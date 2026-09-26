@@ -2133,9 +2133,12 @@ core knowing them by name (`plugins.uc`). A plugin is a plain script at
   writes only when there is no section yet. Written values are re-read at
   once. `qmi_client(ref, schema, cb)` gives the plugin a QMI client of a
   service the core does not know, described in wwand's own schema format, on
-  the modem's QMI channel: `cb(err, client)` with `no_modem`,
-  `service_unavailable` (not in the modem's GET_VERSION_INFO list) or
-  `unsupported` (not a QMI-controlled modem). The modem owns the client and
+  the modem's QMI channel — on an MBIM modem over its QMI-over-MBIM
+  passthrough: `cb(err, client)` with `no_modem`, `service_unavailable` (not
+  in the modem's GET_VERSION_INFO list) or `unsupported` (NCM; an MBIM modem
+  without the passthrough). On an MBIM modem it carries requests only where
+  the firmware pushes no indications over the passthrough (EG06, RM520N:
+  qmi_over_mbim.uc). The modem owns the client and
   releases it on teardown; `client.destroyed` then tells the plugin to ask
   again. `qmi_release(ref, client)` gives it back earlier.
   `modem_at(ref, command, cb, timeout)` sends one AT command over the

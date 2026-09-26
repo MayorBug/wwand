@@ -780,7 +780,7 @@ export function create(opts)
 	// whether anything started it.
 	//
 	// COMPARED HERE rather than trusted from the event. modem_mbim filters its
-	// own emit on a change (modem_mbim.uc:837-846) while the shared reapply
+	// own emit on a change (modem_mbim.uc:838-847) while the shared reapply
 	// tail emits on every re-read (modem_common.uc:553-559); one comparison, in
 	// the place that acts on it, cannot disagree with itself.
 	let modem_sim_refresh = (modem, data) => {
@@ -3544,8 +3544,10 @@ export function create(opts)
 			// a slot switch runs (simops.uc card_changed)
 			sim_changed: (ref, why) => self.card_changed ? self.card_changed(ref, why) : false,
 			// a QMI client of a schema the plugin brings, on the modem's own
-			// channel and owned by the modem (modem.uc extra_client). Only a
-			// QMI-controlled modem has one: MBIM and NCM answer `unsupported`.
+			// channel and owned by the modem (modem.uc extra_client) — on an
+			// MBIM modem over its QMI passthrough (modem_mbim.uc extra_client,
+			// requests only on firmware that pushes no indications there). NCM
+			// has no QMI at all and answers `unsupported`.
 			qmi_client: (ref, schema, cb) => {
 				let m = self.modems[ref]?.modem;
 

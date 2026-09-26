@@ -1029,6 +1029,48 @@ assert_sim_poll_teardown();
 
 	eq(m7.uim, null, 'teardown: the passthrough UIM client is dropped');
 	eq(m7.wms, null, 'teardown: ...and so is the WMS one');
+
+	// A plugin's client over the passthrough (extra_client): allocated from the
+	// passthrough's own service list, owned by the modem, released with it.
+	let m8 = modem_mbim.create({
+		id: 'extra-pt', device: '/dev/mock7', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: () => null, on_event: () => null },
+	});
+	let released = [];
+	let shim = { register: () => null, unregister: () => null, send: () => null, close: () => null, failures: 0 };
+
+	m8.pt = {
+		shim: shim, services: { '11': true, '50': true },
+		ctl: {
+			request: (name, args, cb) => (name == 'ALLOCATE_CID')
+				? cb(null, { allocation: { service: args.service, cid: 7 } })
+				: (name == 'RELEASE_CID') ? (push(released, args.release), cb(null, {})) : cb(null, {}),
+			destroy: () => null,
+		},
+		nas: { destroy: () => null }, dsd: null,
+	};
+
+	let xc = null, err = null;
+
+	m8.extra_client({ service: 0x32, messages: {} }, (e, c) => { err = e; xc = c; });
+	eq([ err, xc?.cid, length(m8.extra_clients) ], [ null, 7, 1 ],
+	   'extra client (MBIM): a client over the passthrough, owned by the modem');
+
+	m8.extra_client({ service: 0x99, messages: {} }, (e, c) => { err = e; });
+	eq(err?.error, 'service_unavailable', 'extra client (MBIM): a service the passthrough does not list is refused');
+
+	m8.extra_release(xc);
+	eq([ length(m8.extra_clients), released[0]?.cid ], [ 0, 7 ],
+	   'extra client (MBIM): given back, its CID released on the wire');
+
+	m8.extra_client({ service: 0x32, messages: {} }, (e, c) => { xc = c; });
+	released = [];
+	m8.teardown();
+	eq([ xc?.destroyed, length(filter(released, (r) => r.service == 0x32)) ], [ true, 1 ],
+	   'extra client (MBIM): teardown destroys it and releases its CID with the passthrough');
 })();
 
 // --- the slow tick must read the serving cell BEFORE choosing a data mode ----

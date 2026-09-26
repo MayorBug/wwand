@@ -72,7 +72,8 @@ export function create(opts)
 		_gen: 0,
 		hub: null,
 		mbim: null,
-		pt: null,          // lazy QMI-over-MBIM passthrough stack { shim, ctl, nas, dsd }
+		pt: null,          // lazy QMI-over-MBIM passthrough stack { shim, ctl, nas, dsd, services }
+		extra_clients: [], // plugins' clients over the passthrough (extra_client)
 		info: {},
 		reg: {},
 		reg_detail: null,  // why (not) registered (reject cause / limited service)
@@ -1693,7 +1694,9 @@ export function create(opts)
 						return complete(false);
 					}
 
-					self.pt = { shim: shim, ctl: ctl, nas: nas, dsd: dsd };
+					// the services the modem lists over the passthrough: what a
+					// plugin's client can be asked for (extra_client)
+					self.pt = { shim: shim, ctl: ctl, nas: nas, dsd: dsd, services: have };
 
 					// the counterpart of the "rebuilding" line: without it a
 					// log shows the attempt and never whether it took
@@ -1794,6 +1797,73 @@ export function create(opts)
 		self.pt.ctl.request('RELEASE_CID',
 			{ release: { service: client.service, cid: client.cid } },
 			() => null, { timeout: 3000, no_recovery: true });
+	};
+
+	// A plugin's client of a QMI service the core does not know, over the
+	// QMI-over-MBIM passthrough — the QMI modem's extra_client, same contract
+	// (modem.uc): the modem owns it, releases its CID on teardown and when the
+	// passthrough is rebuilt, and `destroyed` tells the plugin to ask again.
+	// What the passthrough cannot carry is the plugin's to find out: on the
+	// EG06 and the RM520N it is request/response only and pushes no
+	// indications (qmi_over_mbim.uc:143-149, HW-observed 2026-08) — a service
+	// that lives on them answers its requests and never reports anything.
+	self.extra_client = function(schema, cb) {
+		let gen = self._gen;
+
+		self._ensure_pt((up) => {
+			if (self._gen != gen)
+				return cb({ error: 'cancelled' }, null);
+
+			if (!up)
+				return cb({ error: 'unsupported', detail: 'no QMI passthrough on this modem' }, null);
+
+			if (self.pt.services && !self.pt.services[sprintf('%d', schema.service)])
+				return cb({ error: 'service_unavailable' }, null);
+
+			let pt = self.pt;
+
+			pt.ctl.request('ALLOCATE_CID', { service: schema.service }, (aerr, adata) => {
+				if (aerr || !adata?.allocation)
+					return cb(aerr ?? { error: 'no_allocation' }, null);
+
+				let c = client_mod.create(pt.shim, schema, adata.allocation.cid, hooks);
+
+				c._pt_gen = gen;
+
+				// the stack went while the allocation was on its way: a
+				// client on it would never answer, and nothing would free it
+				if (self._gen != gen || self.pt !== pt) {
+					pt_release(c);
+					return cb({ error: 'cancelled' }, null);
+				}
+
+				push(self.extra_clients, c);
+				cb(null, c);
+			}, { no_recovery: true });
+		});
+	};
+
+	// a plugin giving its client back; only one this modem still owns is
+	// released on the wire (a rebuilt passthrough numbers its CIDs afresh)
+	self.extra_release = function(client, cb) {
+		let owned = false;
+
+		self.extra_clients = filter(self.extra_clients ?? [], (c) => {
+			if (c === client) {
+				owned = true;
+				return false;
+			}
+
+			return true;
+		});
+
+		if (owned)
+			pt_release(client);
+		else
+			client?.destroy();
+
+		if (cb)
+			cb(null);
 	};
 
 	self.reset = function(cb) {
@@ -1990,11 +2060,14 @@ export function create(opts)
 		// and every later SMS op used a client bound to a shim that is gone,
 		// failing forever and feeding the proto-error counter, which eventually
 		// power-cycles a healthy modem.
-		let pt = self.pt, uim = self.uim, wms = self.wms;
+		let pt = self.pt, uim = self.uim, wms = self.wms, extra = self.extra_clients ?? [];
 
 		self.pt = null;
 		self.uim = null;
 		self.wms = null;
+		// plugins' clients rode on the same shim: released and destroyed with
+		// it, and `destroyed` tells their owners to ask again
+		self.extra_clients = [];
 
 		// EACH CLEANUP GUARDED ON ITS OWN, not the sequence. One catch around the
 		// whole block means the first throwing destroy skips the clients after it
@@ -2012,7 +2085,7 @@ export function create(opts)
 			// the native side, which the passthrough never had. ctl is NOT in this list: it is the
 			// implicit client (cid 0) and it is what carries RELEASE_CID for
 			// all the others, so it has to outlive them.
-			for (let c in [ pt.nas, pt.dsd, uim, wms ]) {
+			for (let c in [ pt.nas, pt.dsd, uim, wms, ...extra ]) {
 				if (!c || !pt.ctl)
 					continue;
 
@@ -2025,7 +2098,7 @@ export function create(opts)
 				}
 			}
 
-			for (let c in [ pt.ctl, pt.nas, pt.dsd, uim, wms ]) {
+			for (let c in [ pt.ctl, pt.nas, pt.dsd, uim, wms, ...extra ]) {
 				if (!c)
 					continue;
 

@@ -187,7 +187,7 @@ export function create(opts)
 	// clients, which delivers a synchronous `cancelled` to everything in flight —
 	// so an outer set_opmode callback that ignores its error re-arms tm.settle
 	// AFTER the cancel pass. The new timer fires with self.dms already null
-	// (modem.uc:1616) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
+	// (modem.uc:1620) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
 	// which in ucode is a throw inside a uloop callback: the daemon dies and procd
 	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1161), and
 	// every QMI site that re-arms tm.settle needs it too.
@@ -248,6 +248,20 @@ export function create(opts)
 		push(settles, rec);
 	};
 
+	// EVERY operating-mode write of wwand's own goes through here: the DMS
+	// report that follows is then logged as ours (_opmode_note), not as a
+	// change somebody else made — which sends whoever reads the log looking
+	// for a tool that is not there. A write that fails produces no report.
+	let opmode_ours = (mode, cb) => {
+		self._opmode_asked = { mode: mode, at: time() };
+		qmi_backend.set_opmode(self.dms, mode, (err) => {
+			if (err)
+				self._opmode_asked = null;
+			cb?.(err);
+		});
+	};
+	self._opmode_set = opmode_ours;   // for the init chain (modem_init_qmi.uc)
+
 	// The end of a radio cycle (recovery, reattach, an attach-profile
 	// change): back online — unless the radio is parked (`option lowpower`,
 	// or a plugin lent the modem's card). A cycle that ends online un-parks
@@ -255,7 +269,7 @@ export function create(opts)
 	// radio is no longer in.
 	let online_unless_parked = (cb) => self.lowpower_parked
 		? cb(null)
-		: qmi_backend.set_opmode(self.dms, 'online', cb);
+		: opmode_ours('online', cb);
 
 	// protocol-neutral scaffolding (sets set_state/attach_context/… on self)
 	let scaffold = modem_common.scaffolding(self, { deps: deps, log: log, rec: rec });
@@ -479,7 +493,7 @@ export function create(opts)
 			let cyc_gen = self._gen;
 
 			log('warn', 'recovery: cycling operating mode');
-			qmi_backend.set_opmode(self.dms, 'low_power', () => {
+			opmode_ours('low_power', () => {
 				// done() IS answered on the cancelled path. It is not only
 				// make_fail's internal continuation: the daemon passes a real
 				// caller's callback through note_connect_failure
@@ -500,8 +514,8 @@ export function create(opts)
 				return done(action);
 
 			log('warn', 'recovery: resetting modem');
-			qmi_backend.set_opmode(self.dms, 'offline', () => {
-				qmi_backend.set_opmode(self.dms, 'reset', () => done(action));
+			opmode_ours('offline', () => {
+				opmode_ours('reset', () => done(action));
 			});
 			return;
 
@@ -519,8 +533,8 @@ export function create(opts)
 			return cb({ error: 'unsupported_on_backend' });
 
 		log('warn', 'admin modem reset (DMS offline -> reset)');
-		qmi_backend.set_opmode(self.dms, 'offline', () => {
-			qmi_backend.set_opmode(self.dms, 'reset', (err) => {
+		opmode_ours('offline', () => {
+			opmode_ours('reset', (err) => {
 				// A REFUSED RESET IS NOT A RESET. Dropping the error here would
 				// report `resetting: true` either way, and LuCI and the ubus
 				// caller would wait for a modem that is not going anywhere.
@@ -553,7 +567,7 @@ export function create(opts)
 		let cancelled = () => cb({ error: 'cancelled' });
 
 		log('notice', 'network reattach (DMS low_power -> online)');
-		qmi_backend.set_opmode(self.dms, 'low_power', () => {
+		opmode_ours('low_power', () => {
 			settle_after(gen, () => {
 				online_unless_parked((err) => {
 					cb(err ? { error: 'qmi', detail: err } : null,
@@ -676,7 +690,7 @@ export function create(opts)
 				let finish = () => cb ? cb(changed) : null;
 
 				log('notice', 'attach profile changed after sim reapply, cycling radio to re-attach');
-				qmi_backend.set_opmode(self.dms, 'low_power', () => {
+				opmode_ours('low_power', () => {
 					settle_after(sim_gen, () => {
 						online_unless_parked(finish);
 					}, finish);
@@ -861,7 +875,9 @@ export function create(opts)
 	// A change set_opmode asked for within the last 30 s is ours (a park, a
 	// wake); only anything else is external — calling our own wake external
 	// sends whoever reads the log looking for a tool that is not there.
-	const OPMODE_CODE = { online: 0, low_power: 1 };
+	// QmiDmsOperatingMode (qmi-enums-dms.h:201-205, libqmi 1.38.0): online
+	// 0, low_power 1, offline 3, reset 4
+	const OPMODE_CODE = { online: 0, low_power: 1, offline: 3, reset: 4 };
 
 	self._opmode_note = function(code) {
 		let prev = self._dms_opmode;
@@ -873,10 +889,12 @@ export function create(opts)
 		if (prev == null)
 			return null;
 
-		if (asked && OPMODE_CODE[asked.mode] == code && time() - asked.at <= 30) {
-			self._opmode_asked = null;
+		// asked or not, a change settles it: a later report of the asked
+		// mode is somebody else's
+		self._opmode_asked = null;
+
+		if (asked && OPMODE_CODE[asked.mode] == code && time() - asked.at <= 30)
 			return [ 'info', sprintf('operating mode now %s (as set by wwand)', name) ];
-		}
 
 		return [ 'notice', sprintf('operating mode changed externally: %s', name) ];
 	};
@@ -1302,10 +1320,7 @@ export function create(opts)
 
 		let was_parked = self.lowpower_parked;
 
-		// the DMS indication that follows is ours, not an external change
-		self._opmode_asked = { mode: mode, at: time() };
-
-		qmi_backend.set_opmode(self.dms, mode, (err) => {
+		opmode_ours(mode, (err) => {
 			// remember that WE parked it: the registration that follows is a
 			// consequence, and the supervisor above must not treat it as a fault
 			if (!err)

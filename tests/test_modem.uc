@@ -263,6 +263,15 @@ scenario('late-reg', {
 		modem._update_serving({ serving_system: { registration: 0, radio_ifs: [] } });
 		eq(modem.state, 'REGISTERING', 'unparked: a real registration loss is chased');
 
+		// every write of wwand's own arms the note: the recovery cycle and
+		// the init chain go around set_opmode, and were logged as external
+		let armed = null;
+
+		modem._opmode_asked = null;
+		modem._opmode_set('low_power', () => { armed = modem._opmode_asked; });
+		ok(modem._opmode_asked?.mode == 'low_power' || armed?.mode == 'low_power',
+		   'opmode: a direct write (recovery, init) arms the note as well');
+
 		// the operating-mode report that follows a park or a wake is ours
 		modem._dms_opmode = 1;
 		modem._opmode_asked = { mode: 'online', at: time() };
@@ -270,6 +279,14 @@ scenario('late-reg', {
 		   'opmode: the change wwand asked for is not reported as external');
 		eq(modem._opmode_note(1)?.[1], 'operating mode changed externally: low power',
 		   'opmode: ...one it did not ask for is');
+
+		// a different change settles the request: the asked mode arriving
+		// after it is not ours any more
+		modem._dms_opmode = 0;
+		modem._opmode_asked = { mode: 'online', at: time() };
+		modem._opmode_note(1);
+		eq(modem._opmode_note(0)?.[1], 'operating mode changed externally: online',
+		   'opmode: after another change, the asked mode is external');
 	});
 
 // --- 3: PIN required, verified via UIM ---------------------------------------

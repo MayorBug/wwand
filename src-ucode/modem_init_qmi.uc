@@ -323,8 +323,8 @@ export function install(self, o)
 				{ timeout: 5000 });
 
 		if (self.dms)
-			return qmi_backend.set_opmode(self.dms, 'offline', () =>
-				qmi_backend.set_opmode(self.dms, 'reset',
+			return self._opmode_set('offline', () =>
+				self._opmode_set('reset',
 					(err) => err ? resume(sprintf('refused: %J', err)) : null));
 
 		resume('has no AT port and no DMS client to issue it');
@@ -340,7 +340,7 @@ export function install(self, o)
 		// list + SIM/network state (the actual restore runs at CONFIGURE_NET,
 		// after SIM unlock, so a per-SIM configured list can resolve).
 		sim.log_preradio(self, log, () => {
-			qmi_backend.set_opmode(self.dms, 'online', (err) => {
+			self._opmode_set('online', (err) => {
 				// (set_opmode already treats "no effect / already online" as success)
 				if (err)
 					return fail('opmode', err);
@@ -416,7 +416,7 @@ export function install(self, o)
 				}
 
 				log('notice', sprintf('FCC authentication accepted (%s) — going online', variant));
-				qmi_backend.set_opmode(self.dms, 'online', () => verify_online(fcc_idx + 1));
+				self._opmode_set('online', () => verify_online(fcc_idx + 1));
 			});
 		}, { no_recovery: true });
 	};
@@ -706,9 +706,9 @@ export function install(self, o)
 				return step_register();
 
 			log('notice', 'attach profile changed, cycling radio to re-attach');
-			qmi_backend.set_opmode(self.dms, 'low_power', () => {
+			self._opmode_set('low_power', () => {
 				tm.settle = uloop.timer(self.timing.settle, () => {
-					qmi_backend.set_opmode(self.dms, 'online', () => {
+					self._opmode_set('online', () => {
 						tm.settle = uloop.timer(self.timing.settle, step_register);
 					});
 				});

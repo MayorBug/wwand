@@ -1778,7 +1778,7 @@ export function create(opts)
 	// GIVE THE CID BACK. Every passthrough client is allocated out of the
 	// MODEM's client table, and a destroyed-but-not-released one stays in it
 	// until the modem's stack resets — the same finite resource modem.uc's
-	// teardown release burst exists to protect (modem.uc:327,:1416). The
+	// teardown release burst exists to protect (modem.uc:333,:1416). The
 	// session-long clients (pt.nas/dsd, uim, wms) are allocated once and go
 	// with the session; these two allocate PER CALL, so a scripted reattach
 	// loop walked the table down on its own. An E182E-class stack has room for
@@ -1811,6 +1811,11 @@ export function create(opts)
 	self.extra_client = function(schema, cb) {
 		let gen = self._gen;
 
+		// the MBIM session not open yet (init, a restart): a moment away,
+		// not "this modem cannot" — the plugin tries again without a backoff
+		if (!self.mbim)
+			return cb({ error: 'not_ready' }, null);
+
 		self._ensure_pt((up) => {
 			if (self._gen != gen)
 				return cb({ error: 'cancelled' }, null);
@@ -1834,7 +1839,9 @@ export function create(opts)
 				// the stack went while the allocation was on its way: a
 				// client on it would never answer, and nothing would free it
 				if (self._gen != gen || self.pt !== pt) {
-					pt_release(c);
+					// its CID is on a stack that is gone: releasing it through
+					// the new one would free somebody else's number there
+					c.destroy();
 					return cb({ error: 'cancelled' }, null);
 				}
 
@@ -2082,7 +2089,7 @@ export function create(opts)
 			// — closing the HOST's MBIM session is not shown to reset the
 			// modem's embedded QMI client table, so every daemon reload leaked
 			// a NAS, a DSD and (once used) a UIM and a WMS. The E182E-class
-			// table has room for a handful. Same burst modem.uc:1596 does for
+			// table has room for a handful. Same burst modem.uc:1613 does for
 			// the native side, which the passthrough never had. ctl is NOT in this list: it is the
 			// implicit client (cid 0) and it is what carries RELEASE_CID for
 			// all the others, so it has to outlive them.

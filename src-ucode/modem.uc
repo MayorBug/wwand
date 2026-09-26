@@ -150,6 +150,7 @@ export function create(opts)
 		// we asked for low power (option lowpower) and the radio is off. The
 		// deregistration that follows is expected, and an ifup wakes it.
 		lowpower_parked: false,
+		_opmode_pending: [],   // our own operating-mode writes still to be reported (opmode_ours)
 		active_slot: null,  // which physical slot holds the card in use (slot status)
 		cat: null,          // toolkit client, alive only while cat_mode is applied
 		pdc: null,          // carrier-config client, when the modem has PDC
@@ -187,7 +188,7 @@ export function create(opts)
 	// clients, which delivers a synchronous `cancelled` to everything in flight —
 	// so an outer set_opmode callback that ignores its error re-arms tm.settle
 	// AFTER the cancel pass. The new timer fires with self.dms already null
-	// (modem.uc:1620) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
+	// (modem.uc:1637) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
 	// which in ucode is a throw inside a uloop callback: the daemon dies and procd
 	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1162), and
 	// every QMI site that re-arms tm.settle needs it too.
@@ -252,11 +253,16 @@ export function create(opts)
 	// report that follows is then logged as ours (_opmode_note), not as a
 	// change somebody else made — which sends whoever reads the log looking
 	// for a tool that is not there. A write that fails produces no report.
+	// Pending writes are a QUEUE, in the order they were sent: a sequence
+	// (offline, then reset) has two in flight, and one slot let the second
+	// overwrite the first, whose report then counted as external.
 	let opmode_ours = (mode, cb) => {
-		self._opmode_asked = { mode: mode, at: time() };
+		let e = { mode: mode, at: time() };
+
+		push(self._opmode_pending, e);
 		qmi_backend.set_opmode(self.dms, mode, (err) => {
 			if (err)
-				self._opmode_asked = null;
+				self._opmode_pending = filter(self._opmode_pending, (x) => x !== e);
 			cb?.(err);
 		});
 	};
@@ -882,18 +888,29 @@ export function create(opts)
 	self._opmode_note = function(code) {
 		let prev = self._dms_opmode;
 		let name = dmsmod.OPMODE_NAMES[sprintf('%d', code)] ?? sprintf('mode %d', code);
-		let asked = self._opmode_asked;
+		let now = time();
 
 		self._dms_opmode = code;
+
+		// older than 30 s: whatever happened to it, not this report
+		self._opmode_pending = filter(self._opmode_pending, (e) => now - e.at <= 30);
 
 		if (prev == null)
 			return null;
 
-		// asked or not, a change settles it: a later report of the asked
-		// mode is somebody else's
-		self._opmode_asked = null;
+		// The modem applies writes in the order sent: a report of a pending
+		// mode settles that one and every one before it (a state it skipped
+		// without reporting). A report of none of them is somebody else's,
+		// and settles all — a later report of an asked mode is not ours then.
+		let q = self._opmode_pending, hit = -1;
 
-		if (asked && OPMODE_CODE[asked.mode] == code && time() - asked.at <= 30)
+		for (let i = 0; i < length(q) && hit < 0; i++)
+			if (OPMODE_CODE[q[i].mode] == code)
+				hit = i;
+
+		self._opmode_pending = (hit >= 0) ? slice(q, hit + 1) : [];
+
+		if (hit >= 0)
 			return [ 'info', sprintf('operating mode now %s (as set by wwand)', name) ];
 
 		return [ 'notice', sprintf('operating mode changed externally: %s', name) ];

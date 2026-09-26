@@ -1055,6 +1055,11 @@ assert_sim_poll_teardown();
 
 	let xc = null, err = null;
 
+	// before the MBIM session is open: not yet, rather than "cannot"
+	m8.extra_client({ service: 0x32, messages: {} }, (e, c) => { err = e; });
+	eq(err?.error, 'not_ready', 'extra client (MBIM): before the session is open, not_ready');
+
+	m8.mbim = { destroy: () => null, command: () => null };
 	m8.extra_client({ service: 0x32, messages: {} }, (e, c) => { err = e; xc = c; });
 	eq([ err, xc?.cid, length(m8.extra_clients) ], [ null, 7, 1 ],
 	   'extra client (MBIM): a client over the passthrough, owned by the modem');

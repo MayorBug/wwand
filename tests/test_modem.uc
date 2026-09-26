@@ -263,18 +263,16 @@ scenario('late-reg', {
 		modem._update_serving({ serving_system: { registration: 0, radio_ifs: [] } });
 		eq(modem.state, 'REGISTERING', 'unparked: a real registration loss is chased');
 
-		// every write of wwand's own arms the note: the recovery cycle and
-		// the init chain go around set_opmode, and were logged as external
-		let armed = null;
-
-		modem._opmode_asked = null;
-		modem._opmode_set('low_power', () => { armed = modem._opmode_asked; });
-		ok(modem._opmode_asked?.mode == 'low_power' || armed?.mode == 'low_power',
-		   'opmode: a direct write (recovery, init) arms the note as well');
+		// every write of wwand's own is queued, the recovery cycle's and the
+		// init chain's too: they go around set_opmode
+		modem._opmode_pending = [];
+		// read at once: the write is queued before it is sent
+		modem._opmode_set('low_power', () => null);
+		let queued_direct = filter(modem._opmode_pending, (e) => e.mode == 'low_power');
 
 		// the operating-mode report that follows a park or a wake is ours
 		modem._dms_opmode = 1;
-		modem._opmode_asked = { mode: 'online', at: time() };
+		modem._opmode_pending = [ { mode: 'online', at: time() } ];
 		eq(modem._opmode_note(0)?.[1], 'operating mode now online (as set by wwand)',
 		   'opmode: the change wwand asked for is not reported as external');
 		eq(modem._opmode_note(1)?.[1], 'operating mode changed externally: low power',
@@ -283,10 +281,24 @@ scenario('late-reg', {
 		// a different change settles the request: the asked mode arriving
 		// after it is not ours any more
 		modem._dms_opmode = 0;
-		modem._opmode_asked = { mode: 'online', at: time() };
+		modem._opmode_pending = [ { mode: 'online', at: time() } ];
 		modem._opmode_note(1);
 		eq(modem._opmode_note(0)?.[1], 'operating mode changed externally: online',
 		   'opmode: after another change, the asked mode is external');
+
+		// two writes in flight (a modem reset: offline, then reset): both
+		// reports are ours, in order
+		modem._dms_opmode = 0;
+		modem._opmode_pending = [ { mode: 'offline', at: time() }, { mode: 'reset', at: time() } ];
+		eq([ modem._opmode_note(3)?.[0], modem._opmode_note(4)?.[0] ], [ 'info', 'info' ],
+		   'opmode: offline then reset, both reported as wwand\'s own');
+
+		// a skipped state: the reset reported without the offline before it
+		modem._dms_opmode = 0;
+		modem._opmode_pending = [ { mode: 'offline', at: time() }, { mode: 'reset', at: time() } ];
+		eq([ modem._opmode_note(4)?.[0], length(modem._opmode_pending) ], [ 'info', 0 ],
+		   'opmode: a report of a later write settles the earlier one too');
+		ok(length(queued_direct) == 1, 'opmode: the direct write had been queued');
 	});
 
 // --- 3: PIN required, verified via UIM ---------------------------------------

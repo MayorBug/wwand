@@ -3545,9 +3545,9 @@ export function create(opts)
 			sim_changed: (ref, why) => self.card_changed ? self.card_changed(ref, why) : false,
 			// a QMI client of a schema the plugin brings, on the modem's own
 			// channel and owned by the modem (modem.uc extra_client) — on an
-			// MBIM modem over its QMI passthrough (modem_mbim.uc extra_client,
-			// requests only on firmware that pushes no indications there). NCM
-			// has no QMI at all and answers `unsupported`.
+			// MBIM modem over its QMI passthrough (modem_mbim.uc extra_client;
+			// which indications it carries depends on the service). NCM has no
+			// QMI at all and answers `unsupported`.
 			qmi_client: (ref, schema, cb) => {
 				let m = self.modems[ref]?.modem;
 

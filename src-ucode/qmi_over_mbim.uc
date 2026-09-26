@@ -142,11 +142,14 @@ export function create(mc, opts)
 
 	// unsolicited QMI indications arrive as MBIM INDICATE_STATUS on the QMI CID;
 	// the passthrough info is the raw QMUX indication frame (2nd on() arg = msg).
-	// NOTE (HW finding 2026-08): the EG06 and RM520N accept NAS REGISTER_INDICATIONS
-	// over the passthrough but never actually push indications this way — the
-	// passthrough is request/response only, so MBIM telemetry stays poll-based.
-	// This path is kept correct (0xff broadcast fan-out in deliver) for any
-	// firmware that does forward them.
+	// Which indications come this way depends on the SERVICE, not on the
+	// passthrough: the EG06 and the RM520N accept NAS REGISTER_INDICATIONS
+	// here but never push a NAS indication (HW finding 2026-08) — so MBIM
+	// telemetry stays poll-based — while the RM520N pushes every UIM Remote
+	// indication (connect, power, APDU) this way, which is what a remote SIM
+	// runs on (HW-observed on the GL-X3000, RM520NGLAAR03A03M4G, 2026-09-27:
+	// a session of 431 APDUs through wwand-rsim). The path is kept correct
+	// (0xff broadcast fan-out in deliver) for every service.
 	//
 	// ONE handler per MBIM client, routed to its current shim. mc.on only
 	// appends (mbim_client.uc:369) and has no counterpart, while a shim is made

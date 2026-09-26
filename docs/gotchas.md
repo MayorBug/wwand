@@ -729,3 +729,24 @@ That is itself a status gap by the rule in `extending.md` § 8a, and a candidate
 for a field; until then, ask for the log line explicitly rather than assuming.
 A claim about a user's numbers that skips this question is a claim about the
 wrong code.
+
+## "The QMI passthrough pushes no indications" is true of NAS, not of the passthrough
+
+The EG06 and the RM520N accept NAS `REGISTER_INDICATIONS` over the
+QMI-over-MBIM passthrough and then never push a NAS indication that way
+(HW finding 2026-08). For a year that was written down as a property of the
+passthrough — "request/response only" — and it nearly settled whether a remote
+SIM could work on an MBIM modem: UIM Remote runs entirely on indications (the
+modem announces connect, power-up, reset and every APDU as one), so on that
+belief it could not.
+
+It can. On the GL-X3000 (RM520N-GL, firmware RM520NGLAAR03A03M4G), with
+`uim_remote_service_enable` switched on, the modem pushed every UIM Remote
+indication over the passthrough: connect, power-up, and 431 APDUs of one
+session through wwand-rsim, the modem reading the remote card's identity
+(HW-observed 2026-09-27).
+
+**Which indications come over the passthrough is per service and per
+firmware.** Try the service before concluding from another one;
+`wwandctl rsim MODEM probe` says whether the modem offers UIM Remote at all,
+and a session says the rest.

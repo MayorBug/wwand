@@ -1803,10 +1803,11 @@ export function create(opts)
 	// QMI-over-MBIM passthrough — the QMI modem's extra_client, same contract
 	// (modem.uc): the modem owns it, releases its CID on teardown and when the
 	// passthrough is rebuilt, and `destroyed` tells the plugin to ask again.
-	// What the passthrough cannot carry is the plugin's to find out: on the
-	// EG06 and the RM520N it is request/response only and pushes no
-	// indications (qmi_over_mbim.uc:143-149, HW-observed 2026-08) — a service
-	// that lives on them answers its requests and never reports anything.
+	// Which indications the passthrough carries depends on the service
+	// (qmi_over_mbim.uc:143-151): NAS pushes none on the EG06 and the RM520N,
+	// UIM Remote pushes all of its own on the RM520N — a remote SIM works over
+	// MBIM there (HW-observed 2026-09-27). A plugin whose service stays silent
+	// finds that out from its own protocol.
 	self.extra_client = function(schema, cb) {
 		let gen = self._gen;
 

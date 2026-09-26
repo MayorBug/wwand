@@ -746,6 +746,15 @@ cycles, reattach and attach-profile changes leave it off. Woken, a modem
 reports `registered` again, which re-arms the interfaces given up while it
 was parked. Host-tested; the HW round on 245/242 follows the push.
 
+## Remote SIM on an MBIM modem (2026-09-27)
+
+The plugin dep `qmi_client` works on MBIM modems now, over the QMI-over-MBIM
+passthrough (modem_mbim.uc extra_client). On the GL-X3000 (RM520N-GL, MBIM)
+a remote card from the lab PC's Smartmouse ran through wwand-rsim: UIM Remote
+switched on in the firmware, the modem connected, 431 APDUs, the remote
+card's identity read; back on its own card afterwards. The indications UIM
+Remote needs DO come over the passthrough there — unlike NAS's (gotchas.md).
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

@@ -2136,9 +2136,10 @@ core knowing them by name (`plugins.uc`). A plugin is a plain script at
   the modem's QMI channel — on an MBIM modem over its QMI-over-MBIM
   passthrough: `cb(err, client)` with `no_modem`, `service_unavailable` (not
   in the modem's GET_VERSION_INFO list) or `unsupported` (NCM; an MBIM modem
-  without the passthrough). On an MBIM modem it carries requests only where
-  the firmware pushes no indications over the passthrough (EG06, RM520N:
-  qmi_over_mbim.uc). The modem owns the client and
+  without the passthrough). Which indications reach it over the passthrough
+  depends on the service: NAS pushes none on the EG06 and the RM520N, UIM
+  Remote pushes all of its own on the RM520N (a remote SIM works over MBIM
+  there; qmi_over_mbim.uc). The modem owns the client and
   releases it on teardown; `client.destroyed` then tells the plugin to ask
   again. `qmi_release(ref, client)` gives it back earlier.
   `modem_at(ref, command, cb, timeout)` sends one AT command over the

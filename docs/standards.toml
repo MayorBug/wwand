@@ -1,0 +1,238 @@
+# Components, the standards they implement, and every check against them.
+#
+# Source of docs/standards.md – edit this file, then run
+#   python3 tools/standards.py
+# (run_tests.sh fails if standards.md is out of date). One [[component]] per
+# component, one [[component.standard]] per standard or reference it follows,
+# one [[component.standard.review]] per check of that standard in that
+# component. `review` names an entry of [[reviews]] (date, kind, commits), or
+# "tbd" while the component has not been checked against it yet.
+#
+# A check counts when someone read the standard's text next to the code — not
+# when the code was written from it, and not when a test passed. What the code
+# was written against is `basis`; the review row says when that was last
+# compared. Add a [[reviews]] entry for every such check and point the rows it
+# covered at it.
+#
+# Where no public standard exists (QMI, vendor AT sets), the reference
+# implementation the code is verified against is the "standard", with its
+# version: that is the rule in CLAUDE.md ("QMI schemas must match libqmi").
+
+# No check recorded yet. The first one gets id R1.
+reviews = []
+
+[[component]]
+name = "QMI codec and service schemas"
+code = "src-ucode/codec/{qmux,tlv,hex}.uc, codec/schema/*.uc"
+  [[component.standard]]
+  name = "Qualcomm QMI, as documented by libqmi"
+  basis = "libqmi 1.38.0 data/qmi-service-*.json"
+  sections = "CTL, DMS, NAS, WDS, WDA, UIM, WMS, LOC, PDC, DSD, TMD, CAT: message ids, TLV ids, enums"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "QMI backend (modem, context, telemetry)"
+code = "src-ucode/{modem,modem_init_qmi,modem_datapath_qmi,context,context_monitor_qmi,telemetry_qmi,qmi_backend,regdetail,callend}.uc"
+  [[component.standard]]
+  name = "Qualcomm QMI, as documented by libqmi"
+  basis = "libqmi 1.38.0 (qmi-enums-*.h, qmi-service-*.json)"
+  sections = "call end reasons, operating modes, registration states, signal info"
+    [[component.standard.review]]
+    review = "tbd"
+  [[component.standard]]
+  name = "3GPP TS 24.301 / TS 24.008 (NAS)"
+  basis = ""
+  sections = "EMM/MM reject causes, PDN/PDP connectivity rejects"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "MBIM codec and backend"
+code = "src-ucode/codec/mbim.uc, codec/mbim_schema/*.uc, {mbim_backend,mbim_client,modem_mbim,context_mbim,telemetry_mbim}.uc"
+  [[component.standard]]
+  name = "USB-IF MBIM 1.0"
+  basis = "libmbim 1.32"
+  sections = "message framing, OPEN/CLOSE, fragments, Basic Connect CIDs, status codes"
+    [[component.standard.review]]
+    review = "tbd"
+  [[component.standard]]
+  name = "Microsoft MBIM extensions (MBIMEx v2/v3, MS Basic Connect Extensions, MS UICC Low Level Access)"
+  basis = "libmbim 1.32"
+  sections = "version exchange, registration/packet service v2/v3, base stations info, UICC APDU/open channel/reset"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "QMI-over-MBIM passthrough"
+code = "src-ucode/{qmi_over_mbim,atcmd_mbim}.uc, codec/mbim_schema/qmi_passthrough.uc"
+  [[component.standard]]
+  name = "Qualcomm QMI service over MBIM (QMI passthrough UUID)"
+  basis = "libmbim 1.32, libqmi 1.38.0 (qmi-device over MBIM)"
+  sections = "QMI message CID, indications per service, no CTL SYNC"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "NCM / ECM backend"
+code = "src-ucode/{modem_ncm,context_ncm,telemetry_ncm,ncm_vendors}.uc"
+  [[component.standard]]
+  name = "3GPP TS 27.007 (AT commands for the UE)"
+  basis = ""
+  sections = "+CGDCONT, +CGACT, +CGPADDR, +CGCONTRDP, +CEREG/+C5GREG, +COPS, +CFUN, +CEER"
+    [[component.standard.review]]
+    review = "tbd"
+  [[component.standard]]
+  name = "Vendor AT dial/auth sets (Quectel, Fibocom, MeiG, Huawei, …)"
+  basis = "vendor AT manuals, per entry in ncm_vendors.uc"
+  sections = "data call start/stop, authentication, IP read-back"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "AT command layer"
+code = "src-ucode/{atcmd,atcmd_parse,atport}.uc"
+  [[component.standard]]
+  name = "ITU-T V.250"
+  basis = ""
+  sections = "command line, final result codes, echo, S3/S4"
+    [[component.standard.review]]
+    review = "tbd"
+  [[component.standard]]
+  name = "3GPP TS 27.007"
+  basis = ""
+  sections = "+CME ERROR / +CMS ERROR codes, unsolicited result codes"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "SIM, PIN, identity, PLMN lists"
+code = "src-ucode/{sim,sim_plmn,simops,siminventory}.uc"
+  [[component.standard]]
+  name = "ETSI TS 102 221 (UICC)"
+  basis = ""
+  sections = "file ids (EF ICCID 2FE2), logical channels, status words"
+    [[component.standard.review]]
+    review = "tbd"
+  [[component.standard]]
+  name = "3GPP TS 31.102 (USIM)"
+  basis = ""
+  sections = "EF IMSI 6F07, PLMNwAcT 6F60/6F61/6F62, FPLMN 6F7B, access technology bits"
+    [[component.standard.review]]
+    review = "tbd"
+  [[component.standard]]
+  name = "ISO/IEC 7816-4 and 3GPP TS 27.007 SIM access"
+  basis = ""
+  sections = "APDU structure, +CSIM, +CCHO/+CCHC, +CGLA"
+    [[component.standard.review]]
+    review = "tbd"
+  [[component.standard]]
+  name = "ITU-T E.118 / E.212"
+  basis = ""
+  sections = "ICCID (Luhn), IMSI, MCC/MNC"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "eSIM bridge"
+code = "src-ucode/{esim,esim_bridge}.uc"
+  [[component.standard]]
+  name = "lpac stdio APDU driver"
+  basis = "lpac >= 2.3.0 (upstream PR #399)"
+  sections = "request/response JSON lines, exit status"
+    [[component.standard.review]]
+    review = "tbd"
+  [[component.standard]]
+  name = "GSMA SGP.22 (as far as the bridge sees it)"
+  basis = ""
+  sections = "ISD-R AID, logical channel per session, profile enable → card refresh"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "SMS"
+code = "src-ucode/{sms,sms_pdu}.uc, codec/schema/wms.uc"
+  [[component.standard]]
+  name = "3GPP TS 23.040 (SMS TPDU)"
+  basis = ""
+  sections = "SMS-DELIVER/SUBMIT, UDH concatenation, SCTS"
+    [[component.standard.review]]
+    review = "tbd"
+  [[component.standard]]
+  name = "3GPP TS 23.038 (alphabets)"
+  basis = ""
+  sections = "GSM 7-bit default alphabet and extension table, UCS2"
+    [[component.standard.review]]
+    review = "tbd"
+  [[component.standard]]
+  name = "3GPP TS 27.005"
+  basis = ""
+  sections = "+CMGL/+CMGR/+CMGS/+CMGD in PDU mode"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "Radio vocabulary and bands"
+code = "src-ucode/codec/schema/rat.uc, codec/arfcn_bands.uc"
+  [[component.standard]]
+  name = "3GPP TS 36.101 / TS 38.101-1/-2 (bands, EARFCN, NR-ARFCN)"
+  basis = ""
+  sections = "operating band tables, ARFCN ranges"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "Datapath: QMAP and rmnet"
+code = "src-ucode/{netlink,datapath_rmnet_nss,datapath_rmnet_nss_mhi}.uc, io/src/wwand-io.c"
+  [[component.standard]]
+  name = "Linux rmnet / qmi_wwan / cdc_mbim drivers"
+  basis = "linux 6.18.41 (drivers/net/ethernet/qualcomm/rmnet, drivers/net/usb)"
+  sections = "IFLA_RMNET_* flags (masked apply), mux ids, raw-ip, rx_urb_size"
+    [[component.standard.review]]
+    review = "tbd"
+  [[component.standard]]
+  name = "QMAP v1/v4/v5 data aggregation, as documented by libqmi"
+  basis = "libqmi 1.38.0 (WDA data aggregation protocol enums)"
+  sections = "DAP ids, aggregation limits"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "netifd integration"
+code = "files/wwand-proto.sh, src-ucode/{daemon,reconnect,deps,ctx_settings}.uc"
+  [[component.standard]]
+  name = "OpenWrt netifd proto handler contract"
+  basis = "netifd 2026.07.08~6088f7b3 (proto-ext.c, interface.c, netifd-proto.sh)"
+  sections = "no_proto_task, proto_notify_error, proto_block_restart, autostart, renew"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "IPv6 on the WAN"
+code = "src-ucode/context_common.uc, deps.uc (ensure_wan6), files/wwand-proto.sh"
+  [[component.standard]]
+  name = "RFC 7278 (extending a 3GPP /64), RFC 4861/4862, RFC 6877"
+  basis = ""
+  sections = "prefix sharing without delegation, SLAAC on the WAN, interface identifier"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "GNSS"
+code = "src-ucode/{gps,nmea}.uc, codec/schema/loc.uc"
+  [[component.standard]]
+  name = "NMEA 0183"
+  basis = ""
+  sections = "GGA, RMC, GSA, GSV; talker ids; checksum"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
+name = "ubus / LuCI interface"
+code = "src-ucode/ubus.uc, wwandctl.uc"
+  [[component.standard]]
+  name = "OpenWrt rpcd / ubus conventions"
+  basis = "rpcd (ubus_rpc_session injection)"
+  sections = "every LuCI-called method accepts ubus_rpc_session"
+    [[component.standard.review]]
+    review = "tbd"

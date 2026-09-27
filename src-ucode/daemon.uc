@@ -454,24 +454,45 @@ export function create(opts)
 	//
 	// So the operator's down is recorded where it happens, not guessed at:
 	// every ifdown of a wwand interface runs the shim's teardown, and
-	// context_down's last branch is the operator's. Kept in a file for the
-	// reason the give-ups are. And the shim's own trace is the evidence the
-	// other way round: a failed setup leaves an error of subsystem `wwand`
-	// (proto_notify_error; an ifdown clears none, interface_set_down), an
-	// ifup clears them (interface_set_up → interface_clear_errors).
+	// context_down's last branch is the operator's — or, with no daemon to
+	// ask, the shim writes the record itself. Kept in a file for the reason
+	// the give-ups are. THE RECORD IS THE ONLY EVIDENCE: a cleared autostart
+	// without one is not the operator's. Reading it as one the moment no
+	// `wwand` error explained it still parked interfaces wwand had downed
+	// itself — the marker gone with the daemon that set it — until someone
+	// ran ifup (HW-seen on the NR7101, 242, 2026-09-27: both interfaces of
+	// the modem "administratively down" after a `wwand restart` whose old
+	// daemon had crashed on the way out, no error on either, no ifdown by
+	// anyone).
 	//
 	// An ifdown of an interface that was already down runs no teardown and
-	// is not recorded — with a wwand error on it, that one is revived. That
-	// is the price of reading the evidence at all, and the smaller one.
+	// is not recorded: that one is brought up again at the next
+	// registration. The price of trusting only the record, and the smaller
+	// one — the other way wwand kept a link down that nobody had asked it to.
+	//
+	// ONLY A RECORD THAT CAN EXIST IS TRUSTED. The file is written at every
+	// start, so its absence means this is the first start since boot — or
+	// the first after an upgrade from a version that recorded nothing
+	// (v1.6.8 and older), whose operator ifdowns have no record to show. For
+	// that start the former guess stands: a cleared autostart with no
+	// `wwand` error is the operator's (the Cudy LT300 reproduction of
+	// 2026-08-23 — ifdown, then a restart, and the link came back by itself).
+	// After a boot netifd has re-armed autostart anyway.
 	let admin_downs_file = deps.admin_downs_file ?? '/tmp/wwand/state/admin_downs.json';
 
 	self._admin_downs = {};
+	self._admin_record_trusted = false;
 
 	{
 		let raw = deps.datapath_fx?.read ? deps.datapath_fx.read(admin_downs_file) : null;
 
 		for (let m in match(raw ?? '', /"[A-Za-z0-9_.-]+"/g) ?? [])
 			self._admin_downs[substr(m[0], 1, length(m[0]) - 2)] = true;
+
+		if (raw != null)
+			self._admin_record_trusted = true;
+		else if (deps.datapath_fx?.write)
+			deps.datapath_fx.write(admin_downs_file, '[]');
 	}
 
 	// an interface named by a ubus caller, for the records keyed by interface
@@ -505,11 +526,52 @@ export function create(opts)
 		if (self._admin_downs[entry?.cfg?.interface])
 			return true;
 
+		if (self._admin_record_trusted)
+			return false;
+
+		// the first start since boot or since an upgrade: the former guess
 		for (let e in st?.errors ?? [])
 			if (e?.subsystem == 'wwand')
 				return false;
 
 		return true;
+	};
+
+	// A CLEARED AUTOSTART WITHOUT A RECORD MAY BE ONE ON ITS WAY. netifd
+	// clears autostart and starts the teardown in one step
+	// (interface_set_down, interface.c:1373-1375, netifd 2026.07.08); the
+	// shim's context_down — which writes the record — reaches us only once
+	// its teardown script runs, some 100-500 ms later. A status probe
+	// answered in that gap reads an ifdown as nobody's, and the kick that
+	// follows undoes it (the ifup re-arms autostart during the teardown,
+	// interface.c:1340-1344, and the setup after it clears the record). So
+	// before undoing such a down, ask once more after a pause; only a second
+	// status that is still not the operator's is ours to undo. alive(): the
+	// context is still the one the caller probed for.
+	const UNRECORDED_CONFIRM_MS = 2000;
+
+	let needs_confirm = (entry, st) =>
+		st?.autostart === false && !our_down(entry) && !self._admin_downs[entry?.cfg?.interface];
+
+	let confirm_then = (entry, alive, go) => {
+		let ms = self.timing?.unrecorded_confirm_ms ?? UNRECORDED_CONFIRM_MS;
+		let again = () => deps.iface_status(entry.cfg.interface, (st2) => {
+			if (!alive())
+				return;
+
+			if (operator_down(entry, st2)) {
+				if (entry.wanted) {
+					entry.wanted = false;
+					log('notice', sprintf('interface %s is administratively down (ifdown), leaving it alone',
+						entry.cfg.interface));
+				}
+				return;
+			}
+
+			go(st2);
+		});
+
+		(ms > 0) ? uloop.timer(ms, again) : again();
 	};
 
 	// The SIM inventory (siminventory.uc): every card seen, by ICCID, and
@@ -626,7 +688,10 @@ export function create(opts)
 			// adopt-vs-kick decision runs later in the callback.
 			let cname = name, centry = entry, cctx = entry.ctx;
 
-			let decide = (st) => {
+			// declared first: the second look (confirm_then) calls it again
+			let decide;
+
+			decide = (st, confirmed) => {
 				// Retired while the probe was out: a reload replaced or removed
 				// the context (stop_context deletes the entry, build_context
 				// makes a new one). Acting on the capture would kick an
@@ -678,7 +743,20 @@ export function create(opts)
 							centry.cfg.interface));
 					}
 				}
-				else if ((centry.cfg.auto ?? true) && deps.kick_interface) {
+				else if (!(centry.cfg.auto ?? true)) {
+					// 'auto 0' and not up: dormant until an explicit ifup — and
+					// not wanted meanwhile. A SIM change's down-and-reconnect
+					// (modem_sim_refresh) and the low-power decision read
+					// `wanted`, and neither may dial or hold the radio for an
+					// interface nobody brought up.
+					centry.wanted = false;
+					log('debug', sprintf('interface %s is down and auto=0, not kicking', centry.cfg.interface));
+				}
+				else if (!confirmed && deps.iface_status && needs_confirm(centry, st)) {
+					confirm_then(centry, () => self.contexts[cname] === centry && centry.ctx === cctx,
+						(st2) => decide(st2, true));
+				}
+				else if (deps.kick_interface) {
 					// our own down is being undone here; the kick re-arms
 					// netifd's autostart, so the marker has served its purpose
 					if (our_down(centry))
@@ -724,10 +802,6 @@ export function create(opts)
 						log('info', sprintf('kicking interface %s after modem ready', centry.cfg.interface));
 						deps.kick_interface(centry.cfg.interface);
 					}
-				}
-				else {
-					// 'auto 0' and not up: leave it dormant until an explicit ifup
-					log('debug', sprintf('interface %s is down and auto=0, not kicking', centry.cfg.interface));
 				}
 			};
 
@@ -1397,13 +1471,26 @@ export function create(opts)
 					if (!deps.kick_interface)
 						return;
 
-					log('notice', sprintf('interface %s is down with a connected session, kicking it up instead of renewing',
-						entry.cfg.interface));
+					let kick = () => {
+						log('notice', sprintf('interface %s is down with a connected session, kicking it up instead of renewing',
+							entry.cfg.interface));
 
-					// the signature describes what was pushed to an interface
-					// that no longer holds it; setup will push everything again
-					entry._applied_sig = null;
-					deps.kick_interface(entry.cfg.interface);
+						// the signature describes what was pushed to an interface
+						// that no longer holds it; setup will push everything again
+						entry._applied_sig = null;
+						deps.kick_interface(entry.cfg.interface);
+					};
+
+					// a cleared autostart with no record yet: asked again
+					// first (confirm_then), and left to netifd if it is
+					// coming up by then
+					if (needs_confirm(entry, st))
+						return confirm_then(entry,
+							() => self.contexts[name] === entry && entry.ctx === ctx &&
+							      ctx.state == 'CONNECTED' && (entry._conn_seq ?? 0) === conn_seq,
+							(st2) => (st2?.up || st2?.pending) ? null : kick());
+
+					kick();
 					return;
 				}
 
@@ -1641,6 +1728,12 @@ export function create(opts)
 									kiface));
 								return;
 							}
+
+							// no record of the ifdown yet: asked again first
+							if (needs_confirm(kentry, st))
+								return confirm_then(kentry,
+									() => self.contexts[name] === kentry && kentry.ctx === kctx,
+									() => do_kick());
 
 							// our own down is being undone. The marker is NOT cleared
 							// here: the kick is fire-and-forget, so an up that never
@@ -3253,6 +3346,13 @@ export function create(opts)
 		// that stays on the interface read as OUR block once the modem came,
 		// and the interface was brought up against them.
 		if (!entry?.ctx) {
+			// ...unless it is the teardown of a down wwand issued itself (a
+			// hold expiry, a SIM block) that reached us after the modem had
+			// gone: recorded as the operator's, that interface would stay
+			// down for good now that only the record makes an ifdown
+			if (entry && our_down(entry))
+				return cb({ error: 'no_such_context', ref: ref });
+
 			if (entry) {
 				entry.wanted = false;
 				set_giveup(entry, false);

@@ -772,8 +772,12 @@ survive a daemon restart, so an interface the shim had blocked — sim_blocked
 while an eSIM profile switch left the modem cardless for a moment — was parked
 as "administratively down" after one (HW-seen on 245, 2026-09-27: autostart
 false, errors `[RADIO_HELD]`). `daemon.uc operator_down` now decides on
-evidence: the operator's ifdown is recorded by `context_down` (in a state
-file), and a `wwand` error on the interface is the shim's trace — an ifdown
+evidence, and on that ONLY: the operator's ifdown is recorded by
+`context_down` (in a state file); a cleared autostart without that record is
+not the operator's, whatever errors the interface carries (the NR7101, 242,
+2026-09-27: no error at all after a restart, both interfaces parked by the
+former "no `wwand` error = operator" fallback). A `wwand` error on the
+interface is the shim's trace — an ifdown
 clears no errors (`interface_set_down`); an ifup clears them only on an
 interface that is down (`interface_set_up`, `interface.c:1332-1350`), and
 reaching IFEV_UP does. The operator's ifdown is therefore recorded even when

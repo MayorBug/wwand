@@ -26,6 +26,8 @@ uloop.init();
 
 const TIMING = {
 	sync_retry: 1, settle: 1, sim_settle: 1, card_poll: 1,
+	// the second look at an unrecorded ifdown (confirm_then), at once
+	unrecorded_confirm_ms: 0,
 	reg_timeout: 500,
 	// reconnect backoff paced so only a few attempts fall inside the short hold
 	// window below (avoids climbing the recovery ladder during the test)
@@ -2570,13 +2572,26 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	// interface that is not holding it any more; setup will push the lot again.
 	eq(entry._applied_sig, null, 'netifd down: the stale applied-signature is dropped');
 
-	// (2) operator ifdown: autostart cleared by somebody who is not us. That is
-	// intent, so nothing is kicked and the context stops wanting the interface.
+	// (2) operator ifdown: autostart cleared, and the record its teardown left
+	// (context_down's operator branch). That is intent, so nothing is kicked
+	// and the context stops wanting the interface.
 	calls = [];
 	netifd.autostart = false;
+	d._admin_downs.wan = true;
 	on_event(entry.ctx, 'settings', entry.ctx.settings);
 	eq(calls, [], 'administratively down -> not kicked up');
 	eq(entry.wanted, false, 'administratively down -> the context stops wanting it');
+
+	// (2b) the same cleared autostart WITHOUT that record is nobody's intent —
+	// a down of ours whose marker went with a restarted daemon (HW-seen on
+	// the NR7101, 2026-09-27): kicked up, still wanted
+	calls = [];
+	entry.wanted = true;
+	delete d._admin_downs.wan;
+	d._admin_record_trusted = true;     // a start that could have recorded it
+	on_event(entry.ctx, 'settings', entry.ctx.settings);
+	eq(calls, [ 'kick:wan' ], 'autostart cleared without an operator record -> kicked up');
+	ok(entry.wanted != false, '...and still wanted');
 
 	// (3) counter-proof for (1): with netifd holding the interface UP and the
 	// same address, the renew is skipped as before — the new branch has not
@@ -2990,13 +3005,15 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
 		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: 'a' },
 	} });
+	let before_probe = null;
 	let mk = () => {
 		let d = daemon_mod.create({ timing: TIMING, deps: {
 			log: () => null, load_qmi: () => fake, datapath_fx: fx,
 			giveups_file: '/tmp/test-giveups3.json', admin_downs_file: FILE,
 			kick_interface: (i) => push(calls, 'kick:' + i),
 			down_interface: (i) => push(calls, 'down:' + i),
-			iface_status: (i, cb) => cb(st),
+			// before_probe: what happens between one status probe and the next
+			iface_status: (i, cb) => { before_probe?.(); cb(st); },
 		} });
 
 		d.apply_config(cfg);
@@ -3004,9 +3021,24 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	};
 	let kicks = () => filter(calls, (c) => c == 'kick:wan');
 
-	st = { up: false, pending: false, autostart: false, errors: [ { subsystem: 'wwand', code: 'RADIO_HELD' } ] };
+	// THE FIRST START SINCE BOOT, OR SINCE AN UPGRADE FROM A VERSION THAT
+	// RECORDED NOTHING (v1.6.8): no file, so no record can vouch — an
+	// operator ifdown of the old version would read as nobody's. The former
+	// guess stands for this start: no wwand error = the operator's.
+	st = { up: false, pending: false, autostart: false, errors: [] };
 
 	let d = mk();
+
+	ok(!d._admin_record_trusted, 'first start: no record file yet, not trusted');
+	ok(fx.files[FILE] != null, 'first start: ...and written, so the next start can trust it');
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq([ kicks(), d.contexts.wan.wanted ], [ [], false ],
+	   'first start (an upgrade): cleared autostart, no wwand error — the operator\'s, left alone');
+	d.shutdown();
+
+	calls = [];
+	st = { up: false, pending: false, autostart: false, errors: [ { subsystem: 'wwand', code: 'RADIO_HELD' } ] };
+	d = mk();
 
 	hooks.m0(d.modems.m0.modem, 'registered', {});
 	eq(kicks(), [ 'kick:wan' ], 'restart: a shim error explains the cleared autostart — brought back up');
@@ -3016,7 +3048,10 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	st = { up: false, pending: false, autostart: false, errors: [] };
 	d = mk();
 	hooks.m0(d.modems.m0.modem, 'registered', {});
-	eq([ kicks(), d.contexts.wan.wanted ], [ [], false ], 'restart: no wwand error — an operator ifdown, left alone');
+	// no record, no error: not the operator's — the NR7101 case (242,
+	// 2026-09-27: both interfaces parked after a restart, nobody had run ifdown)
+	eq([ kicks(), d.contexts.wan.wanted ], [ [ 'kick:wan' ], true ],
+	   'restart: autostart cleared with no operator record — brought back up');
 
 	// the operator's ifdown after a failed setup: the error stays (netifd
 	// clears none on a down), the record is what tells
@@ -3040,7 +3075,53 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	st = { up: false, pending: false, autostart: false, errors: [ { subsystem: 'interface', code: 'NO_DEVICE' } ] };
 	d = mk();
 	hooks.m0(d.modems.m0.modem, 'registered', {});
-	eq(kicks(), [], 'restart: an error that is not the shim\'s explains nothing');
+	eq(kicks(), [ 'kick:wan' ], 'restart: netifd\'s own error, no operator record — brought back up too');
+	d.shutdown();
+
+	// AN IFDOWN ON ITS WAY: netifd has cleared autostart, the teardown's
+	// context_down (the record) lands while wwand looks a second time. The
+	// first look alone would have undone the operator's ifdown.
+	calls = [];
+	st = { up: false, pending: false, autostart: false, errors: [] };
+	d = mk();
+	let probes = 0;
+
+	before_probe = () => { if (++probes == 2) d.context_down('wan', () => null); };
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	before_probe = null;
+	eq([ probes, kicks(), d.contexts.wan.wanted ], [ 2, [], false ],
+	   'an unrecorded ifdown is looked at twice, and the record that arrives in between wins');
+	d.shutdown();
+
+	// the teardown of OUR OWN down reaching context_down after the modem has
+	// gone (no context left): not the operator's, not recorded
+	calls = [];
+	st = { up: false, pending: false, autostart: true, errors: [] };
+	fx.files[FILE] = '[]';
+	d = mk();
+	d._our_downs.wan = time();
+	d.contexts.wan.ctx = null;
+	d.context_down('wan', () => null);
+	ok(!d._admin_downs.wan && index(fx.files[FILE] ?? '', '"wan"') < 0,
+	   'context_down without a context, for a down of ours: not recorded as the operator\'s');
+	d.shutdown();
+
+	// 'auto 0' and down: not kicked, and not wanted either — a SIM change's
+	// reconnect and the low-power decision read `wanted`
+	calls = [];
+	st = { up: false, pending: false, autostart: false, errors: [] };
+	d = daemon_mod.create({ timing: TIMING, deps: {
+		log: () => null, load_qmi: () => fake, datapath_fx: fx,
+		giveups_file: '/tmp/test-giveups3.json', admin_downs_file: FILE,
+		kick_interface: (i) => push(calls, 'kick:' + i),
+		iface_status: (i, cb) => cb(st),
+	} });
+	d.apply_config(config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: 'a', auto: '0' },
+	} }));
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq([ kicks(), d.contexts.wan.wanted ], [ [], false ], 'auto 0, down: not kicked, not wanted');
 	d.shutdown();
 })();
 

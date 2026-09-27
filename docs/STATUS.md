@@ -792,10 +792,24 @@ shim's `proto_block_restart` cleared autostart for good. Two changes:
   happens (`context_down`, also when there is no context to take down, and by
   the shim itself when the daemon is not running; persisted in
   `/tmp/wwand/state/admin_downs.json`, cleared by the next up, whatever it is
-  answered with); otherwise a `wwand` error on the interface is the shim's
-  failed setup and the interface is brought back. The in-memory marker for
-  our own downs is lost on a daemon restart — the case HW-seen on 245
-  (autostart false, errors `[RADIO_HELD]`, "administratively down").
+  answered with). **Only that record** makes a cleared autostart the
+  operator's: without it the interface is brought back, error or not. The
+  in-memory marker for our own downs is lost on a daemon restart — the case
+  HW-seen on 245 (autostart false, errors `[RADIO_HELD]`, "administratively
+  down"), and again on the NR7101 (242, 2026-09-27: both interfaces parked
+  after a `wwand restart` whose old daemon crashed on the way out, no error
+  on either — the former fallback "no `wwand` error = the operator's" read
+  that as an ifdown nobody had run). The price: an ifdown of an interface
+  that was already down (no teardown, no record) is undone at the next
+  registration.
+  Two guards around that: the record is trusted only once its file can
+  exist (written at every start; the first start since boot or since an
+  upgrade from a version that recorded nothing keeps the former guess), and
+  a cleared autostart with no record is looked at a second time, 2 s later,
+  before wwand undoes it (`confirm_then`): netifd clears autostart the
+  moment an ifdown starts, the record arrives with the shim's teardown.
+  `auto 0` interfaces that are down are no longer wanted (a SIM change's
+  reconnect and the low-power decision read `wanted`).
 - An answer that lands after a reload replaced the context — the activation,
   and the two netifd status probes before a kick — is not acted on.
 

@@ -750,3 +750,27 @@ session through wwand-rsim, the modem reading the remote card's identity
 firmware.** Try the service before concluding from another one;
 `wwandctl rsim MODEM probe` says whether the modem offers UIM Remote at all,
 and a session says the rest.
+
+## A failed setup of a `no_proto_task` handler is retried by netifd
+
+**It is not — the interface just stays pending, with the error on it.**
+`proto_ext_task_finish` tears a failed setup down only when the handler has no
+`PROTO_FLAG_NO_TASK` (`proto-ext.c:147-152`, netifd 2026.07.08), so after the
+shim's `return 1` nothing in netifd runs setup again: every
+`proto_notify_error` branch works like a block, not only the one that sends
+`proto_block_restart`. The shim's comments said "retried every 60 s" for
+RADIO_HELD and "keep retrying" for WAITING_MODEM; neither was ever true. The
+retry is the daemon's (the reconnect engine, and the `registered` path that
+resets a stuck-pending interface and kicks it).
+
+The companion belief: **`autostart=false` means somebody ran `ifdown`.** A
+handler's `proto_block_restart` clears it too (`proto-ext.c:547-550`), and so
+does every `down` wwand issues. The in-memory marker for our own downs did not
+survive a daemon restart, so an interface the shim had blocked — sim_blocked
+while an eSIM profile switch left the modem cardless for a moment — was parked
+as "administratively down" after one (HW-seen on 245, 2026-09-27: autostart
+false, errors `[RADIO_HELD]`). `daemon.uc operator_down` now decides on
+evidence: the operator's ifdown is recorded by `context_down` (in a state
+file), and a `wwand` error on the interface is the shim's trace — an ifdown
+clears no errors (`interface_set_down`), an ifup clears them
+(`interface_set_up`, `interface.c:1332-1350`).

@@ -2951,6 +2951,84 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	d3.shutdown();
 })();
 
+// WHO CLEARED AUTOSTART, after a restart. The in-memory _our_downs marker is
+// gone, so netifd's evidence decides: a `wwand` error on the interface is the
+// shim's failed setup (a block, or a reset of ours) — brought back; an ifdown
+// recorded by context_down, or a cleared autostart with no wwand error, is
+// the operator's — left alone (HW-seen on 245, 2026-09-27: autostart false,
+// errors [RADIO_HELD], parked as "administratively down" after a restart).
+(() => {
+	let fx = fakefx.create();
+	let FILE = '/tmp/test-admin-downs.json';
+	let hooks = {}, calls = [], st = null;
+	let fake = {
+		modem: { create: (o) => {
+			hooks[o.id] = o.deps.on_event;
+			return { id: o.id, state: 'READY', config: o.config, start: () => null, stop: () => null,
+			         note_connect_success: () => null };
+		} },
+		context: { create: (o) => ({ state: 'IDLE', name: o.name, modem: o.modem, config: o.config,
+		                             down: (cb) => cb ? cb() : null, up: (cb) => cb(null),
+		                             modem_event: () => null }) },
+	};
+	let cfg = config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: 'a' },
+	} });
+	let mk = () => {
+		let d = daemon_mod.create({ timing: TIMING, deps: {
+			log: () => null, load_qmi: () => fake, datapath_fx: fx,
+			giveups_file: '/tmp/test-giveups3.json', admin_downs_file: FILE,
+			kick_interface: (i) => push(calls, 'kick:' + i),
+			down_interface: (i) => push(calls, 'down:' + i),
+			iface_status: (i, cb) => cb(st),
+		} });
+
+		d.apply_config(cfg);
+		return d;
+	};
+	let kicks = () => filter(calls, (c) => c == 'kick:wan');
+
+	st = { up: false, pending: false, autostart: false, errors: [ { subsystem: 'wwand', code: 'RADIO_HELD' } ] };
+
+	let d = mk();
+
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(kicks(), [ 'kick:wan' ], 'restart: a shim error explains the cleared autostart — brought back up');
+	d.shutdown();
+
+	calls = [];
+	st = { up: false, pending: false, autostart: false, errors: [] };
+	d = mk();
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq([ kicks(), d.contexts.wan.wanted ], [ [], false ], 'restart: no wwand error — an operator ifdown, left alone');
+
+	// the operator's ifdown after a failed setup: the error stays (netifd
+	// clears none on a down), the record is what tells
+	d.contexts.wan.ctx.state = 'CONNECTED';
+	d.context_down('wan', () => null);
+	ok(index(fx.files[FILE] ?? '', '"wan"') >= 0, 'operator ifdown: recorded, in the file');
+	d.shutdown();
+
+	calls = [];
+	st = { up: false, pending: false, autostart: false, errors: [ { subsystem: 'wwand', code: 'CONNECT_FAILED' } ] };
+	d = mk();
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(kicks(), [], 'restart: a recorded operator ifdown wins over a stale shim error');
+
+	// errors of another subsystem are netifd's own, not the shim's
+	d.context_up('wan', () => null);
+	eq(index(fx.files[FILE] ?? '', '"wan"'), -1, 'ifup: the operator down is over, in the file too');
+	d.shutdown();
+
+	calls = [];
+	st = { up: false, pending: false, autostart: false, errors: [ { subsystem: 'interface', code: 'NO_DEVICE' } ] };
+	d = mk();
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(kicks(), [], 'restart: an error that is not the shim\'s explains nothing');
+	d.shutdown();
+})();
+
 // ...and what the mark is FOR: after the restart the modem registers, netifd
 // has the interface down with autostart cleared (our own down), and the
 // interface is kicked back up — not read as an operator ifdown. The previous
@@ -3013,6 +3091,29 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	   'ifup then ifdown within the window: the operator\'s down, not re-armed');
 	hooks.m0(d.modems.m0.modem, 'registered', {});
 	eq(filter(calls, (c) => c == 'kick:wan'), [], '...and the next registration does not bring it back');
+
+	// An eSIM profile switch: the modem is without a card for a moment
+	// (SIM_BLOCKED), and netifd's own restart of the interface lands in that
+	// window. context_up answers sim_blocked, the shim BLOCKS the restart
+	// (proto_block_restart: autostart off) — and once the new profile
+	// registers, the interface has to come back by itself.
+	calls = [];
+	d.modems.m0.modem.state = 'SIM_BLOCKED';
+	hooks.m0(d.modems.m0.modem, 'sim_blocked', { reason: 'no_sim' });
+	d.contexts.wan.ctx.state = 'IDLE';
+
+	let upr = null;
+
+	d.context_up('wan', (e) => { upr = e; });
+	eq(upr?.error, 'sim_blocked', 'profile switch: a setup during the switch is answered sim_blocked (the shim blocks)');
+	eq([ d.contexts.wan.wanted, d.contexts.wan.reconnect_on_register ], [ false, true ],
+	   'profile switch: ...and the daemon notes that block as its own give-up');
+
+	d.modems.m0.modem.state = 'READY';
+	calls = [];
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(filter(calls, (c) => c == 'kick:wan'), [ 'kick:wan' ],
+	   'profile switch: the new profile registered — the blocked interface is brought back up');
 	d.shutdown();
 })();
 
@@ -3059,6 +3160,37 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	eq(downs, after_change, 'identity: a read without the IMSI changes nothing');
 	hooks.m0(m, 'sim_refresh', { iccid: '8988000000000000002', imsi: '901280000000003' });
 	ok(downs > after_change, 'identity: another IMSI behind the same ICCID drops the session');
+	d.shutdown();
+})();
+
+// A NEW wwand_sim DOES NOT RESTART THE MODEM. The SIM overrides ride on the
+// modem's config and were part of its reload signature, so adding one — by
+// hand, or wwand-rsim keeping a lender's settings — restarted every modem:
+// connections dropped, and on an MBIM modem the QMI passthrough a plugin was
+// asking for at that moment (HW-seen on the GL-X3000, 2026-09-27). They are
+// handed to the running modem instead.
+(() => {
+	let made = 0;
+	let fake = {
+		modem: { create: (o) => { made++; return { id: o.id, state: 'READY', config: o.config,
+		                                           start: () => null, stop: () => null }; } },
+		context: { create: (o) => ({ state: 'IDLE', down: (cb) => cb ? cb() : null, up: (cb) => cb(null),
+		                             modem_event: () => null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: { log: () => null, load_qmi: () => fake } });
+	let net = {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: 'a' },
+	};
+
+	d.apply_config(config.parse({ network: net }));
+	let m = d.modems.m0.modem;
+
+	d.apply_config(config.parse({ network: { ...net,
+		s1: { '.type': 'wwand_sim', iccid: '89882390000064624748', apn: 'apn.global-m2m.net' } } }));
+
+	eq([ made, d.modems.m0.modem === m ], [ 1, true ], 'new wwand_sim: the modem keeps running (no restart)');
+	eq(d.modems.m0.modem.config.sims?.[0]?.apn, 'apn.global-m2m.net', 'new wwand_sim: ...and has it for its next card read');
 	d.shutdown();
 })();
 

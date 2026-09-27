@@ -310,9 +310,9 @@ proto_wwand_setup() {
 				;;
 			radio_held)
 				# the modem's card is lent to another modem (a plugin such as
-				# wwand-rsim), and its radio stays off until it comes back:
-				# not a failure to retry every few seconds, nor one to block
-				# for good — checked again at a slow pace
+				# wwand-rsim), and its radio stays off until it comes back.
+				# Not blocked: the interface waits in setup (see below) and
+				# the daemon brings it up when the woken modem registers
 				echo "radio off: the modem's SIM card is in use by another modem"
 				proto_notify_error "$interface" RADIO_HELD
 				sleep 60
@@ -321,20 +321,30 @@ proto_wwand_setup() {
 				# the modem's control device is not present yet (after boot, a
 				# modem reboot or a power-cycle). Surface it distinctly so the
 				# network overview shows "waiting for modem" instead of a generic
-				# failure; keep retrying (the daemon binds it once hotplug fires).
+				# failure. The daemon brings it up once hotplug binds the modem
+				# and it registers.
 				echo "waiting for modem (control device not present)"
 				proto_notify_error "$interface" WAITING_MODEM
 				sleep 8
 				;;
 			*)
 				proto_notify_error "$interface" CONNECT_FAILED
-				# netifd re-runs setup immediately after a failed task; without
-				# a pause here a no-service condition becomes a hot loop that
-				# also climbs the daemon's recovery ladder
+				# the pause spaces out a netifd that DOES re-run setup (an ifup
+				# loop, an older netifd); this one does not, see below
 				sleep 10
 				;;
 		esac
 
+		# NOTHING IN NETIFD RETRIES THIS. A failed setup of a handler with
+		# no_proto_task is never torn down (proto_ext_task_finish tears down
+		# only without PROTO_FLAG_NO_TASK, proto-ext.c:147-152, netifd
+		# 2026.07.08): the interface stays pending with the error on it,
+		# which works like a block. The daemon owns the retry — the
+		# reconnect engine for a failed activation, the next `registered` for
+		# a modem that was not usable (it resets a stuck-pending interface
+		# and kicks it). The error is also its evidence that a cleared
+		# autostart is ours and not an operator's ifdown (daemon.uc,
+		# operator_down).
 		return 1
 	}
 

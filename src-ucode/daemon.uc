@@ -439,6 +439,72 @@ export function create(opts)
 		return true;
 	};
 
+	// WHO CLEARED AUTOSTART. netifd has two ways to do it — an `ifdown`
+	// (interface_set_down) and a handler's block_restart
+	// (proto_ext_block_restart) — and its status tells neither apart
+	// (interface.c:1367-1377, proto-ext.c:547-550, netifd 2026.07.08). Our
+	// own downs carry the _our_downs marker, but that lives in this process:
+	// a daemon restart in between (a package upgrade, a deploy) lost it, and
+	// an interface the SHIM had blocked — sim_blocked while an eSIM profile
+	// switch left the modem cardless for a moment — or that WE had reset was
+	// read as an operator ifdown and stayed down (HW-seen on 245, 2026-09-27:
+	// autostart false, errors [RADIO_HELD], "administratively down" at the
+	// first registration after a restart).
+	//
+	// So the operator's down is recorded where it happens, not guessed at:
+	// every ifdown of a wwand interface runs the shim's teardown, and
+	// context_down's last branch is the operator's. Kept in a file for the
+	// reason the give-ups are. And the shim's own trace is the evidence the
+	// other way round: a failed setup leaves an error of subsystem `wwand`
+	// (proto_notify_error; an ifdown clears none, interface_set_down), an
+	// ifup clears them (interface_set_up → interface_clear_errors).
+	//
+	// An ifdown of an interface that was already down runs no teardown and
+	// is not recorded — with a wwand error on it, that one is revived. That
+	// is the price of reading the evidence at all, and the smaller one.
+	let admin_downs_file = deps.admin_downs_file ?? '/tmp/wwand/state/admin_downs.json';
+
+	self._admin_downs = {};
+
+	{
+		let raw = deps.datapath_fx?.read ? deps.datapath_fx.read(admin_downs_file) : null;
+
+		for (let m in match(raw ?? '', /"[A-Za-z0-9_.-]+"/g) ?? [])
+			self._admin_downs[substr(m[0], 1, length(m[0]) - 2)] = true;
+	}
+
+	let set_admin_down = (entry, on) => {
+		let iface = entry?.cfg?.interface;
+
+		if (!iface || !!self._admin_downs[iface] == on)
+			return;
+
+		if (on)
+			self._admin_downs[iface] = true;
+		else
+			delete self._admin_downs[iface];
+
+		if (deps.datapath_fx?.write)
+			deps.datapath_fx.write(admin_downs_file, sprintf('%J', keys(self._admin_downs)));
+	};
+
+	// true when netifd's cleared autostart is the operator's and must be
+	// left alone; false when it is ours or the shim's, and the interface is
+	// to be brought back. `st` is a network.interface status reply.
+	let operator_down = (entry, st) => {
+		if (st?.autostart !== false || our_down(entry))
+			return false;
+
+		if (self._admin_downs[entry?.cfg?.interface])
+			return true;
+
+		for (let e in st?.errors ?? [])
+			if (e?.subsystem == 'wwand')
+				return false;
+
+		return true;
+	};
+
 	// The SIM inventory (siminventory.uc): every card seen, by ICCID, and
 	// where it is. Refreshed from the modems' state on every sim_inventory
 	// call and every tick — in memory, no I/O — so it follows identity re-reads, slot
@@ -567,7 +633,7 @@ export function create(opts)
 					log('info', sprintf('adopting live interface %s after modem ready', centry.cfg.interface));
 					retry_activate(cname);
 				}
-				else if (st?.autostart === false && !our_down(centry)) {
+				else if (operator_down(centry, st)) {
 					// The operator ran `ifdown`. netifd's RUNTIME autostart flag is
 					// the only durable record of that: `wanted` lives in this
 					// process's memory, and every interface-bound context is rebuilt
@@ -1277,7 +1343,7 @@ export function create(opts)
 						return log('debug', sprintf('interface %s is down and auto=0, not kicking it for the renew',
 							entry.cfg.interface));
 
-					if (st.autostart === false && !our_down(entry)) {
+					if (operator_down(entry, st)) {
 						if (entry.wanted) {
 							entry.wanted = false;
 							log('notice', sprintf('interface %s is administratively down (ifdown), leaving it alone',
@@ -1522,7 +1588,7 @@ export function create(opts)
 					// up=false/autostart=false, and only a manual `ifup` recovered it.
 					if (deps.iface_status)
 						deps.iface_status(kiface, (st) => {
-							if (st?.autostart === false && !our_down(kentry)) {
+							if (operator_down(kentry, st)) {
 								kentry.wanted = false;
 								log('notice', sprintf('interface %s went administratively down while connecting, not kicking it up',
 									kiface));
@@ -2620,10 +2686,17 @@ export function create(opts)
 		// them from entry.ext on every tick (step 4 refreshes it), and nothing
 		// in the modem's own state depends on them — switching a plugin feature
 		// on must not bounce the connection it may be going to run over.
+		// ...and so are its SIM overrides (`sims`, the wwand_sim sections it
+		// may match): adding one — by hand, or wwand-rsim keeping a lender's
+		// settings — restarted every modem, dropping its connections and, on
+		// an MBIM modem, the QMI passthrough a plugin was just asking for
+		// (HW-seen on the GL-X3000, 2026-09-27). They are matched on every
+		// card read; step 4 hands the new list to the running modem.
 		let modem_sig = (mn) => {
 			let cfg = { ...(parsed.modems[mn] ?? {}) };
 
 			delete cfg.ext;
+			delete cfg.sims;
 
 			return sprintf('%J', { cfg: cfg, mux: mux_by_modem[mn], l3: l3_by_modem[mn] });
 		};
@@ -2657,6 +2730,12 @@ export function create(opts)
 		for (let mn in keys(self.modems)) {
 			self.modems[mn]._sig = modem_sig(mn);
 			self.modems[mn].ext = parsed.modems[mn]?.ext ?? {};
+
+			// the SIM overrides, live (left out of the signature above)
+			if (self.modems[mn].cfg)
+				self.modems[mn].cfg.sims = parsed.modems[mn]?.sims;
+			if (self.modems[mn].modem?.config)
+				self.modems[mn].modem.config.sims = parsed.modems[mn]?.sims;
 		}
 
 		for (let cn in keys(self.contexts))
@@ -2883,6 +2962,29 @@ export function create(opts)
 		// netifd asked us up → mark wanted so the daemon keeps it up until context_down.
 		entry.wanted = true;
 
+		// A SIM that is not usable (yet) makes the shim BLOCK the interface:
+		// on sim_blocked it sends proto_block_restart, which sets netifd's
+		// autostart off (proto-ext.c:547-550, netifd 2026.07.08), and nothing
+		// restarts it after that. During an eSIM profile switch or a card
+		// change the modem is without a card for a moment, and a setup that
+		// lands then — netifd's own restart included, which ended the give-up
+		// the SIM block had set (the up just above) — left the interface down
+		// for good once the new profile registered. The block is therefore
+		// OURS: noted as a give-up and as our down, so the next `registered`
+		// re-arms the interface and kicks it (modem_registered), exactly as
+		// the daemon's own SIM-block down is (modem_sim_blocked).
+		let answer = (err, res) => {
+			if (err?.error == 'sim_blocked') {
+				entry.wanted = false;
+				set_giveup(entry, true);
+				mark_our_down(entry);
+				log('notice', sprintf('interface %s: the SIM is not usable yet — netifd holds it down; it comes back when the modem registers',
+					entry.cfg.interface ?? name));
+			}
+
+			cb(err, res);
+		};
+
 		// ...an up (an operator's ifup, or our own kick landing) re-arms
 		// netifd's autostart: whatever down we issued is answered, and a
 		// give-up is over. Kept past it, the next ifdown within the marker's
@@ -2890,6 +2992,7 @@ export function create(opts)
 		// interface back against the operator (found by audit, 2026-09-27).
 		clear_our_down(entry);
 		set_giveup(entry, false);
+		set_admin_down(entry, false);
 
 		// Parked by `option lowpower` on the last context-down: the radio is off,
 		// so activating now would dial into a modem that cannot register. Wake it
@@ -2925,11 +3028,11 @@ export function create(opts)
 					log('warn', sprintf('modem %s: wake-up failed: %J',
 						entry.cfg.modem, err));
 
-				activate(name, cb);
+				activate(name, answer);
 			});
 		}
 
-		activate(name, cb);
+		activate(name, answer);
 	};
 
 	// l3 netdev for a context: parent netdev, MBIM VLAN sub-device or QMAP mux
@@ -3085,6 +3188,7 @@ export function create(opts)
 		// reconnect and clear any stale re-arm marker (operator intent wins).
 		entry.wanted = false;
 		set_giveup(entry, false);
+		set_admin_down(entry, true);
 		clear_reconnect(name);
 		entry.ctx.down(() => {
 			cb(null, {});

@@ -1649,7 +1649,9 @@ export function create(opts)
 		// A failure caused by a teardown (its destroy() pays the pending request
 		// with an error) says nothing about the modem and remembers nothing.
 		let bail = () => {
-			if (self._gen == gen)
+			// ...and never from a probe made while the modem was still coming
+			// up: that says nothing about the modem either
+			if (self._gen == gen && index([ 'ABSENT', 'INIT_TRANSPORT', 'INIT_SERVICES' ], self.state) < 0)
 				self._pt_failed = !self._pt_built;
 			if (self._pt_built && self._gen == gen)
 				log('notice', 'qmi-over-mbim: rebuilding the passthrough failed — trying again at the next re-probe');
@@ -1726,6 +1728,13 @@ export function create(opts)
 	// corrected override up on their next (re)dial via conn_cfg. (The LTE attach
 	// APN is programmed separately in step_attach_profile before registration.)
 	self.reapply_sim = function(cb) {
+		let done = () => {
+			scaffold.resolve_active_sim(self.info.iccid, self.info.imsi);
+
+			if (cb)
+				cb(null);
+		};
+
 		self.mbim.command(bc, 'SUBSCRIBER_READY_STATUS', 'query', {}, (err, d) => {
 			if (!err) {
 				if (d.subscriber_id != null && d.subscriber_id != '')
@@ -1734,10 +1743,19 @@ export function create(opts)
 					self.info.iccid = d.sim_iccid;
 			}
 
-			scaffold.resolve_active_sim(self.info.iccid, self.info.imsi);
+			// MBIM says nothing of a card that is not in the modem's own
+			// slot (QMI UIM Remote, wwand-rsim): the card's own files — over
+			// the passthrough's UIM or AT, fresh — name it instead. Without
+			// it the card's wwand_sim did not match and the interface's APN
+			// was dialled (HW-seen on an RM520N lent a card, 2026-09-27).
+			if (self.info.iccid != null && self.info.imsi != null)
+				return done();
 
-			if (cb)
-				cb(null);
+			sim.read_identity(self, (id) => {
+				self.info.imsi = self.info.imsi ?? id.imsi;
+				self.info.iccid = self.info.iccid ?? id.iccid;
+				done();
+			}, { fresh: true });
 		});
 	};
 
@@ -1812,8 +1830,13 @@ export function create(opts)
 		let gen = self._gen;
 
 		// the MBIM session not open yet (init, a restart): a moment away,
-		// not "this modem cannot" — the plugin tries again without a backoff
-		if (!self.mbim)
+		// not "this modem cannot" — the plugin tries again without a backoff.
+		// Still in its init chain counts too: a passthrough probe there fails
+		// (function_error before MBIM is through its own bring-up) and, the
+		// flag of a working one reset by the restart, was remembered as "no
+		// passthrough on this modem" until the next teardown (HW-seen on an
+		// RM520N, 2026-09-27)
+		if (!self.mbim || index([ 'ABSENT', 'INIT_TRANSPORT', 'INIT_SERVICES' ], self.state) >= 0)
 			return cb({ error: 'not_ready' }, null);
 
 		self._ensure_pt((up) => {

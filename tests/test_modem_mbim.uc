@@ -1060,6 +1060,14 @@ assert_sim_poll_teardown();
 	eq(err?.error, 'not_ready', 'extra client (MBIM): before the session is open, not_ready');
 
 	m8.mbim = { destroy: () => null, command: () => null };
+
+	// ...nor while the modem is still in its init chain: a passthrough probe
+	// there fails and was remembered as "no passthrough on this modem"
+	m8.state = 'INIT_TRANSPORT';
+	m8.extra_client({ service: 0x32, messages: {} }, (e, c) => { err = e; });
+	eq(err?.error, 'not_ready', 'extra client (MBIM): during its init chain, not_ready');
+
+	m8.state = 'READY';
 	m8.extra_client({ service: 0x32, messages: {} }, (e, c) => { err = e; xc = c; });
 	eq([ err, xc?.cid, length(m8.extra_clients) ], [ null, 7, 1 ],
 	   'extra client (MBIM): a client over the passthrough, owned by the modem');
@@ -1763,5 +1771,32 @@ assert_attach_cause_from_ceer('+CEER: EMM cause 33', 'EMM cause 33', 33, 'ceer/c
 
 // ...and a modem with nothing to say leaves both null rather than inventing
 assert_attach_cause_from_ceer(null, null, null, 'ceer/silent');
+
+// A CARD NOT IN THE MODEM'S OWN SLOT (QMI UIM Remote): MBIM's subscriber
+// status names none, and the card's wwand_sim did not match — the interface's
+// APN was dialled. The card's own files name it (here over AT), fresh.
+{
+	let m9 = modem_mbim.create({
+		id: 'remote-card', device: '/dev/mock9', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: () => null, on_event: () => null },
+	});
+	let done_ = false;
+
+	m9.mbim = { destroy: () => null, command: (svc, name, op, args, cb) => cb(null, { subscriber_id: '', sim_iccid: '' }) };
+	m9.at = { send: (cmd, cb) => cb(null, { lines: [ (cmd == 'AT+CIMI') ? '901280001430235'
+		: (cmd == 'AT+QCCID') ? '+QCCID: 89882390000064624748' : 'ERROR' ] }) };
+	m9.info = { iccid: null, imsi: null };
+	m9.reapply_sim(() => { done_ = true; });
+
+	let t0 = time();
+	while (!done_ && time() - t0 < 3)
+		uloop.run(50);
+
+	eq([ m9.info.imsi, m9.info.iccid ], [ '901280001430235', '89882390000064624748' ],
+	   'remote card on MBIM: its identity read from the card when MBIM names none');
+}
 
 done('test_modem_mbim');

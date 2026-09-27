@@ -30,6 +30,7 @@ row. That is the whole maintenance rule.
 | Question | Answer |
 |---|---|
 | Who decides to reconnect, and how long it holds the interface up? | `reconnect.uc enter_reconnecting`, `reconnect.uc retry_activate` — `daemon.uc` binds local aliases to them (`self._enter_reconnecting`), so grepping daemon.uc finds the call sites and not the logic. |
+| Why was my interface left down as "administratively down" — or brought back although it was down? | `daemon.uc operator_down` — a cleared autostart is the operator's only when context_down recorded their ifdown, or when no `wwand` error (the shim's failed setup) explains it; `daemon.uc our_down` covers the downs wwand issues itself. |
 | What exactly is netifd told — addresses, routes, DNS, MTU? | `files/wwand-proto.sh _wwand_apply_settings` |
 | Why does my interface have a default route with no gateway? | `files/wwand-proto.sh _wwand_apply_settings` — it branches on `IFF_NOARP`: a point-to-point link gets a device route, an ARP-resolving one a host route plus a via-default. Setup and renew both go through it. |
 | Where does the dhcpv6 `<parent>_6` subinterface come from, and who switches it off? | `deps.uc ensure_wan6` / `deps.uc retire_wan6` — both dispatched from the connected handler in `daemon.uc`, on complementary `effective_pdp` conditions. |

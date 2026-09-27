@@ -2170,8 +2170,10 @@ core knowing them by name (`plugins.uc`). A plugin is a plain script at
 - **Radio hold:** an optional `radio_hold(ref, ext)` returns why the modem's
   radio must stay off (its card is in use by another modem), or null. While
   it answers, `context_up` fails with `radio_held` and that reason (the shim
-  reports RADIO_HELD and retries every 60 s), and a registration of the
-  modem parks its radio again.
+  reports RADIO_HELD; netifd does not retry a failed setup of a
+  `no_proto_task` handler, the interface waits in setup until the modem
+  registers again after the lending and the daemon brings it up), and a
+  registration of the modem parks its radio again.
 - **Stop:** an optional `stop()` runs when the daemon exits. Returning true
   says it sent requests that need the event loop; the daemon then keeps
   running it until the plugin's optional `busy()` answers false, at most 8 s

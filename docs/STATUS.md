@@ -740,7 +740,8 @@ stopped for lack of a card resumes its init when a card arrives
 `modem_radio`; the daemon records it, wakes it on the hand-back only as
 `option lowpower` allows, and releases a park no plugin holds any more.
 While a plugin's `radio_hold` answers, `context_up` fails with `radio_held`
-(shim: RADIO_HELD, retried every 60 s) and a registration parks the radio
+(shim: RADIO_HELD; the interface waits in setup — netifd does not retry it —
+until the wake's registration brings it up) and a registration parks the radio
 again. A parked radio is not dialled by the reconnect path, and recovery
 cycles, reattach and attach-profile changes leave it off. Woken, a modem
 reports `registered` again, which re-arms the interfaces given up while it
@@ -775,6 +776,27 @@ tested hardware and the workarounds are in the wwand-rsim README:
   and `rsim-card-pcsc` (the helper alone, for a SIM host).
 - **Not possible:** one modem using one slot and lending the other — a
   single-standby modem switches its inactive slot off (above, Multi-SIM).
+
+## A block after a card change comes back by itself (2026-09-27)
+
+An interface stayed down after an eSIM profile switch: the modem was cardless
+for a moment, the setup that landed then was answered `sim_blocked`, and the
+shim's `proto_block_restart` cleared autostart for good. Two changes:
+
+- `context_up` notes that answer as the daemon's own give-up (`set_giveup` +
+  `mark_our_down`), so the next `registered` re-arms and kicks it — as the
+  daemon's own SIM-block down already was.
+- **Who cleared autostart is decided on evidence** (`daemon.uc operator_down`,
+  used by all three kick sites): an operator ifdown is recorded where it
+  happens (`context_down`, persisted in `/tmp/wwand/state/admin_downs.json`,
+  cleared by the next up); otherwise a `wwand` error on the interface is the
+  shim's failed setup and the interface is brought back. The in-memory marker
+  for our own downs is lost on a daemon restart — the case HW-seen on 245
+  (autostart false, errors `[RADIO_HELD]`, "administratively down").
+
+Also corrected: netifd never retries a failed setup of a `no_proto_task`
+handler — the interface stays pending (gotchas.md). Host-tested with
+counter-proofs; the HW round on 245 is open.
 
 ## Known open
 

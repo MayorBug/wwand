@@ -75,6 +75,12 @@ Match a specific card by its ICCID and give it a PIN — and optionally its own
 APN / auth / PDP type, optionally bound to one modem. Ideal for dual-SIM or
 swapping eUICC profiles with different PINs.
 
+The table's **Now** column says where each card is at the moment, from the SIM
+inventory: modem and slot, `eSIM <state>` for an eUICC profile, `rsim <reader>`
+for a card in a remote reader, `in use` for the one a modem runs on, or *not
+present* / *not seen*. Status only; the PIN column shows only whether a PIN is
+set.
+
 ![SIM override editor](images/luci-sim-editor.png)
 
 ## Status → SIM cards — the inventory

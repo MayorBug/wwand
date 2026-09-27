@@ -815,7 +815,11 @@ the PIN it waits for. An edit that changes what the card in use gets is also
 APPLIED like a card re-read: the attach profile is programmed again
 (`reapply_sim`; the attach APN lives only there) and the sessions still up
 re-dial — matching alone left an edited APN unused and a rejected attach
-rejected (HW-seen on 245, 2026-09-27).
+rejected (HW-seen on 245, 2026-09-27). The attach profile now also gets the
+connection's CREDENTIALS when its APN is the connection's (no `init_apn`):
+a CHAP-only M2M APN rejected the attach without them ("EMM attach failed",
+profile 1 with the APN and no login) while data calls with the same login
+worked. The password is written once per value, so a live edit lands.
 
 ## A direct download's PIR reaches the SM-DP+ (2026-09-27)
 

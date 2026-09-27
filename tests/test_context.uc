@@ -1334,7 +1334,7 @@ ok(_all_done, sprintf('every scenario ran (%d of %d) — the pump did not run ou
 		deps: { log: () => null, on_event: () => null } });
 
 	ctx3.ensure_attach_profile(1, () => null);
-	eq(m3._init_pass_written, null, 'attach: a failed write does not latch the password away');
+	eq(m3._attach_pass, null, 'attach: a failed write does not latch the password away');
 
 	// credentials alone do not touch a profile whose APN already matches — the
 	// config parser warns about that combination, and it must not silently
@@ -1342,6 +1342,52 @@ ok(_all_done, sprintf('every scenario ran (%d of %d) — the pump did not run ou
 	mods = [];
 	mkctx({ init_user: 'u' }).ensure_attach_profile(1, () => null);
 	eq(length(mods), 0, 'attach: credentials without init_apn write nothing');
+
+	// Without init_apn the attach APN IS the connection's, and so are its
+	// credentials: a CHAP-only APN rejects an attach without them (HW-seen,
+	// RG650E, 2026-09-27: "EMM attach failed", profile 1 with the APN and no
+	// login). Taken from the connection config (conn_cfg: wwand_sim first).
+	// a profile that keeps what was written, as the modem's does (the
+	// password is never read back)
+	let mkwds_live = (cur) => ({
+		request: (name, args, cb) => {
+			if (name == 'GET_PROFILE_SETTINGS')
+				return cb(null, cur);
+			push(mods, args);
+			for (let k in [ 'apn', 'pdp_type', 'auth', 'username' ])
+				if (args[k] != null)
+					cur[k] = args[k];
+			cb(null, {});
+		},
+	});
+	let mkctx_data = (dcfg, modem) => context_mod.create({
+		name: 'atpd', modem: modem,
+		config: dcfg, deps: { log: () => null, on_event: () => null },
+	});
+	let m4 = { wds_cfg: mkwds_live({ apn: 'm2m', pdp_type: 0, auth: 0, username: '' }), config: {},
+	           alloc: () => null, attach_context: () => null };
+	let ctx4 = mkctx_data({ apn: 'm2m', pdp_type: 'ipv4', auth: 'chap', username: 'gdsp', password: 'gdsp' }, m4);
+
+	mods = [];
+	ctx4.ensure_attach_profile(1, () => null);
+	eq([ length(mods), mods[0]?.username, mods[0]?.password, mods[0]?.auth != null ], [ 1, 'gdsp', 'gdsp', true ],
+	   'attach: the connection\'s APN brings its credentials into the attach profile');
+	ctx4.ensure_attach_profile(1, () => null);
+	eq(length(mods), 1, 'attach: ...written once per password');
+
+	// a password changed live (a wwand_sim edit) lands without a rebuild
+	ctx4.config.password = 'new';
+	ctx4.ensure_attach_profile(1, () => null);
+	eq([ length(mods), mods[1]?.password ], [ 2, 'new' ], 'attach: a changed password is written again');
+
+	// a card-provisioned APN (none configured) gets no credentials either
+	let m5 = { wds_cfg: mkwds({ apn: 'card', pdp_type: 0, auth: 0, username: '' }), config: {},
+	           alloc: () => null, attach_context: () => null };
+
+	mods = [];
+	mkctx_data({ apn: '', auth: 'chap', username: 'x', password: 'y' }, m5).ensure_attach_profile(1, () => null);
+	eq(filter(mods, (m) => m.username != null || m.password != null || m.auth != null), [],
+	   'attach: no configured APN — the provisioned one is left with its own login');
 })();
 
 done('test_context');

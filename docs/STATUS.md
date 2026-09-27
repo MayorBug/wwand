@@ -813,6 +813,19 @@ override ignored and a deleted one in force until the next card read. A
 modem held at SIM_BLOCKED is still restarted, since the override may carry
 the PIN it waits for.
 
+## A direct download's PIR reaches the SM-DP+ (2026-09-27)
+
+`esim_bridge.session_notify(ref, seq, cb)`: while an SGP.32 assistant waits
+in an event, lpac sends one pending notification to its SM-DP+ (`notification
+process -r <seq>`, removed from the card only after the acknowledgement). An
+assistant's direct download (SGP.32 v1.3 3.2.3.1) runs lpac without its
+notification step so the assistant can read the PIR into its result for the
+eIM (step 13); step 14 — the PIR to the SM-DP+ over ES9+ — had nobody doing
+it, and the eIM forwards only the PIRs of indirect downloads it ran (5.7.4).
+wwand-ipa answers ipad's new `notify` event with it. Host-tested
+(`test_esim_bridge`: that one notification with `-r`, never `-a`; lpac's
+result line decides; refused outside a waiting session); not run on hardware.
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

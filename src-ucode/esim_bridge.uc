@@ -470,6 +470,9 @@ return {
 			                                    length(conf ?? '') ? sprintf(" -c '%s'", conf) : ''); break;
 			case 'notif-list':    cmd = 'notification list'; break;
 			case 'notif-process': cmd = 'notification process -a'; break;
+			// one notification by seqNumber (digits only, checked by the
+			// caller), removed from the card once the SM-DP+ acknowledged it
+			case 'notif-send':    cmd = sprintf("notification process -r '%s'", code); break;
 			// management writes: the ICCID rides in the code arg (validated
 			// digits-only by the caller, so the quoting is shell-safe)
 			case 'enable':        cmd = sprintf("profile enable '%s'",  code); break;
@@ -666,9 +669,12 @@ return {
 		// (mgmt_busy) and is parked with its own channel closed, so the
 		// download runs under its claim instead of being refused as busy —
 		// and only then: outside such a wait it is refused. The install
-		// notification stays on the card (no auto notify), because the
-		// assistant reports the PIR to its eIM itself. cb(err, dl) when the
-		// run has ENDED, not when it starts.
+		// notification stays on the card (no auto notify): the assistant
+		// reads it into its trigger result for the eIM (SGP.32 v1.3 3.2.3.1
+		// step 13) and then has it sent to the SM-DP+ with session_notify
+		// (step 14). `notification process -a` here would also send every
+		// other pending notification, which the assistant delivers through
+		// its eIM. cb(err, dl) when the run has ENDED, not when it starts.
 		let session_download = (ref, code, conf, cb) => {
 			if (parked?.ref != ref)
 				return cb({ error: 'no_session' });
@@ -698,9 +704,48 @@ return {
 				});
 		};
 
+		// The Profile Installation Result of such a direct download, to the
+		// SM-DP+ through the same ES9+ client: SGP.32 v1.3 3.2.3.1 step 14
+		// (and 3.7 [2a]) puts that delivery on the device, and an eIM
+		// forwards only the PIRs of indirect sessions it ran itself (5.7.4).
+		// `notification process -r <seq>` sends that one notification and
+		// removes it from the card only after the SM-DP+ acknowledged it
+		// (lpac 2.3.0 src/applet/notification/process.c, _process_single; SGP.22
+		// v2.7 3.1.3.3 steps 7 and 11). Only the assistant knows which
+		// notification is the PIR: every other one stays on the card for it
+		// to deliver through its eIM. cb(err) when the run has ENDED.
+		let session_notify = (ref, seq, cb) => {
+			if (parked?.ref != ref)
+				return cb({ error: 'no_session' });
+
+			if (dl?.state == 'running')
+				return cb({ error: 'busy' });
+
+			if (type(seq) != 'int' || seq < 0)
+				return cb({ error: 'invalid_argument' });
+
+			let q = quiet_claim(modem_of(ref)?.modem);
+			let p = lpac_run(ref, parked.slot, 'notif-send', sprintf('%d', seq), '', (err, out) => {
+				q();
+
+				// lpac exits 0 when the SM-DP+ refuses too; its result line decides
+				let ok = !err && match(out ?? '', /result:[^\n]*code=0/);
+
+				log(ok ? 'notice' : 'warn', sprintf('modem %s: eSIM notification %d %s', ref, seq,
+					ok ? 'delivered to the SM-DP+' : 'NOT delivered to the SM-DP+'));
+				cb(ok ? null : { error: 'notify_failed', code: err?.code ?? -1 });
+			});
+
+			if (!p) {
+				q();
+				cb({ error: (p === false) ? 'esim_not_installed' : 'spawn' });
+			}
+		};
+
 		return {
 			session_run: session_run,
 			session_download: session_download,
+			session_notify: session_notify,
 
 			// a host session is on the card (a download, a profile change,
 			// a plugin's run, one parked in an event): another one beside it

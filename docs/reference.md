@@ -2127,7 +2127,11 @@ core knowing them by name (`plugins.uc`). A plugin is a plain script at
   (whose `session_run` runs another stdio-APDU process on the card under
   the same claim as lpac; its events carry their flat payload fields, and
   `session_download(ref, code, cc, cb)` runs an lpac download for the session
-  while that session waits in an event), `esim_refresh` and
+  while that session waits in an event, and `session_notify(ref, seq, cb)`
+  sends one pending notification to its SM-DP+ the same way — `lpac
+  notification process -r <seq>`, removed from the card only after the
+  acknowledgement; an SGP.32 assistant uses it for a direct download's PIR,
+  SGP.32 v1.3 3.2.3.1 step 14), `esim_refresh` and
   `sim_upsert(iccid, fields, origin, opts)`. That last one writes the plugin's
   own `wwsim_<iccid>` section and never touches a user's. `opts.create_only`
   writes only when there is no section yet. Written values are re-read at

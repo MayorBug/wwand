@@ -278,6 +278,70 @@ await_state = (b, left, cb) =>
 		uloop.timer(50, () => await_state(b, left - 1, cb));
 	});
 
+// session_notify: the PIR of an assistant's direct download goes to the SM-DP+
+// through lpac while the assistant waits in an event (SGP.32 v1.3 3.2.3.1 step
+// 14). What lpac is asked to do is the point: that ONE notification, removed
+// only after the SM-DP+ acknowledged it (-r), never `-a`, which would also send
+// every notification the assistant delivers through its eIM.
+let notify_tests = (then) => {
+	let rec_args = sprintf('%s/wwand-test-lpac-args', tmp);
+	let fake_rec = sprintf('%s/wwand-test-lpac-rec.sh', tmp);
+	let fake_bad = sprintf('%s/wwand-test-lpac-bad.sh', tmp);
+	let fake_ipa = sprintf('%s/wwand-test-ipa.sh', tmp);
+	let ipa_ans = sprintf('%s/wwand-test-ipa-answer', tmp);
+
+	write_stub(fake_rec, sprintf("#!/bin/sh\necho \"$*\" > %s\n", rec_args) +
+		"printf '%s\\n' '{\"type\":\"lpa\",\"payload\":{\"code\":0,\"message\":\"success\"}}'\n");
+	write_stub(fake_bad,
+		"printf '%s\\n' '{\"type\":\"lpa\",\"payload\":{\"code\":-1,\"message\":\"es9p_handle_notification\"}}'\n");
+	// the assistant: asks for seq 7, writes down the host's answer, ends
+	write_stub(fake_ipa, "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"type\":\"event\",\"payload\":{\"event\":\"notify\",\"seq\":7}}'\n" +
+		sprintf("read -r line; echo \"$line\" > %s\n", ipa_ans));
+
+	let b = mk(fake_rec, null);
+
+	b.session_notify('m0', 7, (e0) => {
+		eq(e0?.error, 'no_session', 'session_notify: refused outside a waiting session');
+
+		let got = null;
+
+		b.session_run('m0', 1, 'ipa', fake_ipa, 'notice', (rec, reply) => {
+			b.session_notify('m0', '7; reboot', (e1) => {
+				eq(e1?.error, 'invalid_argument', 'session_notify: a seq that is no integer is refused');
+
+				b.session_notify('m0', rec.payload?.seq, (e2) => {
+					got = e2;
+					reply({ ok: !e2 });
+				});
+			});
+		}, () => {
+			eq(got, null, 'session_notify: delivered');
+			eq(trim(fs.readfile(rec_args) ?? ''), 'notification process -r 7',
+				'session_notify: lpac sends that one notification and removes it after the ack');
+			ok(match(fs.readfile(ipa_ans) ?? '', /"ok": *true/), 'session_notify: the assistant hears ok');
+
+			// lpac's result line says the SM-DP+ refused: the assistant hears failed
+			let bb = mk(fake_bad, null);
+			let got2 = 'none';
+
+			bb.session_run('m0', 1, 'ipa', fake_ipa, 'notice', (rec, reply) => {
+				bb.session_notify('m0', rec.payload?.seq, (e3) => {
+					got2 = e3?.error;
+					reply({ ok: !e3 });
+				});
+			}, () => {
+				eq(got2, 'notify_failed', 'session_notify: an lpac failure is a failure');
+				ok(match(fs.readfile(ipa_ans) ?? '', /"ok": *false/), 'session_notify: the assistant hears failed');
+
+				for (let f in [ rec_args, fake_rec, fake_bad, fake_ipa, ipa_ans ])
+					fs.unlink(f);
+				then();
+			});
+		});
+	});
+};
+
 lpac_stdio_tests = () => {
 	backend_at = false;   // back to the host-side (lpac) download path
 	dl_auto = true;
@@ -387,10 +451,12 @@ lpac_stdio_tests = () => {
 											eq(n3, null,
 												'notifications: ...and again, so the claim was released');
 
-											fs.unlink(fake_ok);
-											fs.unlink(fake_mute);
-											fs.unlink(mute_pidf);
-											done('test_esim_bridge');
+											notify_tests(() => {
+												fs.unlink(fake_ok);
+												fs.unlink(fake_mute);
+												fs.unlink(mute_pidf);
+												done('test_esim_bridge');
+											});
 										});
 									});
 									});

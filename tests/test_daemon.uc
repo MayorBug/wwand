@@ -1929,6 +1929,48 @@ uloop.run();
 		'remove: ...and the daemon then drops its handle to it');
 }
 
+// --- a rebuild keeps the plugin options ------------------------------------------
+//
+// `ext` (plugins.uc) is stamped by reload only. start_modem rebuilds the entry
+// on every hotplug re-add, and carry_over did not carry it: after a modem reset
+// the plugin saw the modem as unconfigured until the next reload — a remote SIM
+// session ended on its own (HW-found on 245, 2026-09-27).
+{
+	let ctl = { device: '/dev/cdc-wdm0', protocol: 'qmi', driver: 'qmi_wwan', netdev: 'wwan0' };
+	let parsed3 = config.parse({ network: {
+		m0: { '.type': 'wwand_modem', device: '/dev/cdc-wdm0', rsim: 'reader1' },
+	} }, { ext_options: [ 'rsim' ] });
+	let d4 = daemon_mod.create({
+		timing: { sync_retry: 1, settle: 1, sim_settle: 1, card_poll: 1,
+		          reg_timeout: 500, backoff_min: 40, backoff_max: 60 },
+		deps: {
+			log: () => null,
+			load_qmi: () => ({
+				modem: { create: () => ({ id: 'm0', start: () => null, stop: () => null,
+					note_connect_success: () => null, note_connect_failure: () => null, datapath: {} }) },
+				context: { create: (o) => ({ state: 'IDLE', config: o.config, modem: o.modem, modem_event: () => null }) },
+			}),
+			emit_event: () => null, kick_interface: () => null,
+			renew_interface: () => null, down_interface: () => null,
+			iface_status: (i, cb) => cb({ up: false }),
+			datapath_fx: null, read_config: () => parsed3,
+			resolve_control: () => ctl, resolve_netdev: () => null,
+			learn_device: () => null, learn_modem_path: () => null,
+		},
+	});
+
+	d4.apply_config(parsed3);
+	eq(d4.modems.m0.ext, { rsim: 'reader1' }, 'ext: the plugin options after the config is applied');
+
+	ctl = null;
+	d4.hotplug('remove', 'cdc-wdm0');
+	ctl = { device: '/dev/cdc-wdm0', protocol: 'qmi', driver: 'qmi_wwan', netdev: 'wwan0' };
+	d4.hotplug('add', 'cdc-wdm0');
+
+	ok(d4.modems.m0.modem != null, 'ext: the modem is back after the re-add');
+	eq(d4.modems.m0.ext, { rsim: 'reader1' }, 'ext: ...and keeps its plugin options across the rebuild');
+}
+
 
 // wiped `_had_modem` and the outage clock, the next tick classified the wait as
 // a cold boot, and the reboot rung could never be reached. The reboot rung is
@@ -2845,6 +2887,163 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	} }));
 	eq(lines.builtin?.(), 'gpio515', 'own line: the modem\'s assigned reset_gpio is the one pulsed');
 	d2.shutdown();
+})();
+
+// A GIVE-UP OUTLIVES A DAEMON RESTART. wwand downs an interface it gave up
+// on (reconnect-hold expiry) and re-arms it when the modem registers again —
+// a mark that lived on the context entry only, so a restart inside the outage
+// (a package upgrade) lost it and the interface, autostart cleared by our own
+// down, was read as an operator ifdown and never came back (HW-seen on 245,
+// 2026-09-27). Kept in a state file, per interface; an operator ifdown still
+// clears it.
+(() => {
+	let fx = fakefx.create();
+	let FILE = '/tmp/test-giveups.json';
+	let fake = {
+		modem: { create: (o) => ({ id: o.id, state: 'READY', config: o.config,
+		                           start: () => null, stop: () => null }) },
+		context: { create: (o) => {
+			let c;
+
+			c = { state: 'CONNECTED', name: o.name, modem: o.modem, config: o.config,
+			      down: (cb) => { c.state = 'IDLE'; return cb ? cb() : null; },
+			      up: (cb) => cb(null) };
+			return c;
+		} },
+	};
+	let cfg = config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: 'a' },
+	} });
+	let mk = () => {
+		let d = daemon_mod.create({ timing: TIMING,
+			deps: { log: () => null, load_qmi: () => fake, datapath_fx: fx, giveups_file: FILE } });
+
+		d.apply_config(cfg);
+		return d;
+	};
+
+	let d1 = mk();
+
+	eq(d1.contexts.wan.reconnect_on_register, false, 'give-up file: nothing given up at first');
+
+	d1.contexts.wan._holdexpiry = true;
+	d1.context_down('wan', () => null);
+	eq(d1.contexts.wan.reconnect_on_register, true, 'give-up file: a hold expiry gives the interface up, re-armable');
+	ok(index(fx.files[FILE] ?? '', '"wan"') >= 0, 'give-up file: ...and it is written down');
+	d1.shutdown();
+
+	// the restart
+	let d2 = mk();
+
+	eq(d2.contexts.wan.reconnect_on_register, true, 'give-up file: a restarted daemon still re-arms it on registration');
+
+	// an operator ifdown (a plain down, no hold expiry) clears it, there too
+	d2.contexts.wan.ctx.state = 'CONNECTED';
+	d2.context_down('wan', () => null);
+	eq(d2.contexts.wan.reconnect_on_register, false, 'give-up file: an operator ifdown clears the give-up');
+	eq(index(fx.files[FILE] ?? '', '"wan"'), -1, 'give-up file: ...in the file as well');
+	d2.shutdown();
+
+	let d3 = mk();
+
+	eq(d3.contexts.wan.reconnect_on_register, false, 'give-up file: ...so the next restart leaves it down');
+	d3.shutdown();
+})();
+
+// ...and what the mark is FOR: after the restart the modem registers, netifd
+// has the interface down with autostart cleared (our own down), and the
+// interface is kicked back up — not read as an operator ifdown. The previous
+// version restored the flag but started the context wanted, so the ready
+// path parked it (found by audit, 2026-09-27). Also: the teardown netifd runs
+// after a down WE issued keeps the give-up; a removed interface loses its mark.
+(() => {
+	let fx = fakefx.create();
+	let FILE = '/tmp/test-giveups2.json';
+	let hooks = {}, calls = [];
+
+	fx.files[FILE] = '[ "wan" ]';
+
+	let fake = {
+		modem: { create: (o) => {
+			hooks[o.id] = o.deps.on_event;
+			return { id: o.id, state: 'READY', config: o.config, start: () => null, stop: () => null,
+			         note_connect_success: () => null };
+		} },
+		context: { create: (o) => ({ state: 'IDLE', name: o.name, modem: o.modem, config: o.config,
+		                             down: (cb) => cb ? cb() : null, up: (cb) => cb(null),
+		                             modem_event: () => null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: {
+		log: () => null, load_qmi: () => fake, datapath_fx: fx, giveups_file: FILE,
+		kick_interface: (i) => push(calls, 'kick:' + i),
+		down_interface: (i) => push(calls, 'down:' + i),
+		iface_status: (i, cb) => cb({ up: false, autostart: false }),
+	} });
+
+	d.apply_config(config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: 'a' },
+	} }));
+
+	eq([ d.contexts.wan.wanted, d.contexts.wan.reconnect_on_register ], [ false, true ],
+	   'give-up restored: not wanted until the modem is back, re-armable');
+
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(calls, [ 'kick:wan' ], 'give-up restored: the registration kicks it back up (our own down, not an ifdown)');
+	eq(d.contexts.wan.wanted, true, 'give-up restored: ...and it is wanted again');
+
+	// a SIM block: we mark our down and down it; netifd's teardown comes back
+	// through context_down and must not undo the give-up
+	d.contexts.wan.ctx.state = 'CONNECTED';
+	hooks.m0(d.modems.m0.modem, 'sim_blocked', {});
+	d.context_down('wan', () => null);
+	eq(d.contexts.wan.reconnect_on_register, true, 'SIM block: the teardown of our own down keeps the give-up');
+	ok(index(fx.files[FILE] ?? '', '"wan"') >= 0, 'SIM block: ...in the file too');
+
+	// the interface removed: its mark goes
+	d.apply_config(config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+	} }));
+	eq(index(fx.files[FILE] ?? '', '"wan"'), -1, 'give-up: a removed interface loses its mark');
+	d.shutdown();
+})();
+
+// The same card whose IMSI only now became readable is not a new card: after
+// a card change the IMSI is cleared and a slow card is read again until it
+// has one — "ICCID/" then "ICCID/IMSI" must not drop the session that came up
+// on the first read (found by audit, 2026-09-27). A different card still does.
+(() => {
+	let hooks = {}, downs = 0;
+	let fake = {
+		modem: { create: (o) => {
+			hooks[o.id] = o.deps.on_event;
+			return { id: o.id, state: 'READY', config: o.config, start: () => null, stop: () => null,
+			         note_connect_success: () => null };
+		} },
+		context: { create: (o) => ({ state: 'CONNECTED', name: o.name, modem: o.modem, config: o.config,
+		                             down: (cb) => { downs++; return cb ? cb() : null; }, up: (cb) => cb(null),
+		                             modem_event: () => null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: { log: () => null, load_qmi: () => fake,
+		iface_status: (i, cb) => cb({ up: true, autostart: true }) } });
+
+	d.apply_config(config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: 'a' },
+	} }));
+	d.contexts.wan.wanted = true;
+
+	let m = d.modems.m0.modem;
+
+	hooks.m0(m, 'sim_refresh', { iccid: '8949000000000000001', imsi: '262010000000001' });
+	hooks.m0(m, 'sim_refresh', { iccid: '8988000000000000002', imsi: null });
+	let after_change = downs;
+
+	ok(after_change > 0, 'identity: a new card drops the session');
+	hooks.m0(m, 'sim_refresh', { iccid: '8988000000000000002', imsi: '901280000000002' });
+	eq(downs, after_change, 'identity: its IMSI read a moment later is not another change');
+	d.shutdown();
 })();
 
 done('test_daemon');

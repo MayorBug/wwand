@@ -237,6 +237,55 @@ tr.reply("ERROR\r\n");   // errors do not abort the sequence
 eq(tr.written, [ "AT+A\r", "AT+B\r" ], 'sequence: both commands sent');
 ok(seq_done, 'sequence: completion after error');
 
+// --- run_sequence: a setting, written only when it differs --------------------
+{
+	let step = { check: 'AT+QNVFR="/x"', want: '^\\+QNVFR: *"?00"?$', set: 'AT+QNVFW="/x",00', note: 'x allowed', reset: true };
+	let t2 = fake_transport(), a2 = atcmd.create(t2, { log: silent });
+	let res = null;
+
+	// already as wanted: read only, nothing written, nothing changed
+	a2.run_sequence([ step, 'AT+C' ], (ch) => { res = ch; });
+	t2.reply('+QNVFR: 00\r\nOK\r\n');
+	t2.reply('OK\r\n');
+	eq(t2.written, [ 'AT+QNVFR="/x"\r', 'AT+C\r' ], 'setting: already set — only read, then the next command');
+	eq(res, [], 'setting: ...and nothing changed');
+
+	// differs (no such item): written, read back, reported
+	t2 = fake_transport(); a2 = atcmd.create(t2, { log: silent }); res = null;
+	a2.run_sequence([ step ], (ch) => { res = ch; });
+	t2.reply('ERROR\r\n');
+	t2.reply('OK\r\n');
+	t2.reply('+QNVFR: 00\r\nOK\r\n');
+	eq(t2.written, [ 'AT+QNVFR="/x"\r', 'AT+QNVFW="/x",00\r', 'AT+QNVFR="/x"\r' ], 'setting: missing — written, then read back');
+	eq(res, [ { note: 'x allowed', reset: true } ], 'setting: ...and reported as changed, with its reset');
+
+	// written but it does not stick: not reported (no reset for nothing)
+	t2 = fake_transport(); a2 = atcmd.create(t2, { log: silent }); res = null;
+	a2.run_sequence([ step ], (ch) => { res = ch; });
+	t2.reply('+QNVFR: 01\r\nOK\r\n');
+	t2.reply('OK\r\n');
+	t2.reply('+QNVFR: 01\r\nOK\r\n');
+	eq(res, [], 'setting: a write that does not read back is not a change');
+
+	// refused write: the sequence goes on
+	t2 = fake_transport(); a2 = atcmd.create(t2, { log: silent }); res = null;
+	a2.run_sequence([ step, 'AT+D' ], (ch) => { res = ch; });
+	t2.reply('ERROR\r\n');
+	t2.reply('ERROR\r\n');
+	t2.reply('OK\r\n');
+	eq([ t2.written[2], res ], [ 'AT+D\r', [] ], 'setting: a refused write does not stop the sequence');
+
+	// a check that gets NO answer says nothing about the setting: nothing is
+	// written (no flash write, no reset on every start), the sequence goes on
+	t2 = fake_transport(); a2 = atcmd.create(t2, { log: silent }); res = null;
+	a2.run_sequence([ { ...step, timeout: 10 }, 'AT+E' ], (ch) => { res = ch; });
+	uloop.timer(60, () => uloop.end());
+	uloop.run();
+	t2.reply('OK\r\n');
+	eq([ t2.written, res ], [ [ 'AT+QNVFR="/x"\r', 'AT+E\r' ], [] ],
+	   'setting: an unanswered check writes nothing and the sequence goes on');
+}
+
 // --- model quirks ------------------------------------------------------------
 
 eq(atcmd.model_init_commands('EG06'), [ 'AT+QMBNCFG="AutoSel",1' ], 'quirks: EG06');

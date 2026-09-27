@@ -122,3 +122,48 @@ carries an LTE line and a 5G line, and a break in the purple one is 5G dropping
 out rather than a missing reading:
 
 ![Modem status — NR7101](images/luci-status-nr7101.png)
+
+## Network → Remote SIM (plugin: wwand-rsim)
+
+With the [wwand-rsim](https://github.com/ddimension/wwand-rsim) plugin a
+modem can run on a SIM card that is not in its own slot: in a reader on the
+router or on a PC, in a phone lent over Bluetooth (SIM Access Profile), in
+another modem of the same router, or in a modem of another wwand router. What
+has run on which hardware, and the workarounds for it, is in that repository's
+README, *What works*.
+
+**Status** — per modem the card in use and the remote SIM behind it, and whom
+it lends its own card to. Here the Chateau's RG650E runs on the card of the
+Huawei E392 next to it; the E392 lends it APDU by APDU (it hangs on SIM
+Access) with its radio off:
+
+![Remote SIM — status](images/luci-rsim-status.png)
+
+**Find SIM sources** — a scan of this router or, over SSH, of another
+machine. Nothing is sent to a card or a port, and a phone is not called up.
+A PC with a Smartmouse USB reader and two paired phones that offer SIM Access,
+with what sysfs and BlueZ know about each:
+
+![Remote SIM — scan of a PC](images/luci-rsim-scan-phones.png)
+
+...and another wwand router: its modem's ports (the one wwand drives and the
+diagnostic port are not offered), and the card in its modem with the settings
+that router dials it with — which come along as this router's `wwand_sim` for
+the card when it is borrowed:
+
+![Remote SIM — scan of a wwand router](images/luci-rsim-scan-router.png)
+
+**SSH setup** — the router's key, and per machine the `authorized_keys` line
+that lets it run only what wwand-rsim needs there (`rsim-card --serve`, the
+readers named), with a *Test* that says what is wrong:
+
+![Remote SIM — SSH setup](images/luci-rsim-ssh.png)
+
+**SIM readers** and **Modems** — the configuration: where cards come from,
+and which one each modem uses (*its own SIM* gives its card back at once):
+
+![Remote SIM — configuration](images/luci-rsim-config.png)
+
+The modem status page shows the remote SIM in the modem panel:
+
+![Modem status — remote SIM row](images/luci-status-rsim-row.png)

@@ -23,6 +23,11 @@
 //       status(ref, ext),               // -> status row(s), or null
 //       esim_guard(ref, op, ext),       // -> null, or { reason } to refuse a
 //                                       //    card-changing modem_esim op
+//       at_init(ref, ext, info),        // -> AT init steps for this modem:
+//                                       //    commands, or settings
+//                                       //    { check, want, set, note, reset }
+//                                       //    written only when they differ
+//                                       //    (atcmd run_sequence)
 //       ops: { <op>: (ref, ext, args, cb) },   // ubus modem_plugin
 //       read_ops: [ 'status', ... ],           // ...and which of them the
 //                                              // read-only twin may call
@@ -284,6 +289,43 @@ export function install(self, o)
 		}
 
 		return null;
+	};
+
+	// The AT init steps the plugins add for a modem, in plugin order. info:
+	// the modem's identity (manufacturer, model, revision) and its control
+	// protocol. A plugin that throws adds nothing and costs the others
+	// nothing.
+	self.plugins_at_init = function(ref, info) {
+		let out = [];
+
+		for (let p in active()) {
+			if (type(p.inst.at_init) != 'function')
+				continue;
+
+			try {
+				let steps = p.inst.at_init(ref, ext_of(ref), info ?? {});
+
+				// checked HERE, where a throw is caught: atcmd runs the steps
+				// inside uloop callbacks, where a bad regex ends the daemon
+				for (let st in (type(steps) == 'array') ? steps : []) {
+					let good = (type(st) == 'string') ||
+						(type(st) == 'object' && type(st.check) == 'string' &&
+						 type(st.set) == 'string' && type(st.want) == 'string' &&
+						 type(regexp(st.want)) == 'regexp');
+
+					if (good)
+						push(out, st);
+					else
+						log('warn', sprintf('plugin %s: at_init step ignored (not a command or a {check, want, set} setting): %J',
+							p.name, st));
+				}
+			}
+			catch (e) {
+				log('warn', sprintf('plugin %s: at_init failed (%s)', p.name, e));
+			}
+		}
+
+		return out;
 	};
 
 	// ubus modem_plugin { modem, plugin, op, args } — and the read-only twin,

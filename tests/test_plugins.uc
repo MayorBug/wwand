@@ -44,6 +44,10 @@ inst = {
 		poll:   (ref, ext, args, cb) => cb(null, { started: true }),
 	},
 	read_ops: [ 'status' ],
+	// a setting for a Qualcomm modem with the plugin's option set, nothing else
+	at_init: (ref, ext, info) => (info.protocol == 'qmi' && ext.alpha == '1')
+		? [ 'AT+ALPHA', { check: 'AT+X?', want: '^1$', set: 'AT+X=1', note: 'x', reset: true },
+		    { check: 'AT+Y?', set: 'AT+Y=1' }, 42 ] : [],
 };
 
 let self = {
@@ -68,6 +72,12 @@ self.modem_plugin('m0', 'alpha', 'poll', {}, (e, r) => { res = [ e, r ]; }, fals
 eq(res, [ null, { started: true } ], 'ubus: the write method reaches it');
 self.modem_plugin('m0', 'nosuch', 'status', {}, (e, r) => { res = [ e, r ]; }, false);
 eq(res[0]?.error, 'no_such_plugin', 'ubus: an unknown plugin is named as such');
+
+eq(self.plugins_at_init('m0', { model: 'M', protocol: 'qmi' }),
+   [ 'AT+ALPHA', { check: 'AT+X?', want: '^1$', set: 'AT+X=1', note: 'x', reset: true } ],
+   'at_init: the steps a plugin adds, with the modem\'s options and identity — a malformed one left out');
+eq(self.plugins_at_init('m0', { protocol: 'mbim' }), [], 'at_init: ...and none where it says none');
+eq(self.plugins_at_init('m1', { protocol: 'qmi' }), [], 'at_init: per modem');
 
 // --- simops: the lock and the connection token -------------------------------------
 

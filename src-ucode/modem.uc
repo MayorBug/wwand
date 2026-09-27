@@ -188,7 +188,7 @@ export function create(opts)
 	// clients, which delivers a synchronous `cancelled` to everything in flight —
 	// so an outer set_opmode callback that ignores its error re-arms tm.settle
 	// AFTER the cancel pass. The new timer fires with self.dms already null
-	// (modem.uc:1637) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
+	// (modem.uc:1642) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
 	// which in ucode is a throw inside a uloop callback: the daemon dies and procd
 	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1162), and
 	// every QMI site that re-arms tm.settle needs it too.
@@ -503,7 +503,7 @@ export function create(opts)
 				// done() IS answered on the cancelled path. It is not only
 				// make_fail's internal continuation: the daemon passes a real
 				// caller's callback through note_connect_failure
-				// (daemon.uc:3043), and dropping it strands a ubus request.
+				// (daemon.uc:3066), and dropping it strands a ubus request.
 				// Restarting a torn-down modem is prevented where it belongs
 				// instead — make_fail now refuses a `cancelled` outright
 				// (modem_common.uc).
@@ -673,7 +673,12 @@ export function create(opts)
 	// REFRESH): re-read identity, RE-RESOLVE the per-SIM override (the old card's
 	// wwand_sim must not stick) and re-program the LTE attach profile — without
 	// tearing the modem down. cb(changed) optional.
-	self.reapply_sim = function(cb) {
+	// ALWAYS FRESH (sim.read_identity opts.fresh): every caller is a card
+	// event — a remote SIM, a slot switch, a refresh, a card the modem
+	// recovered internally — and DMS answers GET_IMSI from its cache, the
+	// previous card's IMSI, which then matched THAT card's wwand_sim (PIN,
+	// APN) — HW-seen on an RG650E lent an E392's card, 2026-09-27.
+	self.reapply_sim = function(cb, opts) {
 		sim.read_identity(self, (id) => {
 			let changed = (id.iccid != self.info.iccid || id.imsi != self.info.imsi);
 
@@ -702,7 +707,7 @@ export function create(opts)
 					}, finish);
 				});
 			});
-		});
+		}, { ...(opts ?? {}), fresh: true });
 	};
 
 	// register for SIM/eUICC refresh notifications so a network-/LPA-initiated

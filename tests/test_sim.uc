@@ -1489,6 +1489,37 @@ scenario('identity: a rejecting uim falls through to the legacy DMS getters', (n
 	});
 });
 
+// right after a card change the DMS getter answers from the firmware's
+// cache — the previous card's IMSI: a fresh read leaves it out and takes AT
+scenario('identity: fresh leaves out the cached DMS IMSI', (next) => {
+	let asked = [];
+	let m = { timing: T, config: {},
+		uim: { request: (name, args, cb) => uloop.timer(1, () => cb({ error: 'qmi', code: 48 }, null)) },
+		dms: { request: (name, args, cb) => {
+			push(asked, name);
+			uloop.timer(1, () => cb(null, { imsi: '262014943410220', iccid: '89490200001113571379', msisdn: null }));
+		} },
+		at: { send: (cmd, cb) => cb(null, { lines: [ (cmd == 'AT+CIMI') ? '262011203308161' : 'ERROR' ] }) } };
+
+	sim.read_identity(m, (id) => {
+		eq(id.imsi, '262011203308161', 'identity-fresh: the IMSI from the card (AT), not the cached one');
+		eq(index(asked, 'GET_IMSI'), -1, 'identity-fresh: GET_IMSI not asked');
+		next();
+	}, { fresh: true });
+});
+
+// ...but a modem with no AT channel has no other way to the IMSI: DMS then
+scenario('identity: fresh without an AT channel still asks DMS', (next) => {
+	let m = { timing: T, config: {},
+		uim: { request: (name, args, cb) => uloop.timer(1, () => cb({ error: 'qmi', code: 48 }, null)) },
+		dms: { request: (name, args, cb) => uloop.timer(1, () => cb(null, { imsi: '262031234567890', iccid: '89490260007654321' })) } };
+
+	sim.read_identity(m, (id) => {
+		eq(id.imsi, '262031234567890', 'identity-fresh-noat: DMS is the only source left, so it is asked');
+		next();
+	}, { fresh: true });
+});
+
 // --- PUK unblock chain (sim.unblock_puk) --------------------------------------
 
 // UIM UNBLOCK_PIN succeeds -> done, no fallback
@@ -1704,6 +1735,25 @@ sw_self.modem_sim_switch_slot('m0', 1, (err) => {
 	sw_deferred();
 	eq(sw_reapplied, 2, 'card change: a modem in its SIM step is left to it — no parallel re-read');
 	delete sw_modem.state;
+
+	// a card that is slow to come up (a remote SIM): read FRESH — not the
+	// firmware's cached IMSI, which is the old card's — and again while the
+	// IMSI is not there yet
+	{
+		let seen = [];
+		let plain = sw_modem.reapply_sim;
+
+		sw_modem.reapply_sim = (cb, opts) => { push(seen, opts); cb(true); };
+		sw_self.card_changed('m0', 'remote SIM in use');
+		sw_deferred();
+		eq(seen, [ { fresh: true } ], 'card change: the new card is read fresh (no cached IMSI)');
+		sw_deferred();
+		eq(length(seen), 2, 'card change: no IMSI yet — read again later');
+		sw_modem.info.imsi = '262011203308161';
+		sw_deferred();
+		eq(length(seen), 3, 'card change: ...until there is one');
+		sw_modem.reapply_sim = plain;
+	}
 
 	// idempotent switch keeps the caches
 	sw_modem._esim_refreshed = true;

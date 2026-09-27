@@ -10,6 +10,48 @@ buried at the top invites reading an old entry as present tense.
 
 ---
 
+## Core changes for the wwand-rsim plugin, found on the hardware (2026-09-27)
+
+Driven by running wwand-rsim (remote SIM) across 245, 242, 3.93 and the Cudy
+LT300: cards lent over SSH, by phones over Bluetooth and by sponsor modems.
+
+**Plugins take part in the AT init.** `plugins.uc` gains an `at_init` hook:
+a plugin contributes idempotent steps (`{check, want, set, note, reset}`) to
+the modem's AT init sequence (`atcmd.run_sequence`), and a step whose `set`
+needs a reset gets one — once per daemon (`at_init_changed`). wwand-rsim uses
+it for Quectel's SIM Access switch (the EFS item
+`sap_security_restrictions`). `modem_common.init_commands` / `init_done` are
+the shared entry for the three init sites. A modem rebuilt by hotplug keeps
+its plugin options (`carry_over` carries `ext`).
+
+**NCM parks with `CFUN=4`.** `option lowpower` and a lent card switched the
+radio off with `CFUN=0`, which powers the SIM down on most modems: a card
+lent over `AT+CSIM` answered `+CME ERROR: 13` (MeiG SLM770A). Now `CFUN=4`,
+as QMI's LOW_POWER; `CFUN=0` only for a modem that refuses 4. The radio cycle
+and the SIM power cycle keep 0/1 — there the SIM is meant to go down.
+
+**The identity after a card change is read from the card.** DMS `GET_IMSI`
+answers from the firmware's cache: after a card change it gave the previous
+card's IMSI for a while, which matched that card's `wwand_sim` — its PIN and
+APN (RG650E with a remote card). `sim.read_identity` takes `fresh` (no DMS
+cache); the QMI `reapply_sim` always reads fresh (every caller is a card
+event), and `card_changed` reads again every 15 s, up to 6 times, while a
+slow card has no IMSI yet.
+
+**A give-up survives a daemon restart.** An interface wwand downed itself
+(reconnect-hold expiry, a SIM block) is re-armed on the next registration —
+a mark that lived on the context entry only. A restart inside the outage (a
+package upgrade) lost it, and the interface, autostart cleared by our own
+down, was read as an operator ifdown and stayed down. The marks are kept in
+`/tmp/wwand/state/giveups.json`, per interface; an operator ifdown still
+clears them.
+
+**`tools/luci-screenshot.py` masks two more shapes.** An ICCID or EID printed
+in groups (`8949 0200 …`, the SIM slot panel) and the log panel, a
+`<textarea>` filled through `.value`, went out in clear; both are masked now
+and part of the residue check. The committed images predate both panels and
+were checked: masked.
+
 ## Device support pass: sponsor field fixes + huawei-cdc (2026-08-30)
 
 Driven by the Huasifei WH3000 Pro field report (Fibocom FM350-GL + two Huawei

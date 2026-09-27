@@ -64,6 +64,21 @@ MASK_JS = r"""
      long is never a cell id, an EARFCN or a byte counter. 14 is the floor
      because the longest thing we must NOT touch is a 9-digit cell id. */
   const maskText = (t) => t
+    /* THE SAME NUMBER IN GROUPS: the SIM slot panel prints an ICCID and an
+       EID as `8949 0200 0010 2283 2490`, which the run-length rule below never
+       sees — every group is four digits. Masked by the digit count of the
+       whole, keeping the spaces; the digits already masked stay X. Found on a
+       capture of the status page that printed both in clear (2026-09-27). */
+    .replace(/\b\d{4}(?: [\dX]{1,4}){3,}\b/g, (m) => {
+      const d = m.replace(/ /g, '');
+
+      if (d.length < 14) return m;
+
+      const k = keep(d, 5, 2);
+      let i = 0;
+
+      return m.replace(/[\dX]/g, () => k[i++]);
+    })
     .replace(/\d{14,}/g, (m) => keep(m, 5, 2))
     /* IPv4: the last two octets carry the host, the first two the operator's
        block — enough to show the shape without publishing the line. */
@@ -113,8 +128,13 @@ MASK_JS = r"""
     if (masked !== n.nodeValue) { n.nodeValue = masked; count++; }
   }
 
-  /* input values and titles are not text nodes and hold the same data */
-  for (const el of document.querySelectorAll('input[value], [title]')) {
+  /* input values, text areas and titles are not text nodes and hold the
+     same data. A textarea's text node is only its INITIAL content: the log
+     panel fills it through .value, so the walk above never saw the log, and
+     it went out with ICCID and IMSI in clear (2026-09-27). */
+  const fields = () => document.querySelectorAll('input, textarea, [title]');
+
+  for (const el of fields()) {
     if (el.value) el.value = maskText(el.value);
     if (el.title) el.title = maskText(el.title);
   }
@@ -126,6 +146,10 @@ MASK_JS = r"""
 
   while ((n = w2.nextNode()))
     if (maskText(n.nodeValue) !== n.nodeValue) residue++;
+
+  for (const el of fields())
+    if ((el.value && maskText(el.value) !== el.value) ||
+        (el.title && maskText(el.title) !== el.title)) residue++;
 
   return { ok: polled && residue === 0, polled: polled,
            masked: count, residue: residue };

@@ -499,7 +499,7 @@ push(scenarios, {
 
 push(scenarios, {
 	name: 's1c_lowpower',
-	script: script([ { re: /^AT\+CFUN=0$/, lines: [] },
+	script: script([ { re: /^AT\+CFUN=4$/, lines: [] },
 	                 { re: /^AT\+CFUN=1$/, lines: [] } ]),
 	cconfig: { apn: 'internet', pdp_type: 'ipv4', mux_id: 0 },
 	run_at_start: true,
@@ -507,8 +507,9 @@ push(scenarios, {
 		let m = env.modem;
 
 		m.set_opmode('low_power', (e1) => {
-			eq(e1, null, 'ncm lowpower: CFUN=0 accepted');
-			ok(env.tr.saw(/^AT\+CFUN=0$/) != null, 'ncm lowpower: the radio is switched off over AT');
+			eq(e1, null, 'ncm lowpower: CFUN=4 accepted');
+			ok(env.tr.saw(/^AT\+CFUN=4$/) != null, 'ncm lowpower: the radio is switched off over AT (CFUN 4, like QMI LOW_POWER)');
+			eq(env.tr.saw(/^AT\+CFUN=0$/), null, 'ncm lowpower: ...and the SIM is left powered (no CFUN 0)');
 			eq(m.lowpower_parked, true, 'ncm lowpower: ...and the modem remembers WE parked it');
 
 			m.set_opmode('online', (e2) => {
@@ -516,6 +517,44 @@ push(scenarios, {
 				eq(m.lowpower_parked, false, 'ncm lowpower: waking clears the parked mark');
 				env.finish();
 			});
+		});
+	},
+});
+
+// a SIM busy / anything but a refusal of CFUN 4 is NOT a reason for CFUN 0,
+// which would take the SIM down after all
+push(scenarios, {
+	name: 's1c_lowpower_cfun4_busy',
+	script: script([ { re: /^AT\+CFUN=4$/, term: '+CME ERROR: 14', lines: [] },
+	                 { re: /^AT\+CFUN=0$/, lines: [] } ]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4', mux_id: 0 },
+	run_at_start: true,
+	run: (env) => {
+		let m = env.modem;
+
+		m.set_opmode('low_power', (e) => {
+			ok(e != null, 'ncm lowpower, CFUN 4 busy: the error is reported');
+			eq(env.tr.saw(/^AT\+CFUN=0$/), null, 'ncm lowpower, CFUN 4 busy: no CFUN 0 (the SIM stays on)');
+			env.finish();
+		});
+	},
+});
+
+// a modem without CFUN 4 is parked with CFUN 0
+push(scenarios, {
+	name: 's1c_lowpower_no_cfun4',
+	script: script([ { re: /^AT\+CFUN=4$/, term: 'ERROR', lines: [] },
+	                 { re: /^AT\+CFUN=0$/, lines: [] } ]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4', mux_id: 0 },
+	run_at_start: true,
+	run: (env) => {
+		let m = env.modem;
+
+		m.set_opmode('low_power', (e) => {
+			eq(e, null, 'ncm lowpower, no CFUN 4: parked all the same');
+			ok(env.tr.saw(/^AT\+CFUN=0$/) != null, 'ncm lowpower, no CFUN 4: ...with CFUN 0');
+			eq(m.lowpower_parked, true, 'ncm lowpower, no CFUN 4: ...and remembered');
+			env.finish();
 		});
 	},
 });

@@ -1024,15 +1024,74 @@ export function create(transport, opts)
 	};
 
 	// run a list of commands sequentially, best-effort (errors logged only)
+	// A step is a command, or a SETTING the modem should have:
+	//   { check, want, set, note, reset }
+	// `check` reads it; when one of the answer's lines matches `want` (a
+	// regex source) the modem is as wanted and nothing is written — so the
+	// sequence can run on every start without wearing out the modem's flash.
+	// Otherwise `set` writes it and `check` confirms it. done(changed): the
+	// steps that changed something (their `note` and `reset`), for the
+	// caller to act on — an EFS item, for one, is read at modem boot only.
+	let run_step = (st, next) => {
+		let matches = (res) => length(filter(res?.lines ?? [], (l) => match(l, regexp(st.want)))) > 0;
+
+		// `timeout` (ms, optional): how long the check may take
+		let copts = (st.timeout > 0) ? { timeout: st.timeout } : null;
+
+		self.send(st.check, (err, res) => {
+			if (!err && matches(res)) {
+				log('debug', sprintf('%s: already set', st.note ?? redact(st.check)));
+				return next(null);
+			}
+
+			// A check that got NO ANSWER says nothing about the setting (a
+			// port still busy after enumeration, a timeout): writing on it would
+			// spend a flash write — and, with `reset`, a modem reset — on every
+			// start while the value is already right. Left for the next start.
+			// An answer that refuses (ERROR, +CME) is one: Quectel's QNVFR
+			// answers ERROR for an EFS item that does not exist yet (RG650E).
+			if (err && err.error != 'ERROR' && err.error != 'cme') {
+				log('warn', sprintf('%s: cannot read it (%J) — left as it is', st.note ?? redact(st.check), err));
+				return next(null);
+			}
+
+			self.send(st.set, (serr) => {
+				if (serr) {
+					log('warn', sprintf('%s: %s failed: %J', st.note ?? 'init setting', redact(st.set), serr));
+					return next(null);
+				}
+
+				self.send(st.check, (cerr, cres) => {
+					if (cerr || !matches(cres)) {
+						log('warn', sprintf('%s: written, but it does not read back as wanted', st.note ?? redact(st.set)));
+						return next(null);
+					}
+
+					log('notice', sprintf('%s: set%s', st.note ?? redact(st.set),
+						st.reset ? ' (takes effect after a modem reset)' : ''));
+					next(st);
+				});
+			});
+		}, copts);
+	};
+
 	self.run_sequence = function(cmds, done) {
 		let idx = 0;
+		let changed = [];
 		let step;
 
 		step = () => {
 			if (idx >= length(cmds))
-				return done ? done() : null;
+				return done ? done(changed) : null;
 
 			let cmd = cmds[idx++];
+
+			if (type(cmd) == 'object')
+				return run_step(cmd, (st) => {
+					if (st)
+						push(changed, { note: st.note, reset: !!st.reset });
+					step();
+				});
 
 			self.send(cmd, (err, res) => {
 				if (err)

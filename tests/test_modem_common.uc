@@ -1457,4 +1457,30 @@ eq(mc.resolve_diag_port({ config: {}, device: '/dev/cdc-wdm0' }, diag_fx(), { qc
 eq(mc.resolve_diag_port({ config: {}, device: '/dev/cdc-wdm0' }, diag_fx(), null),
 	null, 'diag: a modem with no AT channels at all does not throw');
 
+// --- the init list: plugin steps between the configured ones and the locks ------------
+{
+	let seen = null, changed = null, nexted = 0;
+	let m = { info: { model: 'RG502Q-EA' }, config: { at_init: [ 'AT+CONF' ], lock_4g: '1300:246' },
+	          at_init_extra: (info) => { seen = info; return [ { check: 'AT+X?', want: '^1$', set: 'AT+X=1', note: 'x', reset: true } ]; },
+	          at_init_changed: (c) => { changed = c; } };
+	let cmds = mc.init_commands(m);
+
+	eq(cmds[0], 'AT+QMBNCFG="AutoSel",1', 'init list: model quirks first');
+	eq(cmds[1], 'AT+CONF', 'init list: then the configured at_init');
+	eq(cmds[2]?.set, 'AT+X=1', 'init list: then what plugins add');
+	ok(index(cmds[3] ?? '', 'QNWLOCK') >= 0, 'init list: cell locks last');
+	eq(seen?.model, 'RG502Q-EA', 'init list: plugins see the identity');
+
+	let d = mc.init_done(m, { next: () => nexted++ });
+
+	d([]);
+	eq([ changed, nexted ], [ null, 1 ], 'init done: nothing changed — no report, the bring-up goes on');
+	d([ { note: 'x', reset: true } ]);
+	eq([ changed, nexted ], [ [ { note: 'x', reset: true } ], 2 ], 'init done: a change is reported to the daemon');
+
+	let bad = { info: {}, config: {}, at_init_extra: () => die('boom') };
+
+	eq(mc.init_commands(bad), [], 'init list: a failing extra adds nothing and breaks nothing');
+}
+
 done('test_modem_common');

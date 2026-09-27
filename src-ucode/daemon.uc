@@ -365,6 +365,48 @@ export function create(opts)
 	// later — well inside OUR_DOWN_TTL, so the TTL is not what lost it.
 	self._our_downs = {};
 
+	// THE INTERFACES WE GAVE UP ON, and reconnect when the modem registers
+	// again (reconnect_on_register: a reconnect-hold give-up, a SIM block).
+	// Also KEPT IN A FILE (tmpfs — a reboot re-arms netifd's autostart
+	// anyway): the mark lived on the context entry only, so a daemon restart
+	// inside such an outage — a package upgrade — lost it, and the interface
+	// wwand had downed itself (autostart cleared) was read as an operator
+	// ifdown and never came back (HW-seen on 245, 2026-09-27). Keyed by
+	// interface for the reason _our_downs is.
+	let giveups_file = deps.giveups_file ?? '/tmp/wwand/state/giveups.json';
+
+	self._giveups = {};
+
+	{
+		let raw = deps.datapath_fx?.read ? deps.datapath_fx.read(giveups_file) : null;
+
+		// written by us, but json() throws uncatchably on a torn file: take
+		// the names out by pattern, as recovery.uc does
+		for (let m in match(raw ?? '', /"[A-Za-z0-9_.-]+"/g) ?? [])
+			self._giveups[substr(m[0], 1, length(m[0]) - 2)] = true;
+	}
+
+	let persist_giveups = () => {
+		if (deps.datapath_fx?.write)
+			deps.datapath_fx.write(giveups_file, sprintf('%J', keys(self._giveups)));
+	};
+
+	let set_giveup = (entry, on) => {
+		entry.reconnect_on_register = on;
+
+		let iface = entry?.cfg?.interface;
+
+		if (!iface || !!self._giveups[iface] == on)
+			return;
+
+		if (on)
+			self._giveups[iface] = true;
+		else
+			delete self._giveups[iface];
+
+		persist_giveups();
+	};
+
 	mark_our_down = (entry) => {
 		let iface = entry?.cfg?.interface;
 
@@ -491,7 +533,7 @@ export function create(opts)
 			if (!entry.wanted) {
 				if (!entry.reconnect_on_register)
 					continue;
-				entry.reconnect_on_register = false;
+				set_giveup(entry, false);
 				entry.wanted = true;
 				log('notice', sprintf('interface %s: service returned, reconnecting after earlier give-up',
 					entry.cfg.interface));
@@ -660,7 +702,7 @@ export function create(opts)
 				// was parked for good and only a manual ifup revived it (field
 				// report on an EG060K-EA: PIN entered, modem registered, nothing
 				// happened).
-				entry.reconnect_on_register = true;
+				set_giveup(entry, true);
 
 				// ...and remember that WE took the interface down. netifd's ubus
 				// `down` clears autostart, which the ready path otherwise reads
@@ -701,6 +743,12 @@ export function create(opts)
 			// forgotten — and forgetting this one costs an NCM modem its
 			// vendor recipe when it refuses to identify itself (wwand#32).
 			_ident: prev?._ident,
+			// the options an installed plugin reads (plugins.uc): stamped by
+			// reload only, so a rebuild between reloads — every hotplug re-add
+			// after a modem reset — must keep them, or the plugin sees the
+			// modem as unconfigured (HW-found on 245, 2026-09-27: a remote SIM
+			// session ended after the modem reset that allowed SIM Access)
+			ext: prev?.ext,
 			// when the serial-only reading started, so the settle window in
 			// start_modem is a window and not a fresh countdown per rebuild
 			_ppp_since: prev?._ppp_since,
@@ -799,6 +847,15 @@ export function create(opts)
 		// a change. Both must stay silent: dropping a healthy session because
 		// the identity was merely READ AGAIN is worse than the bug.
 		if (prev == null || prev == now)
+			return;
+
+		// ...nor is the same card whose IMSI only now became readable: a card
+		// change clears the IMSI and a slow card (a remote SIM) is read again
+		// until it has one (simops card_changed) — "ICCID/" then "ICCID/IMSI"
+		// dropped the session that had just come up on it
+		let pp = split(prev, '/');
+
+		if (pp[0] == (data?.iccid ?? '') && ((pp[1] ?? '') == '' || (data?.imsi ?? '') == ''))
 			return;
 
 		for (let name, centry in self.contexts) {
@@ -2326,6 +2383,30 @@ export function create(opts)
 
 		entry.modem = be.modem.create({ ...common, datapath: datapath,
 		                                known_ident: entry._ident ?? null });
+		// what optional packages add to the AT init sequence (plugins.uc
+		// at_init), with the control protocol: a plugin can tell a Qualcomm
+		// modem (QMI) from others without an identity of its own
+		entry.modem.at_init_extra = (info) => self.plugins_at_init?.(name, { ...(info ?? {}), protocol: proto }) ?? [];
+		// A setting the init sequence changed that only a modem reset makes
+		// real (an EFS item is read at boot): reset once. Once per modem and
+		// setting for the daemon's life — should the reset not make it stick,
+		// the next start writes it again and this does NOT reset a second
+		// time, so a modem that never keeps it cannot be reset in a loop.
+		entry.modem.at_init_changed = (changed) => {
+			self._init_resets ??= {};
+			let key = (c) => name + '/' + (c.set ?? c.note ?? '');
+			let want = filter(changed, (c) => c.reset && !self._init_resets[key(c)]);
+
+			if (!length(want))
+				return;
+
+			for (let c in want)
+				self._init_resets[key(c)] = true;
+
+			log('notice', sprintf('modem %s: resetting it once so that the init setting%s take%s effect: %s', name,
+				(length(want) > 1) ? 's' : '', (length(want) > 1) ? '' : 's', join('; ', map(want, (c) => c.note ?? '?'))));
+			self.modem_reset?.(name, (e) => e ? log('warn', sprintf('modem %s: that reset failed: %J', name, e)) : null);
+		};
 		// remembered for the vanish escalation below: "this control device was
 		// once ours" is the only thing separating a modem that fell out of the
 		// machine from one that never showed up.
@@ -2341,7 +2422,14 @@ export function create(opts)
 		// survived a wwand restart.
 		let prev = self.contexts[name];
 
-		let base = { cfg: cfg, ctx: null, pending_up: [], wanted: (cfg.interface != null),
+		// a give-up restored from the file (a daemon restart inside the
+		// outage) starts NOT wanted: the modem's next `registered` then takes
+		// the re-arm path, which marks the down as ours and kicks netifd —
+		// started wanted, the ready path read the cleared autostart as an
+		// operator ifdown and parked it for good
+		let restored = !prev && cfg.interface != null && !!self._giveups[cfg.interface];
+
+		let base = { cfg: cfg, ctx: null, pending_up: [], wanted: (cfg.interface != null) && !restored,
 		             retry_timer: null, hold_timer: null, retry_n: 0,
 		             // preserve the last-applied reload signature across internal
 		             // re-binds (hotplug) — the config itself is unchanged there
@@ -2366,7 +2454,8 @@ export function create(opts)
 		             // entry can fail to exist across a reload, and then there
 		             // is nothing to carry it from.)
 		             _failed_at: prev?._failed_at,
-		             reconnect_on_register: prev?.reconnect_on_register };
+		             // ...or, after a daemon restart, from the file
+		             reconnect_on_register: prev?.reconnect_on_register ?? restored };
 
 		if (!mentry?.modem) {
 			log('warn', sprintf('interface %s: modem %s not started', name, cfg.modem));
@@ -2555,6 +2644,22 @@ export function create(opts)
 		for (let name, cfg in parsed.contexts)
 			if (!self.contexts[name])
 				start_context(name, cfg);
+
+		// a give-up belongs to an interface that is still configured: a removed
+		// or renamed one is torn down without context_down, and its mark would
+		// otherwise be inherited by a later interface of the same name
+		{
+			let pruned = false;
+
+			for (let iface in keys(self._giveups))
+				if (!length(filter(values(parsed.contexts), (c) => c.interface == iface))) {
+					delete self._giveups[iface];
+					pruned = true;
+				}
+
+			if (pruned)
+				persist_giveups();
+		}
 
 		// 4) stamp the applied signatures for the next reload's diff (idempotent for
 		//    the ones that kept running: same config -> same signature).
@@ -2960,15 +3065,27 @@ export function create(opts)
 		if (entry._holdexpiry) {
 			entry._holdexpiry = false;
 			entry.wanted = false;
-			entry.reconnect_on_register = true;
+			set_giveup(entry, true);
 			clear_reconnect(name);
 			return entry.ctx.down(() => cb(null, {}));
+		}
+
+		// ...and the teardown that follows a down WE issued (a SIM block):
+		// netifd calls back through the proto shim with nothing to tell it
+		// from an operator's, so the marker says it — the give-up stands
+		if (our_down(entry)) {
+			entry.wanted = false;
+			clear_reconnect(name);
+			return entry.ctx.down(() => {
+				cb(null, {});
+				maybe_lowpower(entry);
+			});
 		}
 
 		// netifd tore the interface down (admin/config) → no longer wanted; stop
 		// reconnect and clear any stale re-arm marker (operator intent wins).
 		entry.wanted = false;
-		entry.reconnect_on_register = false;
+		set_giveup(entry, false);
 		clear_reconnect(name);
 		entry.ctx.down(() => {
 			cb(null, {});
@@ -3512,6 +3629,9 @@ export function create(opts)
 		});
 	};
 	self._plugin_radio = plugin_radio;
+
+	// init settings that already cost a modem its one reset (at_init_changed)
+	self._init_resets = {};
 
 	// Optional plugins (plugins.uc). What they may use of the daemon is this
 	// list and nothing else; resolved at call time, so the order of the

@@ -93,7 +93,7 @@ export function pin_block_reason(retries, force)
 
 // A CARD POLL MUST NOT OUTLIVE ITS SESSION. The retries below re-enter
 // unlock_uim/unlock_dms, which re-read modem.uim / modem.dms at entry — and
-// teardown nulls those (modem.uc:1637). An anonymous timer firing after an
+// teardown nulls those (modem.uc:1642). An anonymous timer firing after an
 // unplug or a config reload inside the up-to-10 s poll window therefore
 // dereferenced null, and a throw inside a uloop callback ends the program: the
 // next timer never runs and uloop.run() does not return (measured 2026-09-19).
@@ -1590,7 +1590,7 @@ export function read_iccid(modem, cb)
 	first_of(chain, cb);
 };
 
-export function read_identity(modem, cb)
+export function read_identity(modem, cb, opts)
 {
 	let out = { imsi: null, iccid: null, msisdn: null };
 
@@ -1598,7 +1598,14 @@ export function read_identity(modem, cb)
 	if (modem.uim)
 		push(imsi_chain, (done) => read_ef(modem, EF_IMSI, (b) =>
 			done(b != null ? substr(swap_nibbles(b), 3) : null)));   // strip len+parity
-	if (modem.dms)
+	// DMS GET_IMSI answers from the firmware's cache: right after a card
+	// change that is still the PREVIOUS card's IMSI while the new one is
+	// being initialised (HW-seen on an RG650E with a remote SIM, 2026-09-27:
+	// EF_IMSI not readable yet, DMS gave the old card's) — and a wrong IMSI
+	// matches the old card's wwand_sim. opts.fresh leaves it out.
+	// ...unless there is no other way at all: a modem whose UIM cannot read
+	// EF_IMSI and that has no AT channel would otherwise have no IMSI.
+	if (modem.dms && (!opts?.fresh || !modem.at))
 		push(imsi_chain, (done) => modem.dms.request('GET_IMSI', {}, (e, d) =>
 			done((!e && length(d?.imsi ?? '')) ? d.imsi : null), { no_recovery: true }));
 	if (modem.at)

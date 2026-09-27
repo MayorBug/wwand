@@ -335,11 +335,12 @@ proto_wwand_setup() {
 				;;
 		esac
 
-		# NOTHING IN NETIFD RETRIES THIS. A failed setup of a handler with
-		# no_proto_task is never torn down (proto_ext_task_finish tears down
-		# only without PROTO_FLAG_NO_TASK, proto-ext.c:147-152, netifd
+		# NETIFD DOES NOT RETRY THIS BY ITSELF. A failed setup of a handler
+		# with no_proto_task is never torn down (proto_ext_task_finish tears
+		# down only without PROTO_FLAG_NO_TASK, proto-ext.c:147-152, netifd
 		# 2026.07.08): the interface stays pending with the error on it,
-		# which works like a block. The daemon owns the retry — the
+		# which works like a block. Only a link or availability change
+		# (interface_check_state) or an ifdown/ifup moves it. The daemon owns the retry — the
 		# reconnect engine for a failed activation, the next `registered` for
 		# a modem that was not usable (it resets a stuck-pending interface
 		# and kicks it). The error is also its evidence that a cleared
@@ -367,7 +368,16 @@ proto_wwand_setup() {
 proto_wwand_teardown() {
 	local interface="$1"
 
-	ubus -t 30 call wwand context_down "{\"interface\":\"$interface\"}" >/dev/null 2>&1
+	ubus -t 30 call wwand context_down "{\"interface\":\"$interface\"}" >/dev/null 2>&1 || {
+		# no daemon to tell (stopped for an upgrade, say): this ifdown is
+		# still the operator's, and the error the failed setup left on the
+		# interface would otherwise read as wwand's own block when the daemon
+		# comes back (daemon.uc operator_down). The daemon reads the names in
+		# this file by pattern, so an appended one is enough; its next up
+		# clears it.
+		mkdir -p /tmp/wwand/state
+		echo "\"$interface\"" >> /tmp/wwand/state/admin_downs.json
+	}
 	# no link-down update here: netifd rejects notify_proto while in S_TEARDOWN
 	# and drops the link itself once this script exits
 }

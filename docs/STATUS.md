@@ -783,20 +783,35 @@ An interface stayed down after an eSIM profile switch: the modem was cardless
 for a moment, the setup that landed then was answered `sim_blocked`, and the
 shim's `proto_block_restart` cleared autostart for good. Two changes:
 
-- `context_up` notes that answer as the daemon's own give-up (`set_giveup` +
-  `mark_our_down`), so the next `registered` re-arms and kicks it — as the
-  daemon's own SIM-block down already was.
+- `context_up` notes that answer as the daemon's own give-up (`set_giveup`),
+  so the next `registered` re-arms and kicks it — as the daemon's own
+  SIM-block down already was. Not as "our down": wwand issued none, and the
+  marker would make an operator's ifdown right after it look like ours.
 - **Who cleared autostart is decided on evidence** (`daemon.uc operator_down`,
   used by all three kick sites): an operator ifdown is recorded where it
-  happens (`context_down`, persisted in `/tmp/wwand/state/admin_downs.json`,
-  cleared by the next up); otherwise a `wwand` error on the interface is the
-  shim's failed setup and the interface is brought back. The in-memory marker
-  for our own downs is lost on a daemon restart — the case HW-seen on 245
+  happens (`context_down`, also when there is no context to take down, and by
+  the shim itself when the daemon is not running; persisted in
+  `/tmp/wwand/state/admin_downs.json`, cleared by the next up, whatever it is
+  answered with); otherwise a `wwand` error on the interface is the shim's
+  failed setup and the interface is brought back. The in-memory marker for
+  our own downs is lost on a daemon restart — the case HW-seen on 245
   (autostart false, errors `[RADIO_HELD]`, "administratively down").
+- An answer that lands after a reload replaced the context — the activation,
+  and the two netifd status probes before a kick — is not acted on.
 
-Also corrected: netifd never retries a failed setup of a `no_proto_task`
-handler — the interface stays pending (gotchas.md). Host-tested with
-counter-proofs; the HW round on 245 is open.
+Also corrected: netifd does not retry a failed setup of a `no_proto_task`
+handler by itself — the interface stays pending (gotchas.md). Host-tested
+with counter-proofs; the HW round on 245 is open.
+
+## A new `wwand_sim` does not restart the modem (2026-09-27)
+
+SIM overrides are left out of the modem's reload signature: adding one — by
+hand, or wwand-rsim keeping a lender's settings — restarted every modem.
+The running modem gets the new list AND matches its card against it again
+(`active_sim`, which the dial reads); handing over the list alone left a new
+override ignored and a deleted one in force until the next card read. A
+modem held at SIM_BLOCKED is still restarted, since the override may carry
+the PIN it waits for.
 
 ## Known open
 

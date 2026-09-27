@@ -753,7 +753,9 @@ and a session says the rest.
 
 ## A failed setup of a `no_proto_task` handler is retried by netifd
 
-**It is not — the interface just stays pending, with the error on it.**
+**Not by itself — the interface just stays pending, with the error on it.**
+Only a link or availability change (`interface_check_state`) or an
+ifdown/ifup moves it.
 `proto_ext_task_finish` tears a failed setup down only when the handler has no
 `PROTO_FLAG_NO_TASK` (`proto-ext.c:147-152`, netifd 2026.07.08), so after the
 shim's `return 1` nothing in netifd runs setup again: every
@@ -772,5 +774,8 @@ as "administratively down" after one (HW-seen on 245, 2026-09-27: autostart
 false, errors `[RADIO_HELD]`). `daemon.uc operator_down` now decides on
 evidence: the operator's ifdown is recorded by `context_down` (in a state
 file), and a `wwand` error on the interface is the shim's trace — an ifdown
-clears no errors (`interface_set_down`), an ifup clears them
-(`interface_set_up`, `interface.c:1332-1350`).
+clears no errors (`interface_set_down`); an ifup clears them only on an
+interface that is down (`interface_set_up`, `interface.c:1332-1350`), and
+reaching IFEV_UP does. The operator's ifdown is therefore recorded even when
+there is no context to take down, and by the shim itself when the daemon is
+not there to hear it.

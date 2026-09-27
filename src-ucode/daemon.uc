@@ -20,6 +20,7 @@ import * as reconnect from 'wwand.reconnect';
 import * as recoverymod from 'wwand.recovery';
 import * as ctx_settings from 'wwand.ctx_settings';
 import * as context_common from 'wwand.context_common';
+import * as modem_common from 'wwand.modem_common';
 // module scope: the lazy backend loaders live outside create(), so they cannot
 // use its injected `log` dep and go to the shared sink directly
 import * as logmod from 'wwand.log';
@@ -473,6 +474,12 @@ export function create(opts)
 			self._admin_downs[substr(m[0], 1, length(m[0]) - 2)] = true;
 	}
 
+	// an interface named by a ubus caller, for the records keyed by interface
+	// when there is no context entry for it; null for anything the state
+	// files' name pattern would not read back
+	let iface_ref = (ref) =>
+		(type(ref) == 'string' && match(ref, /^[A-Za-z0-9_.-]{1,64}$/)) ? { cfg: { interface: ref } } : null;
+
 	let set_admin_down = (entry, on) => {
 		let iface = entry?.cfg?.interface;
 
@@ -617,9 +624,17 @@ export function create(opts)
 
 			// capture per iteration: the netifd status probe is async, so the
 			// adopt-vs-kick decision runs later in the callback.
-			let cname = name, centry = entry;
+			let cname = name, centry = entry, cctx = entry.ctx;
 
 			let decide = (st) => {
+				// Retired while the probe was out: a reload replaced or removed
+				// the context (stop_context deletes the entry, build_context
+				// makes a new one). Acting on the capture would kick an
+				// interface the reload took away, or start the replacement on
+				// a status read for its predecessor.
+				if (self.contexts[cname] !== centry || centry.ctx !== cctx)
+					return;
+
 				// The interface is back up, or netifd has re-armed autostart:
 				// whatever down we issued has been answered, so the marker has
 				// done its job and must not outlive the state it describes. This
@@ -1564,7 +1579,7 @@ export function create(opts)
 				entry._kick_after_connect = false;
 
 				if (deps.kick_interface && entry.cfg.interface) {
-					let kentry = entry, kiface = entry.cfg.interface;
+					let kentry = entry, kiface = entry.cfg.interface, kctx = ctx;
 
 					let do_kick = () => {
 						log('info', sprintf('kicking interface %s to adopt the connected session', kiface));
@@ -1588,6 +1603,11 @@ export function create(opts)
 					// up=false/autostart=false, and only a manual `ifup` recovered it.
 					if (deps.iface_status)
 						deps.iface_status(kiface, (st) => {
+							// retired while the probe was out (a reload): not
+							// ours to kick any more — see decide() above
+							if (self.contexts[name] !== kentry || kentry.ctx !== kctx)
+								return;
+
 							if (operator_down(kentry, st)) {
 								kentry.wanted = false;
 								log('notice', sprintf('interface %s went administratively down while connecting, not kicking it up',
@@ -2690,8 +2710,10 @@ export function create(opts)
 		// may match): adding one — by hand, or wwand-rsim keeping a lender's
 		// settings — restarted every modem, dropping its connections and, on
 		// an MBIM modem, the QMI passthrough a plugin was just asking for
-		// (HW-seen on the GL-X3000, 2026-09-27). They are matched on every
-		// card read; step 4 hands the new list to the running modem.
+		// (HW-seen on the GL-X3000, 2026-09-27). Step 4 hands the new list to
+		// the running modem and re-matches its card against it; a modem held
+		// at SIM_BLOCKED is still restarted (step 1), because the override may
+		// carry the PIN it is waiting for and only the SIM step tries one.
 		let modem_sig = (mn) => {
 			let cfg = { ...(parsed.modems[mn] ?? {}) };
 
@@ -2704,8 +2726,12 @@ export function create(opts)
 
 		// 1) stop modems that are gone or changed (cascades to their contexts). A
 		//    changed modem must rebuild its datapath, so its contexts bounce with it.
+		let sims_changed = (mn) =>
+			sprintf('%J', self.modems[mn]?.cfg?.sims) != sprintf('%J', parsed.modems[mn]?.sims);
+
 		for (let mn in keys(self.modems))
-			if (!parsed.modems[mn] || self.modems[mn]._sig != modem_sig(mn))
+			if (!parsed.modems[mn] || self.modems[mn]._sig != modem_sig(mn) ||
+			    (sims_changed(mn) && self.modems[mn].modem?.state == 'SIM_BLOCKED'))
 				stop_modem(mn);
 
 		// 2) stop contexts that are gone or changed on a still-running modem (their
@@ -2731,11 +2757,31 @@ export function create(opts)
 			self.modems[mn]._sig = modem_sig(mn);
 			self.modems[mn].ext = parsed.modems[mn]?.ext ?? {};
 
-			// the SIM overrides, live (left out of the signature above)
+			// the SIM overrides, live (left out of the signature above) — and
+			// matched again. Handing over the list alone changed nothing the
+			// modem acts on: the dial reads `active_sim`, which was matched at
+			// the last card read, so a new override was ignored, an edited one
+			// kept its old values and a deleted one stayed in force.
+			// ctx_settings' own re-match cannot catch it either: it fires only
+			// when the modem's list differs from disk, and this makes them
+			// equal. Matched on the card's identity, not on the previous match,
+			// which is null exactly when a new override matters most.
+			let m = self.modems[mn].modem;
+			let changed = sims_changed(mn);
+
 			if (self.modems[mn].cfg)
 				self.modems[mn].cfg.sims = parsed.modems[mn]?.sims;
-			if (self.modems[mn].modem?.config)
-				self.modems[mn].modem.config.sims = parsed.modems[mn]?.sims;
+
+			if (m?.config) {
+				m.config.sims = parsed.modems[mn]?.sims;
+
+				if (changed && (m.info?.iccid != null || m.info?.imsi != null)) {
+					m.active_sim = modem_common.match_sim_override(m.config.sims,
+						m.info.iccid, m.info.imsi);
+					log('info', sprintf('modem %s: SIM overrides changed — %s', mn,
+						m.active_sim ? 'the card matches one' : 'none matches the card'));
+				}
+			}
 		}
 
 		for (let cn in keys(self.contexts))
@@ -2948,6 +2994,11 @@ export function create(opts)
 		let name = self.resolve_context(ref);
 		let entry = name ? self.contexts[name] : null;
 
+		// an up is the operator's intent whatever it is answered with: a
+		// record kept past an up that failed (modem absent, a context not
+		// built yet) would outlive the ifup that ended it
+		set_admin_down(entry ?? iface_ref(ref), false);
+
 		if (!entry)
 			return cb({ error: 'no_such_context', ref: ref });
 
@@ -2970,14 +3021,23 @@ export function create(opts)
 		// lands then — netifd's own restart included, which ended the give-up
 		// the SIM block had set (the up just above) — left the interface down
 		// for good once the new profile registered. The block is therefore
-		// OURS: noted as a give-up and as our down, so the next `registered`
-		// re-arms the interface and kicks it (modem_registered), exactly as
-		// the daemon's own SIM-block down is (modem_sim_blocked).
+		// OURS: noted as a give-up, so the next `registered` re-arms the
+		// interface and kicks it (modem_registered, which also marks the down
+		// as ours then). NOT marked as our down here: wwand issued no down,
+		// and the marker would send an operator's ifdown within its window
+		// down context_down's `our_down` branch — no operator record, the
+		// give-up kept, and the interface back up against them. The shim's
+		// PIN_FAILED error is the evidence operator_down reads instead.
+		// Only while this entry is still the context: an activation cannot be
+		// cancelled, so its answer can land after a reload replaced the entry,
+		// and a give-up written then would be persisted for an interface whose
+		// new context never gave up — re-arming it after the next restart,
+		// against whatever the operator did meanwhile.
+		let actx = entry.ctx;
 		let answer = (err, res) => {
-			if (err?.error == 'sim_blocked') {
+			if (err?.error == 'sim_blocked' && self.contexts[name] === entry && entry.ctx === actx) {
 				entry.wanted = false;
 				set_giveup(entry, true);
-				mark_our_down(entry);
 				log('notice', sprintf('interface %s: the SIM is not usable yet — netifd holds it down; it comes back when the modem registers',
 					entry.cfg.interface ?? name));
 			}
@@ -3145,8 +3205,20 @@ export function create(opts)
 		let name = self.resolve_context(ref);
 		let entry = name ? self.contexts[name] : null;
 
-		if (!entry?.ctx)
+		// No context to take down — the modem is absent, or the interface's
+		// modem is not configured — but this is still the operator's ifdown
+		// (netifd tears a pending interface down through the shim as well,
+		// proto-ext.c:162-170). Unrecorded, the shim's WAITING_MODEM error
+		// that stays on the interface read as OUR block once the modem came,
+		// and the interface was brought up against them.
+		if (!entry?.ctx) {
+			if (entry) {
+				entry.wanted = false;
+				set_giveup(entry, false);
+			}
+			set_admin_down(entry ?? iface_ref(ref), true);
 			return cb({ error: 'no_such_context', ref: ref });
+		}
 
 		// our own stuck-pending reset (registered handler): self-inflicted teardown,
 		// not operator intent — keep `wanted` and restart the aborted activation once

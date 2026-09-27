@@ -15,7 +15,12 @@ from __future__ import annotations
 import html
 import os
 import sys
-import tomllib
+
+try:
+    import tomllib
+except ImportError:   # Python < 3.11: say so instead of failing the suite
+    print("standards: skipped (needs Python 3.11 for tomllib)")
+    sys.exit(0)
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "docs", "standards.toml")

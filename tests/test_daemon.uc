@@ -2752,6 +2752,21 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	parked[1](netifd);                  // the current one
 	eq(filter(calls, (c) => substr(c, 0, 5) == 'kick:'), [ 'kick:wan' ],
 		'the current answer still acts, exactly once');
+
+	// (14) the connect-first kick asks netifd too, and a reload can retire
+	// the context while that probe is out: the removed or reconfigured
+	// interface must not be kicked on the old entry's behalf.
+	calls = [];
+	parked = [];
+	entry._renew_probe = null;
+	entry._kick_after_connect = true;
+	on_event(entry.ctx, 'up', {});
+	ok(length(parked) >= 1, 'connect-first: the kick waits for a status probe');
+	d.contexts.wan = { ...entry };      // a reload built a new entry
+	answer();
+	eq(filter(calls, (c) => substr(c, 0, 5) == 'kick:'), [],
+		'connect-first: a context retired while its kick probe was out is not kicked');
+	d.contexts.wan = entry;
 })();
 
 
@@ -3016,16 +3031,160 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	hooks.m0(d.modems.m0.modem, 'registered', {});
 	eq(kicks(), [], 'restart: a recorded operator ifdown wins over a stale shim error');
 
-	// errors of another subsystem are netifd's own, not the shim's
 	d.context_up('wan', () => null);
 	eq(index(fx.files[FILE] ?? '', '"wan"'), -1, 'ifup: the operator down is over, in the file too');
 	d.shutdown();
 
+	// errors of another subsystem are netifd's own, not the shim's
 	calls = [];
 	st = { up: false, pending: false, autostart: false, errors: [ { subsystem: 'interface', code: 'NO_DEVICE' } ] };
 	d = mk();
 	hooks.m0(d.modems.m0.modem, 'registered', {});
 	eq(kicks(), [], 'restart: an error that is not the shim\'s explains nothing');
+	d.shutdown();
+})();
+
+// THE OPERATOR'S IFDOWN AROUND A BLOCK. After the shim blocked a setup
+// (sim_blocked), an ifdown is the operator's, not ours: it must not be
+// swallowed as our down and revived at the next registration. And an ifdown
+// with no context to take down (modem absent) is recorded all the same —
+// the WAITING_MODEM error left on the interface is no evidence of ours.
+(() => {
+	let fx = fakefx.create();
+	let hooks = {}, calls = [], st = null;
+	let fake = {
+		modem: { create: (o) => {
+			hooks[o.id] = o.deps.on_event;
+			return { id: o.id, state: 'READY', config: o.config, start: () => null, stop: () => null,
+			         note_connect_success: () => null };
+		} },
+		context: { create: (o) => ({ state: 'IDLE', name: o.name, modem: o.modem, config: o.config,
+		                             down: (cb) => cb ? cb() : null, up: (cb) => cb(null),
+		                             modem_event: () => null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: {
+		log: () => null, load_qmi: () => fake, datapath_fx: fx,
+		giveups_file: '/tmp/test-giveups-op.json', admin_downs_file: '/tmp/test-admin-op.json',
+		kick_interface: (i) => push(calls, 'kick:' + i),
+		down_interface: (i) => push(calls, 'down:' + i),
+		iface_status: (i, cb) => cb(st),
+	} });
+
+	d.apply_config(config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: 'a' },
+	} }));
+
+	d.modems.m0.modem.state = 'SIM_BLOCKED';
+	d.context_up('wan', () => null);    // answered sim_blocked: the shim blocks
+	d.context_down('wan', () => null);  // ...and the operator stops it
+	d.modems.m0.modem.state = 'READY';
+	st = { up: false, pending: false, autostart: false, errors: [ { subsystem: 'wwand', code: 'PIN_FAILED' } ] };
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(filter(calls, (c) => c == 'kick:wan'), [], 'block then ifdown: the operator\'s down stands');
+
+	// modem absent: an up answered modem_absent still ends the operator's
+	// down, and an ifdown with no context to take down is recorded anyway
+	d.contexts.wan.ctx = null;
+	d.context_up('wan', () => null);
+	eq(index(fx.files['/tmp/test-admin-op.json'] ?? '', '"wan"'), -1,
+	   'ifup answered modem_absent: the operator record is gone');
+	d.context_down('wan', () => null);
+	ok(index(fx.files['/tmp/test-admin-op.json'] ?? '', '"wan"') >= 0,
+	   'ifdown without a context: recorded as the operator\'s');
+
+	// ...as does one for an interface the daemon has no context for
+	d.context_down('lte9', () => null);
+	ok(index(fx.files['/tmp/test-admin-op.json'] ?? '', '"lte9"') >= 0, 'ifdown of an unknown interface: recorded');
+	d.context_up('lte9', () => null);
+	eq(index(fx.files['/tmp/test-admin-op.json'] ?? '', '"lte9"'), -1, '...and cleared by its ifup');
+	d.shutdown();
+})();
+
+// A CHANGED wwand_sim, LIVE. The running modem gets the list and matches its
+// card again — a new override takes effect, a deleted one stops — and a modem
+// held at SIM_BLOCKED is restarted, the override may carry its PIN.
+(() => {
+	let made = 0;
+	let fake = {
+		modem: { create: (o) => { made++; return { id: o.id, state: 'READY', config: o.config,
+		                                           info: { iccid: '89882390000064624748', imsi: '901280001430235' },
+		                                           start: () => null, stop: () => null }; } },
+		context: { create: (o) => ({ state: 'IDLE', down: (cb) => cb ? cb() : null, up: (cb) => cb(null),
+		                             modem_event: () => null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: { log: () => null, load_qmi: () => fake } });
+	let base = {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: 'a' },
+	};
+	let with_sim = (apn) => config.parse({ network: { ...base,
+		s1: { '.type': 'wwand_sim', iccid: '89882390000064624748', apn: apn } } });
+
+	d.apply_config(config.parse({ network: base }));
+	d.apply_config(with_sim('one'));
+	eq(d.modems.m0.modem.active_sim?.apn, 'one', 'live wwand_sim: a new override matches the card in use');
+	d.apply_config(with_sim('two'));
+	eq(d.modems.m0.modem.active_sim?.apn, 'two', 'live wwand_sim: an edit takes effect');
+	d.apply_config(config.parse({ network: base }));
+	eq(d.modems.m0.modem.active_sim, null, 'live wwand_sim: a deleted one stops');
+	eq(made, 1, 'live wwand_sim: ...all without a modem restart');
+
+	d.modems.m0.modem.state = 'SIM_BLOCKED';
+	d.apply_config(with_sim('three'));
+	eq(made, 2, 'live wwand_sim: a modem waiting at SIM_BLOCKED is restarted (the override may carry its PIN)');
+	d.shutdown();
+})();
+
+// A RELOAD WHILE AN ANSWER IS OUT. Neither the activation nor netifd's status
+// probe can be cancelled, so both can land after a reload replaced the
+// context. The registration probe must not kick or start the new context on
+// its predecessor's status, and a late sim_blocked must not write a give-up
+// — persisted — for an interface whose current context never gave up.
+(() => {
+	let fx = fakefx.create();
+	let FILE = '/tmp/test-giveups-stale.json';
+	let hooks = {}, calls = [], parked = [], upcb = null;
+	let fake = {
+		modem: { create: (o) => {
+			hooks[o.id] = o.deps.on_event;
+			return { id: o.id, state: 'READY', config: o.config, start: () => null, stop: () => null,
+			         note_connect_success: () => null };
+		} },
+		context: { create: (o) => ({ state: 'IDLE', name: o.name, modem: o.modem, config: o.config,
+		                             down: (cb) => cb ? cb() : null, up: (cb) => { upcb = cb; },
+		                             modem_event: () => null }) },
+	};
+	let net = (apn) => config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: apn },
+	} });
+	let d = daemon_mod.create({ timing: TIMING, deps: {
+		log: () => null, load_qmi: () => fake, datapath_fx: fx,
+		giveups_file: FILE, admin_downs_file: '/tmp/test-admin-stale.json',
+		kick_interface: (i) => push(calls, 'kick:' + i),
+		down_interface: (i) => push(calls, 'down:' + i),
+		iface_status: (i, cb) => push(parked, cb),
+	} });
+
+	d.apply_config(net('a'));
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(length(parked), 1, 'stale probe: the registration asks netifd');
+
+	d.apply_config(net('b'));           // the context is rebuilt meanwhile
+	for (let cb in parked)
+		cb({ up: false, pending: false, autostart: true });
+	eq(calls, [], 'stale probe: an answer for the retired context kicks nothing');
+
+	let got = null;
+
+	d.context_up('wan', (e) => { got = e; });
+	ok(upcb != null, 'stale answer: the activation is out');
+	d.apply_config(net('c'));           // replaced while it runs
+	upcb({ error: 'sim_blocked' });
+	eq(got?.error, 'sim_blocked', 'stale answer: netifd still gets its answer');
+	eq([ d.contexts.wan.reconnect_on_register, index(fx.files[FILE] ?? '', '"wan"') ], [ false, -1 ],
+	   'stale answer: no give-up written for the new context, nor persisted');
 	d.shutdown();
 })();
 

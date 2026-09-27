@@ -3001,11 +3001,18 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	eq(d.contexts.wan.reconnect_on_register, true, 'SIM block: the teardown of our own down keeps the give-up');
 	ok(index(fx.files[FILE] ?? '', '"wan"') >= 0, 'SIM block: ...in the file too');
 
-	// the interface removed: its mark goes
-	d.apply_config(config.parse({ network: {
-		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
-	} }));
-	eq(index(fx.files[FILE] ?? '', '"wan"'), -1, 'give-up: a removed interface loses its mark');
+	// an operator's ifup ends the give-up; a later ifdown is theirs, even
+	// inside our marker's window — it is not brought back
+	calls = [];
+	d.context_up('wan', () => null);
+	eq(d.contexts.wan.reconnect_on_register, false, 'ifup: the give-up is over');
+	eq(index(fx.files[FILE] ?? '', '"wan"'), -1, 'ifup: ...in the file too');
+	d.contexts.wan.ctx.state = 'CONNECTED';
+	d.context_down('wan', () => null);
+	eq([ d.contexts.wan.wanted, d.contexts.wan.reconnect_on_register ], [ false, false ],
+	   'ifup then ifdown within the window: the operator\'s down, not re-armed');
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(filter(calls, (c) => c == 'kick:wan'), [], '...and the next registration does not bring it back');
 	d.shutdown();
 })();
 
@@ -3043,6 +3050,15 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	ok(after_change > 0, 'identity: a new card drops the session');
 	hooks.m0(m, 'sim_refresh', { iccid: '8988000000000000002', imsi: '901280000000002' });
 	eq(downs, after_change, 'identity: its IMSI read a moment later is not another change');
+
+	// ...but the same ICCID with ANOTHER IMSI is a new subscription (an
+	// IMSI-switching applet), also when a read without the IMSI came between
+	d.contexts.wan.ctx.state = 'CONNECTED';
+	d.contexts.wan.wanted = true;
+	hooks.m0(m, 'sim_refresh', { iccid: '8988000000000000002', imsi: null });
+	eq(downs, after_change, 'identity: a read without the IMSI changes nothing');
+	hooks.m0(m, 'sim_refresh', { iccid: '8988000000000000002', imsi: '901280000000003' });
+	ok(downs > after_change, 'identity: another IMSI behind the same ICCID drops the session');
 	d.shutdown();
 })();
 

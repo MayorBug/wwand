@@ -187,7 +187,11 @@ export function install(self, o)
 						return;
 
 					defer(15000, () => {
-						if (self.modems?.[ref]?.modem === m && m._gen === gen && m._card_change_gen === cgen)
+						// the same checks as the first read: this card, this
+						// modem object, and not inside its init chain, which
+						// reads the card itself (NCM has no _gen)
+						if (self.modems?.[ref]?.modem === m && m._gen === gen && m._card_change_gen === cgen &&
+						    index(INIT_STATES, m.state) < 0)
 							read();
 					});
 				}, { fresh: true });

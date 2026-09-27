@@ -308,10 +308,10 @@ export function install(self, o)
 				// checked HERE, where a throw is caught: atcmd runs the steps
 				// inside uloop callbacks, where a bad regex ends the daemon
 				for (let st in (type(steps) == 'array') ? steps : []) {
+					let rx_ok = (w) => { try { return type(regexp(w)) == 'regexp'; } catch (e) { return false; } };
 					let good = (type(st) == 'string') ||
 						(type(st) == 'object' && type(st.check) == 'string' &&
-						 type(st.set) == 'string' && type(st.want) == 'string' &&
-						 type(regexp(st.want)) == 'regexp');
+						 type(st.set) == 'string' && type(st.want) == 'string' && rx_ok(st.want));
 
 					if (good)
 						push(out, st);

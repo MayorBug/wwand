@@ -1050,7 +1050,10 @@ export function create(transport, opts)
 			// start while the value is already right. Left for the next start.
 			// An answer that refuses (ERROR, +CME) is one: Quectel's QNVFR
 			// answers ERROR for an EFS item that does not exist yet (RG650E).
-			if (err && err.error != 'ERROR' && err.error != 'cme') {
+			// ...and so are the answers of a SIM or port still busy (CME 14 SIM
+			// busy, 515 please wait): no word on the value either
+			if (err && ((err.error != 'ERROR' && err.error != 'cme') ||
+			            (err.error == 'cme' && (+err.code == 14 || +err.code == 515)))) {
 				log('warn', sprintf('%s: cannot read it (%J) — left as it is', st.note ?? redact(st.check), err));
 				return next(null);
 			}
@@ -1089,7 +1092,7 @@ export function create(transport, opts)
 			if (type(cmd) == 'object')
 				return run_step(cmd, (st) => {
 					if (st)
-						push(changed, { note: st.note, reset: !!st.reset });
+						push(changed, { note: st.note, set: st.set, reset: !!st.reset });
 					step();
 				});
 

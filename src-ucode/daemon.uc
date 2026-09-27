@@ -839,6 +839,15 @@ export function create(opts)
 
 		let now = sprintf('%s/%s', data?.iccid ?? '', data?.imsi ?? '');
 		let prev = entry._sim_identity;
+		let pp = split(prev ?? '/', '/');
+
+		// A read that got the ICCID but not (yet) the IMSI says nothing new
+		// about the subscription: the identity on record stays, so the IMSI
+		// read later is compared with the one BEFORE — a card that changed
+		// its IMSI behind the same ICCID (an IMSI-switching applet) is still
+		// seen as a change (found by audit, 2026-09-27)
+		if (prev != null && pp[0] == (data?.iccid ?? '') && (data?.imsi ?? '') == '')
+			return;
 
 		entry._sim_identity = now;
 
@@ -853,9 +862,7 @@ export function create(opts)
 		// change clears the IMSI and a slow card (a remote SIM) is read again
 		// until it has one (simops card_changed) — "ICCID/" then "ICCID/IMSI"
 		// dropped the session that had just come up on it
-		let pp = split(prev, '/');
-
-		if (pp[0] == (data?.iccid ?? '') && ((pp[1] ?? '') == '' || (data?.imsi ?? '') == ''))
+		if (pp[0] == (data?.iccid ?? '') && (pp[1] ?? '') == '')
 			return;
 
 		for (let name, centry in self.contexts) {
@@ -2645,22 +2652,6 @@ export function create(opts)
 			if (!self.contexts[name])
 				start_context(name, cfg);
 
-		// a give-up belongs to an interface that is still configured: a removed
-		// or renamed one is torn down without context_down, and its mark would
-		// otherwise be inherited by a later interface of the same name
-		{
-			let pruned = false;
-
-			for (let iface in keys(self._giveups))
-				if (!length(filter(values(parsed.contexts), (c) => c.interface == iface))) {
-					delete self._giveups[iface];
-					pruned = true;
-				}
-
-			if (pruned)
-				persist_giveups();
-		}
-
 		// 4) stamp the applied signatures for the next reload's diff (idempotent for
 		//    the ones that kept running: same config -> same signature).
 		for (let mn in keys(self.modems)) {
@@ -2891,6 +2882,14 @@ export function create(opts)
 
 		// netifd asked us up → mark wanted so the daemon keeps it up until context_down.
 		entry.wanted = true;
+
+		// ...an up (an operator's ifup, or our own kick landing) re-arms
+		// netifd's autostart: whatever down we issued is answered, and a
+		// give-up is over. Kept past it, the next ifdown within the marker's
+		// window was read as OUR teardown and the give-up brought the
+		// interface back against the operator (found by audit, 2026-09-27).
+		clear_our_down(entry);
+		set_giveup(entry, false);
 
 		// Parked by `option lowpower` on the last context-down: the radio is off,
 		// so activating now would dial into a modem that cannot register. Wake it

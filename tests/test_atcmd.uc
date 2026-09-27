@@ -257,7 +257,7 @@ ok(seq_done, 'sequence: completion after error');
 	t2.reply('OK\r\n');
 	t2.reply('+QNVFR: 00\r\nOK\r\n');
 	eq(t2.written, [ 'AT+QNVFR="/x"\r', 'AT+QNVFW="/x",00\r', 'AT+QNVFR="/x"\r' ], 'setting: missing — written, then read back');
-	eq(res, [ { note: 'x allowed', reset: true } ], 'setting: ...and reported as changed, with its reset');
+	eq(res, [ { note: 'x allowed', set: 'AT+QNVFW="/x",00', reset: true } ], 'setting: ...and reported as changed, with its reset (and what it wrote)');
 
 	// written but it does not stick: not reported (no reset for nothing)
 	t2 = fake_transport(); a2 = atcmd.create(t2, { log: silent }); res = null;

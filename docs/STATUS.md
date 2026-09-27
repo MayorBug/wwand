@@ -746,14 +746,35 @@ cycles, reattach and attach-profile changes leave it off. Woken, a modem
 reports `registered` again, which re-arms the interfaces given up while it
 was parked. Host-tested; the HW round on 245/242 follows the push.
 
-## Remote SIM on an MBIM modem (2026-09-27)
+## Remote SIM (wwand-rsim, 2026-09-27)
 
-The plugin dep `qmi_client` works on MBIM modems now, over the QMI-over-MBIM
-passthrough (modem_mbim.uc extra_client). On the GL-X3000 (RM520N-GL, MBIM)
-a remote card from the lab PC's Smartmouse ran through wwand-rsim: UIM Remote
-switched on in the firmware, the modem connected, 431 APDUs, the remote
-card's identity read; back on its own card afterwards. The indications UIM
-Remote needs DO come over the passthrough there — unlike NAS's (gotchas.md).
+What the plugin does now, and what the core offers it — the details, the
+tested hardware and the workarounds are in the wwand-rsim README:
+
+- **Card sources:** a reader on the router or on another machine over SSH
+  (Smartmouse USB with clock and mode set by software, Phoenix, PC/SC), a
+  phone's SIM over Bluetooth SAP, a modem wwand does not manage over its AT
+  port (`AT+CSIM`), a modem on this router lending its card (*sponsor*: SIM
+  Access or APDU), a modem on another wwand router (`wwandctl rsim proxy`
+  there). `wwandctl rsim scan [user@host]` lists what a machine offers; the
+  SSH key can be restricted to `rsim-card --serve`.
+- **Clients:** QMI modems with UIM Remote switched on (RG650E), and MBIM
+  modems through the QMI passthrough: the plugin dep `qmi_client` works there
+  now (modem_mbim.uc extra_client). On the GL-X3000 (RM520N-GL, MBIM) a card
+  from the lab PC's Smartmouse ran — the modem connected, 431 APDUs, the
+  remote card's identity read, back on its own card afterwards. The
+  indications UIM Remote needs DO come over the passthrough there, unlike
+  NAS's (gotchas.md).
+- **In the core for it:** the radio hold (a sponsor's radio stays off, its
+  ifups are refused with `radio_held`, a registration of it is parked again),
+  the card-change process on both sides (`sim_changed`), the SIM inventory
+  filing a remote card under its reader (`card_source`), `sim_upsert` for the
+  settings a lending router dials a card with (`origin 'rsim'`).
+- **Packages:** `wwand-rsim` (plugin, `wwandctl rsim`), `luci-app-wwand-rsim`
+  (Network → Remote SIM: status, find SIM sources, SSH setup), `rsim-card`
+  and `rsim-card-pcsc` (the helper alone, for a SIM host).
+- **Not possible:** one modem using one slot and lending the other — a
+  single-standby modem switches its inactive slot off (above, Multi-SIM).
 
 ## Known open
 

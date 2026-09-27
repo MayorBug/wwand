@@ -280,6 +280,12 @@ core never names it. Two shapes, both in docs/reference.md, "Plugins":
   `/usr/share/ucode/wwand/plugins/` with a tick, an eSIM guard and ubus ops
   (`modem_plugin`). Its `wwand_modem` options arrive raw as `ext`, outside the
   modem's reload signature. Example: ddimension/wwand-ipa (SGP.32 eIM).
+  The one that uses most of the interface is ddimension/wwand-rsim (remote
+  SIM): its own QMI client (`qmi_client`, on MBIM over the passthrough), the
+  modem's AT channel, the radio park and hold (`modem_radio`, `radio_hold`),
+  the card-change process (`sim_changed`), status rows, `card_source` for the
+  SIM inventory, `sim_upsert`, and `stop`/`busy` so a lent card goes home when
+  the daemon exits — a worked example for each.
 - **wwandctl command**: `/usr/share/ucode/wwand/ctl/<cmd>.uc`, returning
   `{ run(ctx, args), help }`. The right shape when the work is really "run an
   external tool against the modem, on demand". Example: ddimension/wwand-qlog

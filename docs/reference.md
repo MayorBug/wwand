@@ -2188,9 +2188,25 @@ core knowing them by name (`plugins.uc`). A plugin is a plain script at
   `/usr/share/ucode/wwand/ctl/<cmd>.uc`, returning
   `{ run(ctx, args), help: [ lines ] }`.
 
-Known plugins: `wwand-ipa` (SGP.32 eIM fleet management) and `wwand-rsim`
-(a SIM in a reader on the router, through QMI UIM Remote), each in its own
-repository under github.com/ddimension.
+Known plugins, each in its own repository under github.com/ddimension:
+
+- **`wwand-ipa`** — SGP.32 eIM fleet management (IoT Profile Assistant
+  `ipad`, `wwandctl ipa`, `luci-app-wwand-ipa`). Uses `esim_guard`,
+  `esim_bridge`/`session_run`, `esim_refresh` and `sim_upsert` (APN of the
+  enabled profile, `origin 'ipa'`).
+- **`wwand-rsim`** — remote SIM: the modem runs on a card offered through QMI
+  UIM Remote (native QMI, or `qmi_client` over the MBIM passthrough) from a
+  reader here or on another machine over SSH, a phone over Bluetooth SAP, a
+  modem here that lends its card (a *sponsor*: SIM Access or APDU by APDU,
+  its radio parked through `modem_radio` and held with `radio_hold`), or a
+  modem on another wwand router (`wwandctl rsim proxy` there). It files the
+  remote card under its reader in the SIM inventory (`card_source`), runs the
+  card-change process on both sides (`sim_changed`), and keeps the settings a
+  lending router dials a card with as that card's `wwand_sim` (`sim_upsert`,
+  `origin 'rsim'`). The card-side helper `rsim-card` is a package of its own
+  for SIM hosts. `wwandctl rsim`, `luci-app-wwand-rsim`.
+- **`wwand-qlog`** — `wwandctl qlog`: Quectel QLog diagnostic capture on the
+  port the core reports as `diag_port`; a CLI command only, no daemon hook.
 
 ## Development
 

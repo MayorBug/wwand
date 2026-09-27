@@ -22,9 +22,11 @@ editor:
 The entry point. Lists every managed **and** detected modem with live SIM and
 registration status, its **backend** (QMI/MBIM/NCM) and the number of **up
 connections** per modem, plus the per-ICCID SIM override table. Each row has
-**Config** (edit the modem), **Status**, **Tools** and **Reboot** — the last
-resets just that modem (GPIO reset if the board exposes one, otherwise a backend
-soft reset; its connections drop briefly and recover on their own).
+**Edit** (the modem), **Status**, **Delete** and an **Actions** menu: **Tools**,
+**Reboot** — which resets just that modem (GPIO reset if the board exposes one,
+otherwise a backend soft reset; its connections drop briefly and recover on
+their own) — **Repower**, **Reattach** and, where they apply, **Unlock SIM**
+and **Save SIM** (a per-ICCID entry for the inserted card).
 
 ![Modems overview](images/luci-modems-list.png)
 
@@ -39,7 +41,7 @@ an unattended one-shot conversion there is an example uci-defaults script in
 
 ## Modem config
 
-The per-modem dialog (Config button). Hardware binding by **device path**
+The per-modem dialog (Edit button). Hardware binding by **device path**
 (a dropdown of detected modems + free text), USB serial or IMEI; the **FCC
 unlock** method for laptop-SKU modems; the generic **Reset modem** button;
 SIM slot, PIN, radio and resilience tabs.
@@ -74,6 +76,16 @@ APN / auth / PDP type, optionally bound to one modem. Ideal for dual-SIM or
 swapping eUICC profiles with different PINs.
 
 ![SIM override editor](images/luci-sim-editor.png)
+
+## Status → SIM cards — the inventory
+
+Every card wwand has seen, by ICCID, and where it is: a modem and slot, a
+profile on an eUICC, or a reader (remote SIM). A card that was taken out stays
+listed as *not present*, with when it was last seen; the cards in a
+multi-slot modem's inactive slots appear once its slot list has been read.
+`wwandctl sims` prints the same.
+
+![SIM cards](images/luci-sim-cards.png)
 
 ## Modem Tools — bands, operator, cell lock, SIM, eSIM, SMS
 

@@ -1164,7 +1164,11 @@ ok(_all_done, sprintf('every scenario ran (%d of %d) — the pump did not run ou
 
 	eq(context_common.conn_cfg(ctx, 'apn'), 'sim-apn', 'conn_cfg: sim apn wins over interface');
 	eq(context_common.conn_cfg(ctx, 'username'), 'simuser', 'conn_cfg: sim fills empty interface field');
-	eq(context_common.conn_cfg(ctx, 'auth'), 'pap', 'conn_cfg: interface fallback when sim unset');
+	// the login belongs to the APN: a card with its own APN does not take the
+	// interface's auth method, which was meant for the interface's APN
+	eq(context_common.conn_cfg(ctx, 'auth'), null, 'conn_cfg: a card with its own APN inherits no auth');
+	eq(context_common.conn_cfg({ config: ctx.config, modem: { active_sim: { username: 'simuser' } } }, 'auth'),
+	   'pap', 'conn_cfg: interface fallback for a card without an APN of its own');
 	eq(context_common.conn_cfg(ctx, 'password'), null, 'conn_cfg: empty on both levels -> null');
 
 	ctx.modem.active_sim = null;

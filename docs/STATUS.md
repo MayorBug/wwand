@@ -819,7 +819,10 @@ rejected (HW-seen on 245, 2026-09-27). The attach profile now also gets the
 connection's CREDENTIALS when its APN is the connection's (no `init_apn`):
 a CHAP-only M2M APN rejected the attach without them ("EMM attach failed",
 profile 1 with the APN and no login) while data calls with the same login
-worked. The password is written once per value, so a live edit lands.
+worked. The password is written once per value, so a live edit lands. And the login now goes with the APN
+(`conn_cfg`): a `wwand_sim` with its own APN never takes the interface's
+credentials — a Telekom card got an M2M card's CHAP login from the
+interface, in the attach profile and in its data calls.
 
 ## A direct download's PIR reaches the SM-DP+ (2026-09-27)
 

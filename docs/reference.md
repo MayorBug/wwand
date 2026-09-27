@@ -165,6 +165,13 @@ dual stack an interface that never said gets). The SIM-specific entry is more sp
 SIM-agnostic dial profile, so it wins (same rule as the PIN) — swap SIMs and
 the matching `wwand_sim` carries its carrier's credentials without touching
 the interface; the interface value is the generic default.
+**The login goes with the APN:** a `wwand_sim` that sets its own `apn` also
+decides `auth`/`username`/`password` — the ones it gives, or none — and
+never takes the interface's, which were written for the interface's APN
+(a user and password without `auth` dial as PAP/CHAP). A `wwand_sim` without
+an `apn` of its own (a PIN only, say) dials the interface's APN with the
+interface's login. Without `init_apn`, the same APN and login also go into the
+modem's LTE attach profile.
 
 How the sections relate (all in `/etc/config/network`):
 

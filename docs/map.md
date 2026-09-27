@@ -19,7 +19,7 @@ row. That is the whole maintenance rule.
 
 | Question | Answer |
 |---|---|
-| Which value wins for this connection — the card's, the interface's? | `context_common.uc conn_cfg` — per-ICCID `wwand_sim` first, interface second. The overridable set is one shared list, `context_common.uc SIM_OVERRIDABLE`. |
+| Which value wins for this connection — the card's, the interface's? | `context_common.uc conn_cfg` — per-ICCID `wwand_sim` first, interface second — except the login, which follows the APN: a `wwand_sim` with its own APN never takes the interface's credentials. The overridable set is one shared list, `context_common.uc SIM_OVERRIDABLE`. |
 | Which IP family is the PDP actually using? | `context_common.uc effective_pdp` — reads the CONFIG, never the modem's read-back. |
 | Which mux channel is really used (`auto` resolved)? | `config.uc effective_mux_id` |
 | Which `wwand_sim` section matches the card in the slot? | `modem_common.uc match_sim_override` |

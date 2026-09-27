@@ -340,4 +340,26 @@ eq(cc.effective_pdp({ config: { pdp_type: 'ipv6' }, modem: { active_sim: {} } })
 eq(cc.effective_pdp({ config: {}, modem: { active_sim: { pdp_type: 'ipv4' } } }), 'ipv4',
 	'pdp: the card can also be the ONLY statement there is');
 
+// THE LOGIN GOES WITH THE APN. A card with its own APN and no login must not
+// borrow the interface's, which was written for the interface's APN (HW-seen
+// on 245, 2026-09-27: a Telekom APN attached with an M2M card's CHAP login).
+{
+	let iface = { apn: 'm2m', auth: 'chap', username: 'gdsp', password: 'gdsp' };
+	let own = { config: iface, modem: { active_sim: { apn: 'internet.telekom' } } };
+
+	eq([ cc.conn_cfg(own, 'apn'), cc.conn_cfg(own, 'auth'), cc.conn_cfg(own, 'username'),
+	     cc.conn_cfg(own, 'password') ], [ 'internet.telekom', null, null, null ],
+	   'login: a card with its own APN brings its own login — none here — not the interface\'s');
+
+	let with_login = { config: iface, modem: { active_sim: { apn: 'x', auth: 'pap', username: 'u' } } };
+
+	eq([ cc.conn_cfg(with_login, 'auth'), cc.conn_cfg(with_login, 'username'), cc.conn_cfg(with_login, 'password') ],
+	   [ 'pap', 'u', null ], 'login: ...and its own fields, without mixing in the interface\'s password');
+
+	let pin_only = { config: iface, modem: { active_sim: { pincode: '1234' } } };
+
+	eq([ cc.conn_cfg(pin_only, 'apn'), cc.conn_cfg(pin_only, 'username') ], [ 'm2m', 'gdsp' ],
+	   'login: a card without an APN of its own dials the interface\'s APN with its login');
+}
+
 done('test_context_common');

@@ -959,6 +959,33 @@ export function create(opts)
 		}
 	};
 
+	// A live edit of the override that matches the card in use: re-program
+	// the attach profile (reapply_sim, which cycles the radio only when the
+	// profile really changed), then re-dial the sessions still up, which were
+	// dialled with the old values. Only on a modem past its init chain: one
+	// that is still coming up reads the new list on its own.
+	let apply_sim_change = (mn, m) => {
+		log('notice', sprintf('modem %s: the SIM override of the card in use changed — applying it', mn));
+
+		if (index([ 'ABSENT', 'INIT_TRANSPORT', 'INIT_SERVICES', 'INIT_DATAPATH' ], m.state) >= 0 ||
+		    type(m.reapply_sim) != 'function')
+			return;
+
+		m.reapply_sim(() => {
+			if (self.modems[mn]?.modem !== m)
+				return;   // restarted or removed meanwhile
+
+			for (let name, centry in self.contexts) {
+				if (centry.cfg?.modem != mn || !centry.ctx || !centry.wanted ||
+				    centry.ctx.state != 'CONNECTED')
+					continue;
+
+				log('notice', sprintf('interface %s: re-dialling with the changed SIM override', name));
+				centry.ctx.down(() => enter_reconnecting(name));
+			}
+		});
+	};
+
 	let on_modem_event = (modem, event, data) => {
 		// clear the one-shot manual-PIN-release flags so a later cycle never reuses them
 		if (event == 'registered' || event == 'sim_blocked') {
@@ -2776,10 +2803,24 @@ export function create(opts)
 				m.config.sims = parsed.modems[mn]?.sims;
 
 				if (changed && (m.info?.iccid != null || m.info?.imsi != null)) {
+					let before = sprintf('%J', m.active_sim);
+
 					m.active_sim = modem_common.match_sim_override(m.config.sims,
 						m.info.iccid, m.info.imsi);
-					log('info', sprintf('modem %s: SIM overrides changed — %s', mn,
-						m.active_sim ? 'the card matches one' : 'none matches the card'));
+
+					// What the card in use gets has changed (its APN, PDP type,
+					// credentials — or it gained or lost an override): apply it
+					// the way a card re-read does. The attach APN lives in the
+					// modem's attach profile, programmed only by reapply_sim, and
+					// a running session keeps what it dialled with — so without
+					// both an edited APN did nothing until the next card event,
+					// and a card whose attach was being rejected stayed rejected
+					// (HW-seen on 245, 2026-09-27). Edits for other cards change
+					// nothing here and touch nothing.
+					if (sprintf('%J', m.active_sim) != before)
+						apply_sim_change(mn, m);
+					else
+						log('info', sprintf('modem %s: SIM overrides changed — none for the card in use', mn));
 				}
 			}
 		}

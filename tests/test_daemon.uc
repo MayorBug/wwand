@@ -3105,13 +3105,14 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 // card again — a new override takes effect, a deleted one stops — and a modem
 // held at SIM_BLOCKED is restarted, the override may carry its PIN.
 (() => {
-	let made = 0;
+	let made = 0, reapplied = 0, downs = 0;
 	let fake = {
 		modem: { create: (o) => { made++; return { id: o.id, state: 'READY', config: o.config,
 		                                           info: { iccid: '89882390000064624748', imsi: '901280001430235' },
+		                                           reapply_sim: (cb) => { reapplied++; cb(false); },
 		                                           start: () => null, stop: () => null }; } },
-		context: { create: (o) => ({ state: 'IDLE', down: (cb) => cb ? cb() : null, up: (cb) => cb(null),
-		                             modem_event: () => null }) },
+		context: { create: (o) => ({ state: 'IDLE', down: (cb) => { downs++; return cb ? cb() : null; },
+		                             up: (cb) => cb(null), modem_event: () => null }) },
 	};
 	let d = daemon_mod.create({ timing: TIMING, deps: { log: () => null, load_qmi: () => fake } });
 	let base = {
@@ -3124,8 +3125,22 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	d.apply_config(config.parse({ network: base }));
 	d.apply_config(with_sim('one'));
 	eq(d.modems.m0.modem.active_sim?.apn, 'one', 'live wwand_sim: a new override matches the card in use');
+	reapplied = 0; downs = 0;
+	d.contexts.wan.wanted = true;
+	d.contexts.wan.ctx.state = 'CONNECTED';
 	d.apply_config(with_sim('two'));
 	eq(d.modems.m0.modem.active_sim?.apn, 'two', 'live wwand_sim: an edit takes effect');
+	eq([ reapplied, downs ], [ 1, 1 ],
+	   'live wwand_sim: ...applied like a card re-read (attach profile) and the session re-dialled');
+
+	// an override for another card changes nothing for this one
+	reapplied = 0; downs = 0;
+	d.apply_config(config.parse({ network: { ...base,
+		s1: { '.type': 'wwand_sim', iccid: '89882390000064624748', apn: 'two' },
+		s2: { '.type': 'wwand_sim', iccid: '89490200001844967110', apn: 'other' } } }));
+	eq([ reapplied, downs, d.modems.m0.modem.active_sim?.apn ], [ 0, 0, 'two' ],
+	   'live wwand_sim: an override for another card touches nothing');
+	d.contexts.wan.ctx.state = 'IDLE';
 	d.apply_config(config.parse({ network: base }));
 	eq(d.modems.m0.modem.active_sim, null, 'live wwand_sim: a deleted one stops');
 	eq(made, 1, 'live wwand_sim: ...all without a modem restart');

@@ -811,7 +811,11 @@ The running modem gets the new list AND matches its card against it again
 (`active_sim`, which the dial reads); handing over the list alone left a new
 override ignored and a deleted one in force until the next card read. A
 modem held at SIM_BLOCKED is still restarted, since the override may carry
-the PIN it waits for.
+the PIN it waits for. An edit that changes what the card in use gets is also
+APPLIED like a card re-read: the attach profile is programmed again
+(`reapply_sim`; the attach APN lives only there) and the sessions still up
+re-dial — matching alone left an edited APN unused and a rejected attach
+rejected (HW-seen on 245, 2026-09-27).
 
 ## A direct download's PIR reaches the SM-DP+ (2026-09-27)
 

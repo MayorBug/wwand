@@ -145,7 +145,7 @@ export function install(self, o)
 			// the backoff they were meant to space out collapses. Reachable
 			// whenever something reaches retry_activate while a retry is
 			// already scheduled: the modem-ready and adoption paths call it
-			// directly (daemon.uc:852,:943), and the sim_refresh handler gets
+			// directly (daemon.uc:897,:988), and the sim_refresh handler gets
 			// there through enter_reconnecting.
 			if (entry.retry_timer) {
 				entry.retry_timer.cancel();
@@ -171,6 +171,23 @@ export function install(self, o)
 		// woken modem reports re-arms the interface (modem_registered).
 		if (modem.lowpower_parked)
 			return schedule();
+
+		// ...and a radio a plugin holds, parked or not. Not every held modem
+		// is parked: one whose backend cannot switch its radio off, or that
+		// registered before the hold was asked, is READY on its own card —
+		// and this path, unlike context_up, had no word about the hold: a
+		// non-destructive wwand restart adopted the still-up interface and
+		// dialled on the local card of a modem waiting for its remote SIM.
+		// Waits the same way; the hold's end is picked up by the next try.
+		if (self.plugins_radio_hold?.(entry.cfg?.modem ?? modem.id)) {
+			if (!entry._held_retry_logged)
+				log('notice', sprintf('interface %s: not dialling — %s', name,
+					self.plugins_radio_hold(entry.cfg?.modem ?? modem.id)));
+			entry._held_retry_logged = true;
+			return schedule();
+		}
+
+		entry._held_retry_logged = false;
 
 		entry.ctx.up((err) => {
 			if (err && entry.wanted && entry.ctx?.state != 'CONNECTED')

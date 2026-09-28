@@ -86,6 +86,9 @@ export function create(opts)
 		datapath: null,
 		counters: null,
 		contexts: [],
+		// the radio switched off on purpose (set_opmode low_power: a plugin's
+		// hold, `option lowpower`) — the registration it costs is no fault
+		lowpower_parked: false,
 	};
 
 	let deps = opts.deps ?? {};
@@ -156,7 +159,7 @@ export function create(opts)
 
 	// --- step chain --------------------------------------------------------
 
-	let step_open, step_fcc, step_caps, step_at, step_at_ident, step_datapath, step_simslot, step_sim, step_attach_profile, step_register, do_register, step_attach;
+	let hold_at_open, step_open, step_fcc, step_caps, step_at, step_at_ident, step_datapath, step_simslot, step_sim, step_attach_profile, step_register, do_register, step_attach;
 
 	// MBIM reports the operator as one concatenated MCC+MNC string
 	// (MbimRegisterState ProviderId, "26006"), while QMI reports the pair
@@ -248,6 +251,12 @@ export function create(opts)
 			self.mbim.command(bc, 'RADIO_STATE', 'set',
 				{ radio_state: bc.RADIO_STATE_OFF }, () => {
 					settle_timer = uloop.timer(self.timing.settle, () => {
+						// a parked radio stays off: a cycle ending online
+						// un-parks it behind the park's back (modem.uc
+						// online_unless_parked)
+						if (self.lowpower_parked || !self.mbim)
+							return done();
+
 						self.mbim.command(bc, 'RADIO_STATE', 'set',
 							{ radio_state: bc.RADIO_STATE_ON }, (e2, d2) => {
 								note_radio(d2);
@@ -337,6 +346,40 @@ export function create(opts)
 		});
 	};
 
+	// A PLUGIN HOLDS THE RADIO OFF (its card is lent, or it waits for a
+	// remote SIM): off right after OPEN — after the vendor FCC unlock, so
+	// nothing that command does to the radio comes after the park — and
+	// before anything else. An MBIM modem registers on its own whenever its
+	// software radio is on: that state persists across boots, wwand sends no
+	// REGISTER_STATE set at init, and the only thing step_register ever had
+	// to do for it was switch an off radio on (ddimension/wwand#3, EG18). So
+	// the QMI chain's point of asking (step_opmode) comes too late here: on
+	// LTE a registration is an attach, and the network has seen the local
+	// IMSI. The native switch, because the passthrough cannot be probed this
+	// early (extra_client). A refused switch does not fail the init: it
+	// continues held, REGISTERING waits, and its interfaces are refused
+	// (radio_held).
+	hold_at_open = (next) => {
+		let hold = self.radio_hold?.();
+
+		if (!hold)
+			return next();
+
+		log('notice', sprintf('radio stays off at init — %s', hold));
+		self._plugin_held = true;
+
+		self.set_opmode('low_power', (err) => {
+			if (err?.error == 'cancelled')
+				return;
+
+			if (err)
+				log('warn', sprintf('radio stays off at init: switching it off failed (%J) — continuing held; its interfaces are refused until the hold ends',
+					err));
+
+			next();
+		});
+	};
+
 	// FCC RF unlock (laptop-SKU Quectel modems in MBIM mode, e.g. EM120R-GL /
 	// EM160R-GL in Lenovo machines): `option fcc_auth 'quectel'` sends the
 	// vendor Radio State = on right after MBIM OPEN — the MBIM mirror of
@@ -345,7 +388,7 @@ export function create(opts)
 	// modem simply ignores/rejects the vendor CID).
 	step_fcc = () => {
 		if (self.config.fcc_auth != 'quectel')
-			return step_caps();
+			return hold_at_open(step_caps);
 
 		self.mbim.command(quectel_svc, 'RADIO_STATE', 'set',
 			{ radio_state: quectel_svc.RADIO_ON }, (err, data) => {
@@ -354,7 +397,7 @@ export function create(opts)
 			else
 				log('notice', sprintf('FCC unlock: quectel radio state now %d', data?.radio_state));
 
-			step_caps();
+			hold_at_open(step_caps);
 		});
 	};
 
@@ -1114,13 +1157,39 @@ export function create(opts)
 
 		if (registered && self.state == 'REGISTERING') {
 			if (reg_timer) { reg_timer.cancel(); reg_timer = null; }
+			// woken from a park at init: this READY entry emits `registered`
+			// itself, the READY wake below must not add a second
+			self._wake_pending = false;
 			// ATTACHING guards against REGISTER_STATE indications piling up
 			// while the attach is in flight — without it each one would re-run
 			// step_attach and re-emit 'registered' (kick spam in the daemon)
 			self.set_state('ATTACHING');
 			step_attach();
 		}
+		else if (registered && self.state == 'READY' && self._wake_pending) {
+			// Woken from a park while READY: registered again with no
+			// REGISTERING step, so no `registered` event, and the daemon never
+			// re-arms the interfaces it gave up while the radio was off
+			// (modem.uc set_opmode has the QMI twin). Through the attach, as
+			// a registration regained after a loss goes, which ends in READY
+			// and `registered`.
+			self._wake_pending = false;
+			log('notice', 'registered again after the radio was parked');
+			self.set_state('ATTACHING');
+			step_attach();
+		}
 		else if (!registered && (self.state == 'READY' || self.state == 'ATTACHING')) {
+			// PARKED: we switched the radio off ourselves, so losing
+			// registration is the consequence, not a fault — step_register
+			// would fight the park (it switches the software radio on) and
+			// its timeout walk the recovery ladder. Same as modem.uc.
+			if (self.lowpower_parked) {
+				log('info', 'registration released (radio parked)');
+				emit('deregistered', self.reg);
+				notify_contexts('suspend', self.reg);
+				return;
+			}
+
 			log('warn', 'registration lost');
 			emit('deregistered', self.reg);
 			notify_contexts('suspend', self.reg);
@@ -1216,6 +1285,12 @@ export function create(opts)
 
 				self.effective_apn = apn;
 
+				// parked or held: the attach runs with the new profile when
+				// the radio is woken — a cycle ending online here would
+				// register behind the park's back
+				if (self.lowpower_parked || self._plugin_held)
+					return step_register();
+
 				// force the (possibly already-completed) autonomous attach to
 				// re-run with the new profile: radio off -> settle -> on -> settle
 				log('notice', 'attach profile changed, cycling radio to re-attach');
@@ -1234,6 +1309,51 @@ export function create(opts)
 	};
 
 	step_register = () => {
+		// HELD: the radio stays off (hold_at_open has the reason), and this is
+		// the second place to ask — a hold that began after OPEN, or a
+		// registration lost while held but not parked. REGISTERING waits.
+		let hold = self.radio_hold?.();
+
+		if (hold) {
+			self._plugin_held = true;
+
+			if (self.lowpower_parked)
+				return do_register();
+
+			log('notice', sprintf('radio stays off — %s', hold));
+
+			return self.set_opmode('low_power', (err) => {
+				if (err?.error == 'cancelled')
+					return;
+
+				if (err)
+					log('warn', sprintf('switching the radio off failed (%J) — continuing held', err));
+
+				do_register();
+			});
+		}
+
+		// Not held, and a park from an earlier pass still recorded: this
+		// object outlives a failed init (make_fail restarts the same
+		// instance), so it is woken the way it was parked — a DMS low power
+		// is not undone by the Radio State query below — and the flags go
+		// with it. Left, REGISTERING waited forever and the next
+		// registration loss read as "radio parked".
+		if (self.lowpower_parked)
+			return self.set_opmode('online', (err) => {
+				if (err?.error == 'cancelled')
+					return;
+
+				if (err)
+					log('warn', sprintf('waking the parked radio failed: %J', err));
+
+				self.lowpower_parked = false;
+				self._plugin_held = false;
+				step_register();
+			});
+
+		self._plugin_held = false;
+
 		// The SOFTWARE radio can be off, and stay off across reboots: some modems
 		// ship that way. Nothing else in this backend ever turns it on — the two
 		// existing RADIO_STATE writers both cycle off->on inside a flow that only
@@ -1295,9 +1415,20 @@ export function create(opts)
 			// no worse off than before.
 			self.mbim.subscribe_events();
 
-			reg_timer = uloop.timer(self.timing.reg_timeout, () => {
+			let reg_timeout;
+
+			reg_timeout = () => {
 				if (self.state != 'REGISTERING')
 					return;
+
+				// parked or held on purpose: not registered because the radio
+				// is off, not a fault — failing would walk the recovery ladder
+				// (radio cycles, resets that end online) over a modem doing
+				// as told. The timer re-arms, so a woken modem still times out.
+				if (self.lowpower_parked || self._plugin_held) {
+					reg_timer = uloop.timer(self.timing.reg_timeout, reg_timeout);
+					return;
+				}
 
 				// ASK WHY BEFORE GIVING UP. A registration that never completes
 				// is the case LTE Attach Info exists for: under MBIMEx v3 it
@@ -1333,7 +1464,9 @@ export function create(opts)
 						attach: info,
 					});
 				});
-			});
+			};
+
+			reg_timer = uloop.timer(self.timing.reg_timeout, reg_timeout);
 
 			self.mbim.command(bc, 'REGISTER_STATE', 'query', {}, (err, data) => {
 				if (!err)
@@ -2047,6 +2180,123 @@ export function create(opts)
 		});
 	};
 
+	// One DMS SET_OPERATING_MODE over the QMI passthrough, on a CID held for
+	// that request only (the reattach's pattern). cb(err): { error:
+	// 'no_passthrough' } when there is no QMI to ask, `cancelled` when the
+	// session ended meanwhile. Never a CTL SYNC: over the passthrough it
+	// resets the modem's embedded QMI state and ends the MBIM data session
+	// (qmi_over_mbim.uc blocks it). A method, so a test can stand in for a
+	// passthrough the MBIM mock does not have.
+	self._pt_opmode = function(mode, cb) {
+		let gen = self._gen;
+
+		self._ensure_pt((up) => {
+			if (self._gen != gen)
+				return cb({ error: 'cancelled' });
+
+			if (!up)
+				return cb({ error: 'no_passthrough' });
+
+			self.pt.ctl.request('ALLOCATE_CID', { service: dmsmod.default.service }, (aerr, adata) => {
+				if (self._gen != gen || aerr?.error == 'cancelled')
+					return cb({ error: 'cancelled' });
+
+				if (aerr || !adata?.allocation)
+					return cb({ error: 'no_passthrough' });
+
+				let dms = client_mod.create(self.pt.shim, dmsmod.default, adata.allocation.cid, hooks);
+
+				dms._pt_gen = self._gen;
+
+				qmi_backend.set_opmode(dms, mode, (err) => {
+					pt_release(dms);
+					cb(err);
+				});
+			}, { no_recovery: true });
+		});
+	};
+
+	// Backend operation `set_opmode` (docs/backend-interface.md): online /
+	// low_power / offline — the radio park of a plugin's hold
+	// (`modem_radio`) and of `option lowpower`. `lowpower_parked` records a
+	// successful low_power, as on QMI, and the supervisors read it.
+	//
+	// OVER THE PASSTHROUGH'S DMS FIRST: LOW_POWER is the mode QMI modems are
+	// parked in, RF off with the SIM kept up ("temporarily disabled RF",
+	// qmi-enums-dms.h, libqmi 1.38.0) — a remote SIM served through UIM
+	// Remote over this same passthrough keeps running. MBIM's own software
+	// radio switch (Basic Connect Radio State) where there is no
+	// passthrough, where DMS refuses, and during the init chain, where a
+	// passthrough probe fails and would be remembered as "none on this
+	// modem" (extra_client). `offline` maps to that switch too: MBIM has
+	// only the one.
+	//
+	// THE WAKE GOES THE WAY THE PARK WENT (`_park_via`): the two are not the
+	// same switch, and undoing one leaves the other off.
+	self.set_opmode = function(mode, cb) {
+		cb = cb ?? (() => null);
+
+		if (!self.mbim)
+			return cb({ error: 'unsupported', detail: 'no mbim channel' });
+
+		if (mode != 'online' && mode != 'low_power' && mode != 'offline')
+			return cb({ error: 'unsupported', mode: mode });
+
+		let gen = self._gen;
+		let was_parked = self.lowpower_parked;
+		let early = index([ 'ABSENT', 'INIT_TRANSPORT', 'INIT_SERVICES' ], self.state) >= 0;
+
+		let done = (err, via) => {
+			if (self._gen != gen)
+				return cb({ error: 'cancelled' });
+
+			if (!err) {
+				self.lowpower_parked = (mode == 'low_power');
+				self._park_via = self.lowpower_parked ? via : null;
+			}
+
+			// woken from a park: the next registration is reported as one
+			// (_update_register)
+			if (!err && was_parked && mode == 'online')
+				self._wake_pending = true;
+
+			cb(err ?? null);
+		};
+
+		let via_radio = () => {
+			if (self._gen != gen || !self.mbim)
+				return cb({ error: 'cancelled' });
+
+			self.mbim.command(bc, 'RADIO_STATE', 'set',
+				{ radio_state: (mode == 'online') ? bc.RADIO_STATE_ON : bc.RADIO_STATE_OFF },
+				(err, data) => {
+					if (self._gen != gen)
+						return cb({ error: 'cancelled' });
+
+					note_radio(data);
+					done(err ? { error: 'mbim', detail: err } : null, 'radio');
+				});
+		};
+
+		if (early || (mode == 'online' && self._park_via == 'radio'))
+			return via_radio();
+
+		self._pt_opmode(mode, (err) => {
+			if (self._gen != gen || err?.error == 'cancelled')
+				return cb({ error: 'cancelled' });
+
+			if (err) {
+				if (err.error != 'no_passthrough')
+					log('info', sprintf('radio %s over the QMI passthrough refused (%J) — using the MBIM radio switch',
+						mode, err));
+
+				return via_radio();
+			}
+
+			done(null, 'dms');
+		});
+	};
+
 	// telemetry (signal/cells/CA/data-mode/reg-detail + slow log loop + fast
 	// watch loop) — lives in telemetry_mbim.uc; attaches the _refresh_*
 	// methods, watch and _start_telemetry, returns { stop } for teardown.
@@ -2112,7 +2362,7 @@ export function create(opts)
 			// — closing the HOST's MBIM session is not shown to reset the
 			// modem's embedded QMI client table, so every daemon reload leaked
 			// a NAS, a DSD and (once used) a UIM and a WMS. The E182E-class
-			// table has room for a handful. Same burst modem.uc:1622 does for
+			// table has room for a handful. Same burst modem.uc:1632 does for
 			// the native side, which the passthrough never had. ctl is NOT in this list: it is the
 			// implicit client (cid 0) and it is what carries RELEASE_CID for
 			// all the others, so it has to outlive them.

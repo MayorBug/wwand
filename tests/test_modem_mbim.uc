@@ -883,7 +883,12 @@ modem = modem_mbim.create({
 		on_event: (m, event, data) => {
 			if (event == 'sim_refresh')
 				push(ready_events, { event: event, data: data });
-			if (event == 'registered') {
+			// ONCE: assert_inline_reject drives a registration loss and a
+			// re-registration on this modem, and a second assert_telemetry
+			// armed by it fires in whichever later scenario runs the loop
+			// long enough — against a modem that is stopped by then
+			if (event == 'registered' && !m._telemetry_armed) {
+				m._telemetry_armed = true;
 				ok(true, 'modem reached READY (OPEN->CAPS->SUBSCRIBER->REGISTER->PACKET_SERVICE)');
 
 				// warm the fast loop (as daemon.modem_signal does), then read back
@@ -1690,6 +1695,256 @@ function assert_late_registration_survives_the_diagnostic() {
 }
 
 assert_late_registration_survives_the_diagnostic();
+
+// --- the radio hold on MBIM ---------------------------------------------------
+//
+// A modem with a remote SIM assigned (wwand-rsim) must not register on its own
+// card even once. MBIM had no set_opmode, so a held MBIM modem was never
+// parked at all: it registered at init and stayed registered, and a daemon
+// restart adopted its interfaces into a dial on the local card.
+
+// A modem whose radio state behaves like the real one: the software switch
+// persists, the modem registers whenever it is on.
+function radio_modem_handlers(st) {
+	let h = handlers();
+
+	h.RADIO_STATE = (args, meta) => {
+		if (meta.kind == 'set')
+			st.on = (args.radio_state == bc.RADIO_STATE_ON);
+
+		return { hw_radio_state: bc.RADIO_STATE_ON,
+		         sw_radio_state: st.on ? bc.RADIO_STATE_ON : bc.RADIO_STATE_OFF };
+	};
+	h.REGISTER_STATE = () => ({ nw_error: 0,
+		register_state: st.on ? bc.REGISTER_STATE_HOME : bc.REGISTER_STATE_SEARCHING,
+		register_mode: 1, available_data_classes: ext.DATA_CLASS_LTE, current_cellular_class: 1,
+		provider_id: st.on ? '26201' : '', provider_name: st.on ? 'Telekom.de' : '',
+		roaming_text: '', registration_flag: 0 });
+	// asked by a registration timeout (the reject detail) — which is what a
+	// held modem must not run into
+	h.LTE_ATTACH_INFO = { __error: 9 };
+
+	return h;
+}
+
+let reg_ind = (mock, on) => mock.indicate('REGISTER_STATE', { nw_error: 0,
+	register_state: on ? bc.REGISTER_STATE_HOME : bc.REGISTER_STATE_SEARCHING,
+	register_mode: 1, available_data_classes: on ? ext.DATA_CLASS_LTE : 0, current_cellular_class: 1,
+	provider_id: on ? '26201' : '', provider_name: on ? 'Telekom.de' : '',
+	roaming_text: '', registration_flag: 0 });
+
+let mk_radio_modem = (id, mock, events) => modem_mbim.create({
+	id: id, device: '/dev/' + id,
+	config: { apn: 'internet' },
+	timing: { settle: 1, reg_timeout: 40, backoff_min: 1000, backoff_max: 1000, at_drain: 1 },
+	at: { fx: { read: () => null, glob: () => [] } },
+	recovery: { fx: fakefx.create(), state_dir: '/state' },
+	datapath: { netdev: 'wwan0', fx: fakefx.create(), mux: 'auto' },
+	deps: {
+		transport_open: mock.transport_open,
+		log: () => null,
+		on_event: (mm, event, data) => push(events, event),
+	},
+});
+
+let radio_sets = (mock) => map(filter(mock.calls, (c) => c.name == 'RADIO_STATE' && c.kind == 'set'),
+	(c) => c.args?.radio_state);
+
+// held at init: off right after OPEN, waits, registers once woken
+function assert_mbim_hold_at_init() {
+	uloop.init();
+
+	let st = { on: true };        // booted with its radio on, as it was left
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers(st) });
+	let events = [], seen = {};
+	let hold = 'rsim: its remote SIM x is not connected yet';
+	let m = mk_radio_modem('m_hold', mock, events);
+
+	m.radio_hold = () => hold;
+	m.start();
+
+	// several registration timeouts later
+	uloop.timer(250, () => {
+		let names = map(mock.calls, (c) => c.name);
+
+		seen.state = m.state;
+		seen.sets = radio_sets(mock);
+		seen.off_first = index(names, 'RADIO_STATE') >= 0 &&
+			index(names, 'RADIO_STATE') < index(names, 'DEVICE_CAPS');
+		seen.parked = [ m.lowpower_parked, m._plugin_held, m._park_via ];
+
+		hold = null;
+		m.set_opmode('online', (e) => {
+			seen.wake_err = e;
+			reg_ind(mock, true);
+		});
+	});
+
+	uloop.timer(450, () => { m.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(seen.off_first, true, 'mbim hold at init: the radio goes off right after OPEN, before the capabilities');
+	eq(seen.sets, [ bc.RADIO_STATE_OFF ], 'mbim hold at init: off, and never on behind the hold');
+	eq(seen.parked, [ true, true, 'radio' ], 'mbim hold at init: parked over the native switch (no passthrough this early)');
+	eq(seen.state, 'REGISTERING', 'mbim hold at init: waits in REGISTERING...');
+	eq(length(filter(events, (e) => e == 'error')), 0, '...through several registration timeouts, without a failure');
+	eq(seen.wake_err, null, 'mbim hold at init: woken');
+	eq(radio_sets(mock), [ bc.RADIO_STATE_OFF, bc.RADIO_STATE_ON ], 'mbim hold at init: ...the way it was parked');
+	eq(length(filter(events, (e) => e == 'registered')), 1, 'mbim hold at init: registered once, after the wake');
+}
+
+assert_mbim_hold_at_init();
+
+// the park of a running modem: a lost registration is its consequence, the
+// wake's registration is reported
+function assert_mbim_park_while_ready() {
+	uloop.init();
+
+	let st = { on: true };
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers(st) });
+	let events = [], seen = {};
+	let m = mk_radio_modem('m_park', mock, events);
+
+	m.start();
+
+	uloop.timer(150, () => {
+		seen.ready = m.state;
+		m._pt_opmode = (mode, cb) => cb({ error: 'no_passthrough' });
+		m.set_opmode('low_power', (e) => {
+			seen.park_err = e;
+			reg_ind(mock, false);
+		});
+	});
+
+	uloop.timer(300, () => {
+		seen.parked_state = m.state;
+		seen.sets = radio_sets(mock);
+		seen.regs = length(filter(events, (e) => e == 'registered'));
+		m.set_opmode('online', () => reg_ind(mock, true));
+	});
+
+	uloop.timer(450, () => { seen.final = m.state; m.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq([ seen.ready, seen.park_err ], [ 'READY', null ], 'mbim park: a READY modem is parked');
+	eq(seen.parked_state, 'READY', 'mbim park: the lost registration is the park\'s consequence, not re-registered');
+	eq(seen.sets, [ bc.RADIO_STATE_OFF ], 'mbim park: ...and the radio is not switched back on behind it');
+	ok(index(events, 'deregistered') >= 0, 'mbim park: the loss is still reported');
+	eq(length(filter(events, (e) => e == 'registered')) - seen.regs, 1,
+	   'mbim park: the wake\'s registration is reported as one');
+	eq(seen.final, 'READY', 'mbim park: READY again after the wake');
+	eq([ m.lowpower_parked, m._wake_pending ], [ false, false ], 'mbim park: nothing pending afterwards');
+}
+
+assert_mbim_park_while_ready();
+
+// the transport: the passthrough's DMS first, the native switch without one
+// or when DMS refuses, and the wake the way the park went
+(() => {
+	let m = modem_mbim.create({
+		id: 'm_opmode', device: '/dev/mockop', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: () => null, on_event: () => null },
+	});
+	let radio = [], pt = [], err = 'unset';
+	let pt_ok = (mode, cb) => { push(pt, mode); cb(null); };
+
+	m.set_opmode('low_power', (e) => { err = e?.error; });
+	eq(err, 'unsupported', 'mbim set_opmode: no session, unsupported');
+
+	m.mbim = { destroy: () => null, command: (svc, name, kind, args, cb) => {
+		push(radio, args.radio_state);
+		cb(null, { hw_radio_state: bc.RADIO_STATE_ON, sw_radio_state: args.radio_state });
+	} };
+	m.state = 'READY';
+	m._pt_opmode = pt_ok;
+
+	m.set_opmode('low_power', () => null);
+	eq([ pt, radio, m.lowpower_parked, m._park_via ], [ [ 'low_power' ], [], true, 'dms' ],
+	   'mbim set_opmode: parked over the passthrough\'s DMS');
+	m.set_opmode('online', () => null);
+	eq([ pt, radio, m.lowpower_parked, m._wake_pending ], [ [ 'low_power', 'online' ], [], false, true ],
+	   'mbim set_opmode: ...and woken there');
+
+	m._pt_opmode = (mode, cb) => cb({ error: 'no_passthrough' });
+	m.set_opmode('low_power', () => null);
+	eq([ radio, m._park_via ], [ [ bc.RADIO_STATE_OFF ], 'radio' ], 'mbim set_opmode: no passthrough — the MBIM radio switch');
+
+	pt = [];
+	m._pt_opmode = pt_ok;
+	m.set_opmode('online', () => null);
+	eq([ pt, radio ], [ [], [ bc.RADIO_STATE_OFF, bc.RADIO_STATE_ON ] ],
+	   'mbim set_opmode: a radio parked over the switch is woken over the switch');
+
+	radio = [];
+	m._pt_opmode = (mode, cb) => cb({ error: 'qmi', code: 1 });
+	m.set_opmode('low_power', () => null);
+	eq(radio, [ bc.RADIO_STATE_OFF ], 'mbim set_opmode: refused over DMS — the MBIM radio switch');
+
+	radio = [];
+	m.lowpower_parked = false;
+	m._pt_opmode = (mode, cb) => cb({ error: 'cancelled' });
+	m.set_opmode('low_power', (e) => { err = e?.error; });
+	eq([ err, radio, m.lowpower_parked ], [ 'cancelled', [], false ],
+	   'mbim set_opmode: a session ending meanwhile changes nothing and sends nothing native');
+})();
+
+// the recovery ladder's radio cycle leaves a parked radio off: a cycle that
+// ends online un-parks it behind the park's back
+(() => {
+	uloop.init();
+
+	let m = modem_mbim.create({
+		id: 'm_cycle', device: '/dev/mockcy', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: () => null, on_event: () => null },
+	});
+	let radio = [], done_action = null;
+
+	m.mbim = { destroy: () => null, command: (svc, name, kind, args, cb) => {
+		push(radio, args.radio_state);
+		cb(null, { hw_radio_state: bc.RADIO_STATE_ON, sw_radio_state: args.radio_state });
+	} };
+	m.state = 'READY';
+	m.lowpower_parked = true;
+	m.counters.proto_ok = 1;          // armed: the modem has answered
+	m.counters.attempts = 7;          // the next failure is the opmode-cycle rung
+	m.note_connect_failure((a) => { done_action = a; });
+
+	uloop.timer(30, () => uloop.end());
+	uloop.run();
+
+	eq([ radio, done_action ], [ [ bc.RADIO_STATE_OFF ], 'opmode_cycle' ],
+	   'mbim recovery: the radio cycle of a parked modem does not end online');
+})();
+
+// a park left from an earlier init pass (make_fail restarts the same object):
+// woken on the way to REGISTERING, the flags go with it
+function assert_mbim_reinit_clears_park() {
+	uloop.init();
+
+	let st = { on: false };       // parked over the native switch by the earlier pass
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers(st) });
+	let events = [];
+	let m = mk_radio_modem('m_reinit', mock, events);
+
+	m.lowpower_parked = true;
+	m._plugin_held = true;
+	m._park_via = 'radio';
+	m.start();
+
+	uloop.timer(200, () => { m.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	ok(index(events, 'registered') >= 0, 'mbim re-init: registers once the hold is gone');
+	eq([ m.lowpower_parked, m._plugin_held ], [ false, false ], 'mbim re-init: no park left recorded');
+}
+
+assert_mbim_reinit_clears_park();
 
 // --- the attach cause comes from AT+CEER when MBIM has none ------------------
 //

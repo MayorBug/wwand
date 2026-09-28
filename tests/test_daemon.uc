@@ -1423,6 +1423,92 @@ uloop.timer(900, () => {
 });
 
 uloop.run();
+// --- a held modem is not dialled, parked or not; one that cannot be held says so
+// After a non-destructive restart the modem registers again and the still-up
+// interface is ADOPTED — through retry_activate, which knew nothing of the
+// hold: a modem waiting for its remote SIM dialled on its own card. And a
+// modem whose backend has no radio switch cannot be held at all: every park
+// attempt answers unsupported, said once, and the status says the radio is on.
+(() => {
+	let logs = [], ups = 0, hook = null, why = 'rsim: waits for its remote SIM';
+	let mk = (modem_extra) => {
+		let fake = {
+			modem: { create: (o) => {
+				hook = o.deps.on_event;
+				return { id: o.id, state: 'READY', config: o.config, start: () => null, stop: () => null,
+				         note_connect_success: () => null, ...(modem_extra ?? {}) };
+			} },
+			context: { create: (o) => ({ state: 'IDLE', name: o.name, modem: o.modem, config: o.config,
+			                             down: (cb) => cb ? cb() : null, up: (cb) => { ups++; },
+			                             modem_event: () => null }) },
+		};
+		let d = daemon_mod.create({ timing: TIMING, deps: {
+			log: (l, m) => push(logs, m), load_qmi: () => fake,
+			plugins: [ { name: 'rsim', options: [], mod: { create: () => ({
+				radio_hold: (ref) => (why && ref == 'm0') ? substr(why, 6) : null }) } } ],
+			kick_interface: () => null, down_interface: () => null,
+			iface_status: (i, cb) => cb({ up: true, pending: false, autostart: true }),
+		} });
+
+		d.apply_config(config.parse({ network: {
+			m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+			wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: 'a' },
+		} }));
+		d.esim_guard('m0', 'enable');   // loads the plugins
+		d.contexts.wan.wanted = true;
+		return d;
+	};
+
+	// no radio switch at all (an NCM modem without an AT port answers the
+	// same through set_opmode, below)
+	let d = mk();
+
+	ups = 0;
+	hook(d.modems.m0.modem, 'registered', {});
+	eq(ups, 0, 'held, restart: the still-up interface is not adopted into a dial on the modem\'s own card');
+	ok(d.contexts.wan.retry_timer != null, 'held: ...it waits for the hold to end instead');
+
+	why = null;
+	d.contexts.wan.retry_timer?.cancel();
+	d.contexts.wan.retry_timer = null;
+	ups = 0;
+	d.contexts.wan.ctx.state = 'IDLE';
+	d._retry_activate('wan');
+	eq(ups, 1, 'held: once nothing holds the radio, the interface is dialled');
+	d.shutdown();
+
+	// ...and that modem cannot be held: said once, and in the status
+	why = 'rsim: waits for its remote SIM';
+	logs = [];
+	d = mk();
+	hook(d.modems.m0.modem, 'registered', {});
+	hook(d.modems.m0.modem, 'registered', {});
+	d._plugin_radio('m0', false, () => null);
+	eq(length(filter(logs, (l) => index(l, 'cannot be switched off') >= 0)), 1,
+	   'unholdable: said once per modem, not per attempt');
+	eq(d.status().modems.m0.radio_hold_error, 'cannot hold this modem (its backend has no radio switch)',
+	   'unholdable: the status says the radio is on although held');
+	d.shutdown();
+
+	// a backend whose set_opmode answers unsupported (NCM without an AT port)
+	logs = [];
+	d = mk({ set_opmode: (mode, cb) => cb({ error: 'unsupported', detail: 'no at channel' }) });
+
+	let res = [];
+
+	d._plugin_radio('m0', false, (e) => push(res, e?.error));
+	d._plugin_radio('m0', false, (e) => push(res, e?.error));
+	eq(res, [ 'unsupported', 'unsupported' ], 'unholdable (set_opmode): every attempt is answered unsupported');
+	eq(length(filter(logs, (l) => index(l, 'cannot be switched off') >= 0)), 1,
+	   'unholdable (set_opmode): ...said once');
+	eq(d.status().modems.m0.radio_hold_error, 'cannot hold this modem (no at channel)',
+	   'unholdable (set_opmode): the status names why');
+
+	why = null;
+	eq(d.status().modems.m0.radio_hold_error, null, 'unholdable: nothing to report once nothing holds it');
+	d.shutdown();
+})();
+
 // --- option lowpower: park the radio when nothing on this modem is up --------
 // For battery and solar installs. Two things make it dangerous if done naively,
 // and both are asserted: it must fire only on an OPERATOR down (a transient
@@ -1607,6 +1693,34 @@ uloop.run();
 		dk.modems.m0.modem.lowpower_parked = false;
 		dk._retry_activate('wanA');
 		eq(ups, 1, 'reconnect: once it is on, it dials again');
+	}
+
+	// A HAND-BACK IS NOT A WAKE WHILE ANOTHER HOLD STANDS: a lent card coming
+	// back must not wake a modem that is itself waiting for its remote SIM
+	{
+		let why = 'waits for its remote SIM';
+		let pd = null;
+		let dc = mk('0', [ { name: 'rsim', options: [], mod: { create: (d) => {
+			pd = d;
+			return { radio_hold: (ref) => (ref == 'm0') ? why : null };
+		} } } ]);
+
+		dc.esim_guard('m0', 'enable');   // loads the plugins
+		dc.contexts.wanA.wanted = true;
+		dc.modems.m0.modem.lowpower_parked = true;
+		dc.modems.m0.modem._plugin_held = true;
+
+		let res = null;
+
+		ops = [];
+		pd.modem_radio('m0', true, (e) => { res = e; });
+		eq([ ops, res?.error, dc.modems.m0.modem._plugin_held ], [ [], 'radio_held', true ],
+		   'hand-back: a modem another hold keeps off is not woken, and stays the daemon\'s park');
+
+		why = null;
+		ops = [];
+		pd.modem_radio('m0', true, () => null);
+		eq(ops, [ 'm0:online' ], 'hand-back: ...once nothing holds it, the hand-back wakes it');
 	}
 
 	// a modem still coming up must not be parked: its init chain sets the mode

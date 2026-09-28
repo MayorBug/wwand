@@ -243,6 +243,149 @@ scenario('plugin hold at init', {
 		eq(modem._wake_pending, false, 'hold at init: no second registered to come from the wake');
 	});
 
+// --- 1a2: a re-init after the hold ended leaves no park behind ----------------
+// The modem object outlives a failed init (make_fail: teardown, then start()
+// on the same instance). Parked at the first pass, online at the second: the
+// park flags must go with the online switch, or REGISTERING waits forever and
+// the next registration loss is read as "radio parked" and swallowed.
+let reinit = { hold: 'rsim: its remote SIM x is not connected yet' };
+
+scenario('plugin hold at init, re-init without it', {
+	handlers: base_handlers({
+		GET_SYSTEM_INFO: { __error: 71 },
+		GET_PROFILE_SETTINGS: { __error: 71 },
+		// the parked radio does not register; online (second pass) it does
+		GET_SERVING_SYSTEM: () => reinit.hold ? {
+			serving_system: { registration: 0, cs_attach: 0, ps_attach: 0,
+			                  selected_network: 0, radio_ifs: [] },
+		} : {
+			serving_system: { registration: 1, cs_attach: 1, ps_attach: 1,
+			                  selected_network: 1, radio_ifs: [ 8 ] },
+			current_plmn: { mcc: 262, mnc: 1, description: 'Telekom.de' },
+		},
+	}),
+	guard_ms: 4000,
+	setup: (mock, modem) => {
+		modem.radio_hold = () => reinit.hold;
+
+		// the first pass parks; then the hold ends and the init runs again —
+		// what make_fail does after a failure
+		uloop.timer(400, () => {
+			reinit.parked = [ modem.lowpower_parked, modem._plugin_held ];
+			reinit.hold = null;
+			modem.teardown();
+			modem.start();
+		});
+	},
+}, 'registered',
+	(modem, mock, events) => {
+		eq(reinit.parked, [ true, true ], 're-init: the first pass parked (the plugin\'s hold)');
+		eq([ modem.lowpower_parked, modem._plugin_held ], [ false, false ],
+		   're-init: online at the second pass, and no park left recorded');
+
+		// a registration loss now is a fault, not a park's consequence
+		modem._update_serving({ serving_system: { registration: 0, cs_attach: 0, ps_attach: 0,
+		                                          selected_network: 0, radio_ifs: [] } });
+		eq(modem.state, 'REGISTERING', 're-init: a later registration loss re-registers, it is not swallowed');
+	});
+
+// --- 1a3: a modem that refuses low power at init stays held -------------------
+// fail() on the refused park walked the recovery ladder — radio cycles and
+// resets that end online, the registration the hold is there to prevent.
+let refused = { hold: 'rsim: its remote SIM x is not connected yet' };
+
+scenario('plugin hold at init, low power refused', {
+	handlers: base_handlers({
+		SET_OPERATING_MODE: (args) => (args?.mode == 1) ? { __error: 0x0001 } : {},
+		GET_SYSTEM_INFO: { __error: 71 },
+		GET_PROFILE_SETTINGS: { __error: 71 },
+		GET_SERVING_SYSTEM: (args, meta) => refused.woke ? {
+			serving_system: { registration: 1, cs_attach: 1, ps_attach: 1,
+			                  selected_network: 1, radio_ifs: [ 8 ] },
+			current_plmn: { mcc: 262, mnc: 1, description: 'Telekom.de' },
+		} : {
+			serving_system: { registration: 0, cs_attach: 0, ps_attach: 0,
+			                  selected_network: 0, radio_ifs: [] },
+		},
+	}),
+	guard_ms: 4000,
+	setup: (mock, modem) => {
+		modem.radio_hold = () => refused.hold;
+
+		// past two registration timeouts: still waiting, held, no failure
+		uloop.timer(1300, () => {
+			refused.state = modem.state;
+			refused.held = [ modem._plugin_held, modem.lowpower_parked ];
+			refused.hold = null;
+			refused.woke = true;
+			modem._plugin_held = false;     // the daemon's tick hands it back
+
+			// failed and torn down instead (what the checks below catch)
+			if (!modem.nas)
+				return;
+
+			mock.indicate(3, modem.nas.cid, 'SERVING_SYSTEM_IND', {
+				serving_system: { registration: 1, cs_attach: 1, ps_attach: 1,
+				                  selected_network: 1, radio_ifs: [ 8 ] },
+				current_plmn: { mcc: 262, mnc: 1, description: 'Telekom.de' },
+			});
+		});
+	},
+}, 'registered',
+	(modem, mock, events) => {
+		eq(refused.state, 'REGISTERING', 'refused park: the init goes on and waits in REGISTERING');
+		eq(refused.held, [ true, false ], 'refused park: held, not parked (the modem said no)');
+		eq(length(filter(events, (e) => e.event == 'error')), 0,
+		   'refused park: no failure, so no recovery ladder');
+		eq(map(mock.calls_for('SET_OPERATING_MODE'), (c) => c.args?.mode), [ 1 ],
+		   'refused park: low power asked once, no offline fallback, never online behind the hold');
+		eq(modem.state, 'READY', 'refused park: registers once the hold is gone');
+	});
+
+// --- 1a4: the FCC check skipped with the held radio runs at the wake ----------
+// An RF-locked laptop SKU accepts set-online and stays in low power until it is
+// authenticated; the held init skipped verify_online with the radio, so the
+// wake must run it, or the woken modem never registers.
+let fcc_held = { hold: 'rsim: its remote SIM x is not connected yet', unlocked: false };
+
+scenario('plugin hold at init, FCC at the wake', {
+	handlers: base_handlers({
+		GET_OPERATING_MODE: () => ({ mode: fcc_held.unlocked ? 0 : 6 }),
+		SET_FCC_AUTHENTICATION: (args) => { fcc_held.unlocked = true; return {}; },
+		GET_SYSTEM_INFO: { __error: 71 },
+		GET_PROFILE_SETTINGS: { __error: 71 },
+		GET_SERVING_SYSTEM: (args, meta) => ({
+			serving_system: { registration: 0, cs_attach: 0, ps_attach: 0,
+			                  selected_network: 0, radio_ifs: [] },
+		}),
+	}),
+	guard_ms: 4000,
+	setup: (mock, modem) => {
+		modem.radio_hold = () => fcc_held.hold;
+
+		uloop.timer(700, () => {
+			fcc_held.at_init = length(mock.calls_for('SET_FCC_AUTHENTICATION'));
+			fcc_held.hold = null;
+			modem.set_opmode('online', () => {
+				fcc_held.answered_unlocked = fcc_held.unlocked;
+				if (!modem.nas)
+					return;
+				mock.indicate(3, modem.nas.cid, 'SERVING_SYSTEM_IND', {
+					serving_system: { registration: 1, cs_attach: 1, ps_attach: 1,
+					                  selected_network: 1, radio_ifs: [ 8 ] },
+					current_plmn: { mcc: 262, mnc: 1, description: 'Telekom.de' },
+				});
+			});
+		});
+	},
+}, 'registered',
+	(modem, mock, events) => {
+		eq(fcc_held.at_init, 0, 'fcc held: no FCC message while the radio stays off at init');
+		eq(length(mock.calls_for('SET_FCC_AUTHENTICATION')), 1, 'fcc held: ...and the wake sends it');
+		eq(fcc_held.answered_unlocked, true, 'fcc held: the wake answers once the modem is unlocked');
+		eq(modem._fcc_due, false, 'fcc held: done once, not again at the next wake');
+	});
+
 // --- 1b: GSM-7-bit packed operator name (issue #2) ---------------------------
 // EG06-class firmware GSM-7-bit packs the Current-PLMN name. "PLAY" packs to the
 // octets 50 66 30 0b, which as raw ASCII read "Pf0\x0b" (note the 0x0b control

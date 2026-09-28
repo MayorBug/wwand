@@ -188,9 +188,9 @@ export function create(opts)
 	// clients, which delivers a synchronous `cancelled` to everything in flight —
 	// so an outer set_opmode callback that ignores its error re-arms tm.settle
 	// AFTER the cancel pass. The new timer fires with self.dms already null
-	// (modem.uc:1646) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
+	// (modem.uc:1656) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
 	// which in ucode is a throw inside a uloop callback: the daemon dies and procd
-	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1162), and
+	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1230), and
 	// every QMI site that re-arms tm.settle needs it too.
 	//
 	// `gen` is captured where the OPERATION begins, not read here — by the time a
@@ -503,7 +503,7 @@ export function create(opts)
 				// done() IS answered on the cancelled path. It is not only
 				// make_fail's internal continuation: the daemon passes a real
 				// caller's callback through note_connect_failure
-				// (daemon.uc:3657), and dropping it strands a ubus request.
+				// (daemon.uc:3714), and dropping it strands a ubus request.
 				// Restarting a torn-down modem is prevented where it belongs
 				// instead — make_fail now refuses a `cancelled` outright
 				// (modem_common.uc).
@@ -1354,6 +1354,16 @@ export function create(opts)
 			// radio was off. The next registration reports it (_update_serving).
 			if (!err && was_parked && mode == 'online')
 				self._wake_pending = true;
+
+			// The first set-online of a radio held at init: the init skipped
+			// its FCC check with the radio (modem_init_qmi.uc step_opmode), and
+			// an RF-locked laptop SKU accepts set-online and stays in low
+			// power until it is authenticated — woken without it, it never
+			// registers. Answered once the check is done.
+			if (!err && mode == 'online' && self._fcc_due && self.dms) {
+				self._fcc_due = false;
+				return chain.fcc_verify(() => cb(null));
+			}
 
 			cb(err ?? null);
 		});

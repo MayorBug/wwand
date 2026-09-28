@@ -325,6 +325,7 @@ export function create(opts)
 	let derive_netdev;
 	let detach_modem;   // forward-declared: used by modem_removed above its definition
 	let maybe_autosetup_fill;
+	let note_unholdable;   // defined beside plugin_radio; the registered handler uses it
 
 	// --- modem event handlers ---------------------------------------------
 
@@ -1171,7 +1172,7 @@ export function create(opts)
 	// whether anything started it.
 	//
 	// COMPARED HERE rather than trusted from the event. modem_mbim filters its
-	// own emit on a change (modem_mbim.uc:838-847) while the shared reapply
+	// own emit on a change (modem_mbim.uc:877-886) while the shared reapply
 	// tail emits on every re-read (modem_common.uc:553-559); one comparison, in
 	// the place that acts on it, cannot disagree with itself.
 	let modem_sim_refresh = (modem, data) => {
@@ -1274,10 +1275,22 @@ export function create(opts)
 			if (hold && modem.set_opmode) {
 				log('warn', sprintf('modem %s: registered although %s — switching its radio off again', modem.id, hold));
 				modem._plugin_held = true;
-				modem.set_opmode('low_power', (e) => e
-					? log('warn', sprintf('modem %s: switching the radio off failed: %J', modem.id, e)) : null);
+				modem.set_opmode('low_power', (e) => {
+					if (e?.error == 'unsupported')
+						note_unholdable(modem, modem.id, e.detail ?? 'unsupported');
+					else if (e)
+						log('warn', sprintf('modem %s: switching the radio off failed: %J', modem.id, e));
+					else
+						modem._hold_unsupported = null;
+				});
 				return;
 			}
+
+			// a modem with no radio switch at all registers regardless; its
+			// interfaces are refused (context_up) and not adopted
+			// (retry_activate) while the hold lasts
+			if (hold)
+				note_unholdable(modem, modem.id, 'its backend has no radio switch');
 
 			emit('wwand.modem', { modem: modem.id, event: event, ...(data ?? {}) });
 			return modem_registered(modem, data);
@@ -3978,6 +3991,10 @@ export function create(opts)
 				// status pages say why in one place, whichever plugin it is.
 				radio_held: self.plugins_radio_hold?.(name) ?? null,
 				remote_sim: remote_sim_support(entry.protocol, entry.modem),
+				// ...and when that hold cannot be honoured: the radio is on
+				// although the line above says it is held (note_unholdable)
+				radio_hold_error: (entry.modem?._hold_unsupported != null && self.plugins_radio_hold?.(name))
+					? sprintf('cannot hold this modem (%s)', entry.modem._hold_unsupported) : null,
 			};
 		}
 
@@ -4116,6 +4133,21 @@ export function create(opts)
 	// lowpower` and no interface of the modem wanted up (one taken down while
 	// the card was lent), the radio stays off as maybe_lowpower would leave
 	// it. A radio already parked by the operator is simply left off.
+	// A HOLD THIS MODEM CANNOT HONOUR says so, once per modem object: its
+	// backend has no radio switch (NCM without an AT port, say), or it
+	// refused one. Each park attempt answers `unsupported` all the same; the
+	// log line is not repeated per attempt, and status() carries it
+	// (radio_hold_error) so the pages say the radio is NOT off although a
+	// plugin holds it. What still stands is refusing its interfaces
+	// (context_up) and not dialling them (reconnect.uc retry_activate).
+	note_unholdable = (m, ref, detail) => {
+		if (m._hold_unsupported == null)
+			log('warn', sprintf('modem %s: a plugin holds its radio off, but this modem cannot be switched off (%s) — it stays registered, its interfaces are refused',
+				ref, detail));
+
+		m._hold_unsupported = detail;
+	};
+
 	let radio_wanted = (ref) => {
 		let e = self.modems[ref];
 
@@ -4135,8 +4167,12 @@ export function create(opts)
 
 		cb = cb ?? (() => null);
 
-		if (!m?.set_opmode)
+		if (!m?.set_opmode) {
+			if (m && !on)
+				note_unholdable(m, ref, 'its backend has no radio switch');
+
 			return cb({ error: 'unsupported' });
+		}
 
 		if (!on) {
 			m._plugin_held = true;
@@ -4144,7 +4180,27 @@ export function create(opts)
 			if (m.lowpower_parked)
 				return cb(null);
 
-			return m.set_opmode('low_power', (err) => cb(err));
+			return m.set_opmode('low_power', (err) => {
+				if (err?.error == 'unsupported')
+					note_unholdable(m, ref, err.detail ?? 'unsupported');
+				else if (!err)
+					m._hold_unsupported = null;
+
+				cb(err);
+			});
+		}
+
+		// A HAND-BACK IS NOT A WAKE WHILE ANOTHER HOLD STANDS. The radio is
+		// off for every plugin that holds it, not for the one handing back:
+		// a card lent to another modem coming back woke a modem that was
+		// itself waiting for its remote SIM, and it registered on its own
+		// card. Stays parked, and ours; the tick wakes it once nothing holds.
+		let still = self.plugins_radio_hold?.(ref);
+
+		if (still) {
+			m._plugin_held = true;
+			log('info', sprintf('modem %s: radio handed back, but it stays off — %s', ref, still));
+			return cb({ error: 'radio_held', detail: still });
 		}
 
 		if (!m.lowpower_parked) {

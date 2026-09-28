@@ -899,13 +899,46 @@ misconfigured, and again when the modem lets go of it.
 - **While running:** the plugin parks a modem registered on its own card
   although held (a remote SIM configured while online, or one the modem let
   go of); the core parks only at a new registration or an interface
-  bring-up.
+  bring-up, and refuses to dial a held modem's interfaces.
 - **Status:** `status()` carries `radio_held` (the reason, from any plugin);
   `wwandctl status` prints it, the modem status page (luci-app-wwand) shows
   a Radio row, the RADIO_HELD interface error names both reasons.
-- **Open:** the init-time hold is QMI's only. An MBIM modem — a remote SIM
-  works there through the QMI passthrough — and a sponsor on MBIM or NCM
-  still register at init and are parked after.
+- **MBIM (2026-09-28, host-tested, not yet on hardware):** until now an MBIM
+  modem had no `set_opmode` at all, so a held MBIM modem was **not parked at
+  all** — not at init and not after: it registered on its own card and stayed
+  registered, only its interfaces were refused. It has one now (passthrough
+  DMS low power, else the software Radio State; woken the way it was parked),
+  so `modem_radio`, the park at a registration, `option lowpower` and the
+  init-time hold work there: the hold is asked right after MBIM OPEN (an
+  MBIM modem registers on its own, so step_register would be too late),
+  REGISTERING waits while held, a registration lost while parked is not
+  re-registered, the wake's registration is reported, and the recovery
+  ladder's radio cycle and an attach-profile change leave a parked radio off.
+- **NCM:** parked after registration (`AT+CFUN=4`), no init-time hold. NCM
+  without an AT port cannot be held at all: every park answers `unsupported`
+  (logged once per modem), `status()` carries `radio_hold_error` ("cannot
+  hold this modem"), `wwandctl status` prints the radio as on although held.
+- **Audit follow-up (2026-09-28):**
+  - a **held modem is not dialled**, parked or not (`reconnect.uc
+    retry_activate`): after a non-destructive restart the still-up interface
+    was adopted through that path, which knew nothing of the hold, and dialled
+    on the local card of a modem waiting for its remote SIM;
+  - a **hand-back is not a wake** while another hold answers
+    (`plugin_radio(on)` → `radio_held`); the tick wakes it once nothing does;
+  - a modem that **refuses low power at init** continues held instead of
+    failing its init: the ladder's cycles and resets end online, the
+    registration the hold is there to prevent. No `offline` fallback — libqmi
+    calls it RF off and "partially shutdown" (`qmi-enums-dms.h`, 1.38.0), and
+    the way back from it is a reset;
+  - the **FCC check** the held init skips with the radio runs at the wake
+    (`_fcc_due`, `modem.uc set_opmode`) — an RF-locked laptop SKU otherwise
+    stays in low power after the wake;
+  - a **re-init after the hold ended** clears the park flags (QMI at the
+    init's online switch, MBIM in step_register): the same modem object
+    outlives a failed init, and a stale `lowpower_parked` made REGISTERING
+    wait forever and swallowed the next registration loss;
+  - `wwandctl status` names the holding plugin instead of repeating the
+    reason its own status row gives.
 
 ## Known open
 

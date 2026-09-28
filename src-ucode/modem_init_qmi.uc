@@ -293,7 +293,7 @@ export function install(self, o)
 				why, join('; ', reasons)));
 
 			// Deliberately NOT cleared on a later init pass. The object is
-			// created once per device attach (daemon.uc:2747), so a modem that
+			// created once per device attach (daemon.uc:2804), so a modem that
 			// really did reset comes back as a NEW instance with no debt — and
 			// a re-init of THIS instance means it did not, so the debt still
 			// holds. Deduplicated because a re-init re-derives the same reason
@@ -353,9 +353,28 @@ export function install(self, o)
 				log('notice', sprintf('radio stays off at init — %s', hold));
 				self._plugin_held = true;
 
+				// The FCC check below is skipped with the radio: an RF-locked
+				// modem shows its lock only after a set-online, so the wake
+				// runs it (modem.uc set_opmode, `_fcc_due`).
+				self._fcc_due = true;
+
 				return self.set_opmode('low_power', (err) => {
+					// A REFUSED PARK IS NOT AN INIT FAILURE. fail() here walked
+					// the recovery ladder — opmode cycles and resets that end
+					// online, the very registration the hold is there to
+					// prevent — over a modem whose only fault was declining
+					// one mode. It continues held instead: REGISTERING waits
+					// while held, the daemon's registered handler parks again
+					// if it registers after all, and its interfaces are
+					// refused (radio_held). No `offline` fallback: libqmi
+					// describes it as RF off and "partially shutdown"
+					// (qmi-enums-dms.h, QmiDmsOperatingMode, libqmi 1.38.0),
+					// and the way back from it is a reset (the tree's own
+					// modem reset is offline -> reset, modem_mbim.uc reset) —
+					// the wake would have to reset the modem.
 					if (err)
-						return fail('opmode', err);
+						log('warn', sprintf('radio stays off at init: low power refused (%J) — continuing held; its interfaces are refused until the hold ends',
+							err));
 
 					tm.settle = uloop.timer(self.timing.settle, step_simslot);
 				});
@@ -365,6 +384,15 @@ export function install(self, o)
 				// (set_opmode already treats "no effect / already online" as success)
 				if (err)
 					return fail('opmode', err);
+
+				// Online by the init's own hand, so no park is in force any
+				// more: this object outlives a failed init (make_fail
+				// restarts the same instance), and a flag left from a park
+				// at an earlier pass made REGISTERING wait forever and the
+				// next registration loss read as "radio parked" — swallowed.
+				self.lowpower_parked = false;
+				self._plugin_held = false;
+				self._fcc_due = false;
 
 				verify_online(0);
 			});
@@ -403,14 +431,19 @@ export function install(self, o)
 		return [ [ 'dms', null ], [ 'foxconn', 0 ] ];
 	};
 
-	verify_online = (fcc_idx) => {
+	// `then` (default: settle, then the SIM steps) runs once the modem is
+	// online or the FCC variants are used up — the wake of a radio held at
+	// init passes its own (fcc_verify below).
+	verify_online = (fcc_idx, then) => {
+		then ??= () => tm.settle = uloop.timer(self.timing.settle, step_simslot);
+
 		self.dms.request('GET_OPERATING_MODE', {}, (err, d) => {
 			let mode = err ? null : d?.mode;
 
 			// unsupported query or already online -> settle and continue
 			// (settle after mode change; old dialer: sleep 2)
 			if (mode == null || mode == dmsmod.OPMODE_ONLINE)
-				return tm.settle = uloop.timer(self.timing.settle, step_simslot);
+				return then();
 
 			let locked = (mode == dmsmod.OPMODE_LOW_POWER ||
 			              mode == dmsmod.OPMODE_PERSISTENT_LOW_POWER ||
@@ -422,7 +455,7 @@ export function install(self, o)
 				log('warn', sprintf('modem stays in %s after set-online%s — continuing',
 					dmsmod.OPMODE_NAMES[sprintf('%d', mode)] ?? sprintf('opmode %d', mode),
 					(locked && length(variants)) ? ' (FCC authentication did not release it)' : ''));
-				return tm.settle = uloop.timer(self.timing.settle, step_simslot);
+				return then();
 			}
 
 			let variant = variants[fcc_idx][0], magic = variants[fcc_idx][1];
@@ -433,11 +466,11 @@ export function install(self, o)
 			qmi_backend.fcc_auth(self.dms, variant, magic, (ferr) => {
 				if (ferr) {
 					log('info', sprintf('FCC authentication (%s) not accepted: %J', variant, ferr));
-					return verify_online(fcc_idx + 1);
+					return verify_online(fcc_idx + 1, then);
 				}
 
 				log('notice', sprintf('FCC authentication accepted (%s) — going online', variant));
-				self._opmode_set('online', () => verify_online(fcc_idx + 1));
+				self._opmode_set('online', () => verify_online(fcc_idx + 1, then));
 			});
 		}, { no_recovery: true });
 	};
@@ -729,7 +762,7 @@ export function install(self, o)
 			// parked (a plugin's hold at init): the attach runs with the new
 			// profile when the radio is woken — a cycle ending online here
 			// would register behind the park's back
-			if (self.lowpower_parked)
+			if (self.lowpower_parked || self._plugin_held)
 				return step_register();
 
 			log('notice', 'attach profile changed, cycling radio to re-attach');
@@ -795,7 +828,10 @@ export function install(self, o)
 				// because the radio is off, not a fault — failing here would
 				// walk the recovery ladder over a modem doing as told. Waits
 				// on: the timer re-arms, so a woken modem still times out.
-				if (self.lowpower_parked) {
+				// Held but not parked (the modem refused low power) waits
+				// too: a registration is not wanted, and the ladder's cycles
+				// end online.
+				if (self.lowpower_parked || self._plugin_held) {
 					tm.reg = uloop.timer(self.timing.reg_timeout, reg_timeout);
 					return;
 				}
@@ -823,5 +859,10 @@ export function install(self, o)
 
 	// register() is re-entered by _update_serving when registration is lost
 	// while READY (transient dereg -> back to the REGISTERING wait)
-	return { begin: () => step_sync(0), register: () => step_register() };
+	// fcc_verify(cb): the init's set-online check and FCC unlock, for a
+	// radio switched online later (the wake of a hold at init); cb() when
+	// done, whatever the outcome — the init continues on a lock it could
+	// not release as well, with a warning.
+	return { begin: () => step_sync(0), register: () => step_register(),
+	         fcc_verify: (cb) => verify_online(0, cb) };
 };

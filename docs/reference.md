@@ -1406,7 +1406,7 @@ when called from LuCI).
 
 | Method | Arguments | Description |
 |---|---|---|
-| `status` / `modem_list` | — | modems (state, identity, registration, `registration_detail`, counters, `control_note`, `apdu_backend`, `at2_released` — the secondary AT port left to external tools, `gps_port` — the modem's NMEA tty when its port table names one (read by wwand-gps when `option gnss` is set; see `modem_gps`), `diag_port` — the modem's DM/DIAG node, likewise resolved and never opened (see "The diag port"), `locks` — cell/frequency-lock read-back, `rat` — the current fine access technology incl. IoT/RedCap/NTN (`NB-IoT`/`LTE-M`/`5G-SA`/…, identified over AT where QMI/MBIM can't name it), `caps` — best-effort `{ rats, iot_modes, ntn }` capability summary, `fcc_lock` — the FCC/RF-lock probe read-back, `esim` — `{ eid, profiles }` once the `esim_ready` bring-up refresh ran, `remote_sim` — `{ supported, via \| reason }`: whether the modem can run on a remote SIM, from the services it lists itself (QMI UIM Remote, service 0x32, natively or over the QMI-over-MBIM passthrough); `supported: null` while not known yet — listed is not switched on, see `wwandctl rsim MODEM switch`) + contexts + `board` (detected profile, power/reset capability) |
+| `status` / `modem_list` | — | modems (state, identity, registration, `registration_detail`, counters, `control_note`, `apdu_backend`, `at2_released` — the secondary AT port left to external tools, `gps_port` — the modem's NMEA tty when its port table names one (read by wwand-gps when `option gnss` is set; see `modem_gps`), `diag_port` — the modem's DM/DIAG node, likewise resolved and never opened (see "The diag port"), `locks` — cell/frequency-lock read-back, `rat` — the current fine access technology incl. IoT/RedCap/NTN (`NB-IoT`/`LTE-M`/`5G-SA`/…, identified over AT where QMI/MBIM can't name it), `caps` — best-effort `{ rats, iot_modes, ntn }` capability summary, `fcc_lock` — the FCC/RF-lock probe read-back, `esim` — `{ eid, profiles }` once the `esim_ready` bring-up refresh ran, `remote_sim` — `{ supported, via \| reason }`: whether the modem can run on a remote SIM, from the services it lists itself (QMI UIM Remote, service 0x32, natively or over the QMI-over-MBIM passthrough); `supported: null` while not known yet — listed is not switched on, see `wwandctl rsim MODEM switch`, `radio_held` — why a plugin holds the radio off (`<plugin>: <reason>`, null when nothing does; see "Radio hold" under Plugins), `radio_hold_error` — `cannot hold this modem (<why>)` when that hold cannot be honoured and the radio is in fact on, null otherwise) + contexts + `board` (detected profile, power/reset capability) |
 | `reload` | — | re-read UCI and apply the **diff** — only changed/added/removed modems and contexts are touched (idempotent; see *Idempotent reload*) |
 | `set_log_level` | `level` | change the log level at runtime |
 | `hotplug` | `action`, `device` | device add/remove (from the hotplug script) |
@@ -1745,7 +1745,9 @@ with a permanent one, which makes the router easier to track from outside; that
 is usually the point, but it is a trade and the reason the default is empty.
 
 **`option lowpower`** (default off) parks the **radio** once no context of this
-modem is up — DMS low-power on QMI, `AT+CFUN=0` on NCM. For battery and solar
+modem is up — DMS low-power on QMI, DMS low-power over the QMI passthrough on
+MBIM (the software Radio State without one), `AT+CFUN=4` on NCM (`0` where the
+modem refuses 4). For battery and solar
 installs, where an idle modem still spends a couple of watts holding a
 registration nobody is using. Two conditions, both deliberate: only on an
 **operator** down, never on a transient loss (those keep the interface up by
@@ -2190,12 +2192,22 @@ core knowing them by name (`plugins.uc`). A plugin is a plain script at
   or null; the SIM inventory files that card under it instead of the modem's
   slot.
 - **Radio hold:** an optional `radio_hold(ref, ext)` returns why the modem's
-  radio must stay off (its card is in use by another modem), or null. While
-  it answers, `context_up` fails with `radio_held` and that reason (the shim
-  reports RADIO_HELD; netifd does not retry a failed setup of a
-  `no_proto_task` handler, the interface waits in setup until the modem
-  registers again after the lending and the daemon brings it up), and a
-  registration of the modem parks its radio again.
+  radio must stay off (its card is in use by another modem, or it waits for
+  a remote SIM), or null. While it answers, `context_up` fails with
+  `radio_held` and that reason (the shim reports RADIO_HELD; netifd does not
+  retry a failed setup of a `no_proto_task` handler, the interface waits in
+  setup until the modem registers again after the lending and the daemon
+  brings it up), the reconnect path does not dial the modem's interfaces
+  (also not an interface still up after a daemon restart), a registration of
+  the modem parks its radio again, and a `modem_radio(ref, true)` hand-back
+  is refused (`radio_held`) — the tick wakes it once nothing holds it. The
+  init chains ask before the radio can register: QMI at SET_OPMODE (low
+  power instead of online), MBIM right after OPEN (the software Radio State,
+  since an MBIM modem registers on its own); a modem that refuses the switch
+  continues held rather than failing its init. NCM has no init-time hold. A
+  modem that cannot switch its radio off at all (NCM without an AT port)
+  answers every park `unsupported`; it stays registered, its interfaces are
+  refused, and `status()` says so in `radio_hold_error`.
 - **Stop:** an optional `stop()` runs when the daemon exits. Returning true
   says it sent requests that need the event loop; the daemon then keeps
   running it until the plugin's optional `busy()` answers false, at most 8 s

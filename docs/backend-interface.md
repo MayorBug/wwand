@@ -78,7 +78,7 @@ do not "fix" one side to match the other:
 |---|---|---|---|---|
 | `open` | bring the control channel up | transport + `CTL SYNC` + version + per-service CID alloc | open + `MBIM OPEN` | open the AT tty (this *is* the control channel; optional usb-serial `new_id` bind) |
 | `read_info` | model, revision, imei, manufacturer, capabilities | `DMS GET_*` | `DEVICE_CAPS` | `ATI`/`CGMI`/`CGMM`/`CGMR` + `CGSN` (imei); manufacturer selects the vendor recipe |
-| `set_opmode(mode)` | online / low_power / offline / reset | `DMS SET_OPERATING_MODE` | radio-state (partial) | `AT+CFUN` (reset = `AT+CFUN=1,1`) |
+| `set_opmode(mode)` | online / low_power / offline / reset | `DMS SET_OPERATING_MODE` | online / low_power / offline: passthrough `DMS SET_OPERATING_MODE`, else (no passthrough, DMS refused, or during init) Basic Connect `RADIO_STATE`; woken the way it was parked; no reset (`reset()` is its own op) | `AT+CFUN` (reset = `AT+CFUN=1,1`) |
 | `slot_status` / `switch_slot(n)` | list / select physical SIM slots | `UIM GET_SLOT_STATUS` / `SWITCH_SLOT` | — | vendor `slots` recipe (Fibocom `AT+GTDUALSIM`, switch + CFUN reset) |
 | `sim_unlock(pin)` | query PIN state, verify, guard retries | `UIM`/`DMS` | `SUBSCRIBER_READY` + `PIN` | `AT+CPIN?` + `AT+CPIN="…"`; retries via `AT+QPINC` |
 | `read_identity` | imsi, iccid, msisdn | `UIM` EF read → `DMS` → AT | `SUBSCRIBER_READY` | `AT+CIMI` (imsi) + `AT+QCCID`/`+CCID`/`+ICCID` chain |

@@ -9,7 +9,7 @@
 'use strict';
 
 import { fmt_plmn, fmt_sig, fmt_locks, reg_text, packet_service_text,
-	collectd_lines, collectd_interval, recovery_text } from 'wwand.wwandctl_fmt';
+	collectd_lines, collectd_interval, recovery_text, radio_text } from 'wwand.wwandctl_fmt';
 
 import * as libubus from 'ubus';
 import * as fs from 'fs';
@@ -115,8 +115,10 @@ function cmd_status(args)
 			m.control_note ? sprintf('  [%s]', m.control_note) : '');
 		printf('  SIM         imsi %s  iccid %s\n', m.imsi ?? '-', m.iccid ?? '-');
 
-		if (m.radio_held)
-			printf('  radio       off — %s\n', m.radio_held);
+		let radio = radio_text(m);
+
+		if (radio)
+			printf('  radio       %s\n', radio);
 
 		// what optional packages report about this modem (a remote SIM, say)
 		for (let r in (m.plugins ?? []))

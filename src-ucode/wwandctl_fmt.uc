@@ -312,6 +312,27 @@ export function recovery_text(r)
 		n, (n == 1) ? '' : 's', tail);
 };
 
+// The `radio` line of a modem held by a plugin, or null when none holds it.
+// `m` is a status() modem: radio_held is "<plugin>: <reason>", and that
+// plugin's own status row usually carries the same reason, so the line then
+// names the plugin and leaves the reason to its row — printed twice, the two
+// read as two different problems. radio_hold_error means the hold is NOT in
+// force (the modem cannot switch its radio off), which "off" would hide.
+export function radio_text(m)
+{
+	if (!m?.radio_held)
+		return null;
+
+	let who = match(m.radio_held, /^([^:]+): (.*)$/);
+	let dup = who && length(filter(m.plugins ?? [],
+		(r) => index(r?.text ?? '', who[2]) >= 0)) > 0;
+	let why = dup ? sprintf('held by %s (below)', who[1]) : m.radio_held;
+
+	return m.radio_hold_error
+		? sprintf('ON although held — %s; %s', m.radio_hold_error, why)
+		: sprintf('off — %s', why);
+};
+
 export function collectd_interval(want)
 {
 	let n = +(want ?? 0);

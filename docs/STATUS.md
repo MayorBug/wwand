@@ -805,11 +805,38 @@ shim's `proto_block_restart` cleared autostart for good. Two changes:
   Two guards around that: the record is trusted only once its file can
   exist (written at every start; the first start since boot or since an
   upgrade from a version that recorded nothing keeps the former guess), and
-  a cleared autostart with no record is looked at a second time, 2 s later,
+  a cleared autostart with no record is looked at a second time, 5 s later,
   before wwand undoes it (`confirm_then`): netifd clears autostart the
-  moment an ifdown starts, the record arrives with the shim's teardown.
+  moment an ifdown starts, the record arrives with the shim's teardown —
+  up to a second later still when the ifdown has to kill a running setup
+  first (SIGTERM, 1 s, SIGKILL: `proto-ext.c:780-788`, netifd
+  2026.07.08~6088f7b3).
   `auto 0` interfaces that are down are no longer wanted (a SIM change's
-  reconnect and the low-power decision read `wanted`).
+  reconnect and the low-power decision read `wanted`) — unless the down is
+  wwand's own give-up of one the operator had brought up.
+- **Audit follow-up (2026-09-28):**
+  - what the first start's guess reads as the operator's is **recorded**
+    (`operator_down`), and that start asks netifd about every interface at
+    its first `apply_config` (`seed_admin_record`), writing the trusted file
+    only when all have answered — before, the second start after an upgrade
+    trusted a record the first had written empty and undid the ifdown the
+    first had honoured;
+  - the record is **trusted only whole**: the daemon's JSON array at the
+    head of the file. Empty, torn, or the shim's appends alone are read for
+    their names but not trusted — trusted, "nothing recorded" would revive
+    every ifdown whose record went with the rest of the file;
+  - `admin_downs.json` and `giveups.json` are **replaced whole** (write
+    beside, rename over: `default_fx.write_atomic`), and the daemon re-reads
+    the file before each write and when it decides, so a name the shim
+    appended while the daemon ran (its teardown could not reach it) is
+    neither written away nor ignored;
+  - an ifup that finds the modem gone (`modem_absent`) also ends wwand's own
+    down: its marker, kept past the ifup, sent the operator's next ifdown
+    down the "ours" branch unrecorded;
+  - the second look is **one per interface entry** (a burst of settings
+    events armed one timer each), cancelled by `stop_context`, `stop_local`
+    and `shutdown`; at the connect-first site it now also requires the same
+    CONNECTED session and an interface netifd is not bringing up by itself.
 - An answer that lands after a reload replaced the context — the activation,
   and the two netifd status probes before a kick — is not acted on.
 

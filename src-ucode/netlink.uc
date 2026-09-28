@@ -283,7 +283,30 @@ export function default_fx(log)
 		return ok;
 	};
 
-	self.exists = (path) => fs.access(path) == true;
+	// Replace a file whole: written beside it, then renamed over it. For
+	// state a later start trusts (the daemon's admin_downs and giveups):
+	// write() truncates first, so a daemon killed between the truncate and
+	// the write — or a full tmpfs — left an empty or half-written record,
+	// and an empty admin_downs reads as "nothing recorded" (daemon.uc,
+	// admin_record_complete). rename(2) replaces the name atomically within
+	// one filesystem, and the temporary lives in the same directory for
+	// that reason. false with last_error set; the old file is then intact.
+	self.write_atomic = (path, data) => {
+		let tmp = path + '.tmp';
+
+		if (!self.write(tmp, data))
+			return false;
+
+		if (!fs.rename(tmp, path)) {
+			self.last_error = fs.error();
+			fs.unlink(tmp);
+			return false;
+		}
+
+		return true;
+	};
+
+	self.exists =(path) => fs.access(path) == true;
 	self.realpath = (path) => fs.realpath(path);
 	self.glob = (...patterns) => fs.glob(...patterns);
 	self.run = (argv) => system(argv);

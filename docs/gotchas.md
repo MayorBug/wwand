@@ -783,3 +783,13 @@ interface that is down (`interface_set_up`, `interface.c:1332-1350`), and
 reaching IFEV_UP does. The operator's ifdown is therefore recorded even when
 there is no context to take down, and by the shim itself when the daemon is
 not there to hear it.
+
+And the record only helps while it is whole. **"The file is there, so it can
+be trusted"** is the next belief that looks right: an in-place write truncates
+first, so a daemon killed between the truncate and the write (or a full
+tmpfs) leaves an empty file, and an empty record read as "nothing recorded"
+revives every operator ifdown it held. The daemon replaces the file whole
+(`netlink.uc default_fx.write_atomic`: beside it, then `rename(2)`) and
+trusts it only when its own JSON array is at the head (`daemon.uc
+admin_record_complete`); anything else is read for its names and treated like
+the first start after an upgrade.

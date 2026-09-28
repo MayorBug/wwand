@@ -942,6 +942,17 @@ not immediately re-established; `ifup` sets it again). *(HW-verified on the
 dual-modem Chateau: changing modem A's APN kept modem B CONNECTED across the
 whole reload; a no-op reload bounced nothing.)*
 
+An `ifdown` is **recorded** (`/tmp/wwand/state/admin_downs.json`, by the
+daemon's `context_down`, or appended by the shim when the daemon cannot be
+reached) and stays in force across daemon restarts until the next `ifup` of
+that interface; a down wwand issued itself (a SIM block, a give-up) is not
+recorded and is undone when the modem registers again. The file is replaced
+whole on every change and trusted only when intact — an empty or damaged one,
+or the first start since boot, falls back to reading "autostart cleared and no
+`wwand` error on the interface" as an `ifdown`, and records that reading. An
+interface whose autostart is cleared with no record is looked at once more,
+5 s later, before wwand brings it back.
+
 ## Deployment examples
 
 Two ways to isolate a cellular WAN together with a DMZ so that **all inbound

@@ -431,10 +431,24 @@ export function create(opts)
 			self._giveups[substr(m[0], 1, length(m[0]) - 2)] = true;
 	}
 
-	let persist_giveups = () => {
-		if (deps.datapath_fx?.write)
-			deps.datapath_fx.write(giveups_file, sprintf('%J', keys(self._giveups)));
+	// THE STATE FILES ARE REPLACED WHOLE, never rewritten in place: a later
+	// start trusts what it reads there (admin_record_complete below), and an
+	// in-place write truncates first — killed in between, or on a full
+	// tmpfs, it left an empty record behind. write_atomic writes beside the
+	// file and renames over it (netlink.uc default_fx); a writer without it
+	// (a test double) falls back to write(). false when nothing was written.
+	let write_state = (path, data) => {
+		let fx = deps.datapath_fx;
+		let ok = fx?.write_atomic ? fx.write_atomic(path, data)
+		       : fx?.write ? fx.write(path, data) : null;
+
+		if (ok === false)
+			log('warn', sprintf('cannot write %s: %s', path, fx?.last_error ?? 'unknown error'));
+
+		return !!ok;
 	};
+
+	let persist_giveups = () => write_state(giveups_file, sprintf('%J', keys(self._giveups)));
 
 	let set_giveup = (entry, on) => {
 		entry.reconnect_on_register = on;
@@ -514,7 +528,7 @@ export function create(opts)
 	// registration. The price of trusting only the record, and the smaller
 	// one — the other way wwand kept a link down that nobody had asked it to.
 	//
-	// ONLY A RECORD THAT CAN EXIST IS TRUSTED. The file is written at every
+	// ONLY A RECORD THAT CAN EXIST IS TRUSTED. The file is written by every
 	// start, so its absence means this is the first start since boot — or
 	// the first after an upgrade from a version that recorded nothing
 	// (v1.6.8 and older), whose operator ifdowns have no record to show. For
@@ -522,22 +536,55 @@ export function create(opts)
 	// `wwand` error is the operator's (the Cudy LT300 reproduction of
 	// 2026-08-23 — ifdown, then a restart, and the link came back by itself).
 	// After a boot netifd has re-armed autostart anyway.
+	//
+	// WHAT THE GUESS DECIDES IS WRITTEN DOWN (operator_down), because the
+	// file this start writes is trusted by the next one: an operator ifdown
+	// found only by the guess would otherwise be undone by the second start
+	// after an upgrade. And the untrusted start asks netifd about every
+	// interface once, at its first apply_config (seed_admin_record), and
+	// writes the file in its trusted form only when all have answered — a
+	// guess waiting for a registration that never came before the next
+	// restart would be lost the same way.
+	//
+	// A RECORD IS TRUSTED ONLY WHOLE: the daemon's own write, a JSON array
+	// at its head (the shim appends bare names after it). An empty file, a
+	// torn one, or one holding the shim's appends alone is read for its
+	// names but not trusted. Trusted, its "nothing recorded" would bring
+	// back every operator ifdown whose record went with the rest of the
+	// file; untrusted, the worst it costs is the first-start guess once more.
 	let admin_downs_file = deps.admin_downs_file ?? '/tmp/wwand/state/admin_downs.json';
 
 	self._admin_downs = {};
-	self._admin_record_trusted = false;
 
-	{
+	let admin_record_complete = (raw) =>
+		type(raw) == 'string' && match(raw, /^[ \t\n]*\[[^\]]*\]/) != null;
+
+	// The file's names into the in-memory record, ADDED and never replacing
+	// it: the shim appends a name when its teardown cannot reach the daemon
+	// (files/wwand-proto.sh proto_wwand_teardown), a daemon that is running
+	// but slow or stopping included — and a daemon writing only its own set
+	// over that dropped the operator's ifdown. Taken by pattern: json()
+	// throws uncatchably on a torn file, and the shim's lines are no JSON.
+	// Returns the raw file (null: none).
+	let merge_admin_record = () => {
 		let raw = deps.datapath_fx?.read ? deps.datapath_fx.read(admin_downs_file) : null;
 
 		for (let m in match(raw ?? '', /"[A-Za-z0-9_.-]+"/g) ?? [])
 			self._admin_downs[substr(m[0], 1, length(m[0]) - 2)] = true;
 
-		if (raw != null)
-			self._admin_record_trusted = true;
-		else if (deps.datapath_fx?.write)
-			deps.datapath_fx.write(admin_downs_file, '[]');
-	}
+		return raw;
+	};
+
+	self._admin_record_trusted = admin_record_complete(merge_admin_record());
+
+	// set while an untrusted start has not heard back from netifd about
+	// every interface (seed_admin_record): the file is written without its
+	// head until then, so a restart meanwhile is untrusted again
+	self._admin_seed_pending = !self._admin_record_trusted;
+
+	let persist_admin_downs = () => write_state(admin_downs_file, self._admin_seed_pending
+		? join('', map(keys(self._admin_downs), (n) => sprintf('"%s"\n', n)))
+		: sprintf('%J', keys(self._admin_downs)));
 
 	// an interface named by a ubus caller, for the records keyed by interface
 	// when there is no context entry for it; null for anything the state
@@ -548,7 +595,14 @@ export function create(opts)
 	let set_admin_down = (entry, on) => {
 		let iface = entry?.cfg?.interface;
 
-		if (!iface || !!self._admin_downs[iface] == on)
+		if (!iface)
+			return;
+
+		// re-read before the write: names the shim appended since the last
+		// one must survive it
+		merge_admin_record();
+
+		if (!!self._admin_downs[iface] == on)
 			return;
 
 		if (on)
@@ -556,18 +610,27 @@ export function create(opts)
 		else
 			delete self._admin_downs[iface];
 
-		if (deps.datapath_fx?.write)
-			deps.datapath_fx.write(admin_downs_file, sprintf('%J', keys(self._admin_downs)));
+		persist_admin_downs();
 	};
 
 	// true when netifd's cleared autostart is the operator's and must be
 	// left alone; false when it is ours or the shim's, and the interface is
-	// to be brought back. `st` is a network.interface status reply.
+	// to be brought back. `st` is a network.interface status reply. Every
+	// caller leaves the interface down on true, so a true that only the
+	// first-start guess gave is recorded here — the next start trusts the
+	// record and has no guess left to make.
 	let operator_down = (entry, st) => {
 		if (st?.autostart !== false || our_down(entry))
 			return false;
 
-		if (self._admin_downs[entry?.cfg?.interface])
+		let iface = entry?.cfg?.interface;
+
+		// the shim's append while this daemon runs (its teardown could not
+		// reach us) is read now, not only at the next write
+		if (!self._admin_downs[iface])
+			merge_admin_record();
+
+		if (self._admin_downs[iface])
 			return true;
 
 		if (self._admin_record_trusted)
@@ -578,46 +641,121 @@ export function create(opts)
 			if (e?.subsystem == 'wwand')
 				return false;
 
+		set_admin_down(entry, true);
 		return true;
+	};
+
+	// The untrusted start's one look at every configured interface (see
+	// WHAT THE GUESS DECIDES above): operator_down records what the guess
+	// reads as the operator's, and the file gets its trusted head once every
+	// interface has answered. Without a status source there is nothing to
+	// guess from and the file is written at once.
+	let seed_admin_record = (ifaces) => {
+		if (!self._admin_seed_pending || self._admin_seeding)
+			return;
+
+		self._admin_seeding = true;
+
+		let left = length(ifaces);
+		let finish = () => {
+			self._admin_seed_pending = false;
+			persist_admin_downs();
+		};
+
+		if (!left || !deps.iface_status)
+			return finish();
+
+		for (let i in ifaces)
+			deps.iface_status(i, (st) => {
+				operator_down({ cfg: { interface: i } }, st);
+
+				if (--left == 0)
+					finish();
+			});
 	};
 
 	// A CLEARED AUTOSTART WITHOUT A RECORD MAY BE ONE ON ITS WAY. netifd
 	// clears autostart and starts the teardown in one step
 	// (interface_set_down, interface.c:1373-1375, netifd 2026.07.08); the
 	// shim's context_down — which writes the record — reaches us only once
-	// its teardown script runs, some 100-500 ms later. A status probe
-	// answered in that gap reads an ifdown as nobody's, and the kick that
-	// follows undoes it (the ifup re-arms autostart during the teardown,
-	// interface.c:1340-1344, and the setup after it clears the record). So
-	// before undoing such a down, ask once more after a pause; only a second
-	// status that is still not the operator's is ours to undo. alive(): the
-	// context is still the one the caller probed for.
-	const UNRECORDED_CONFIRM_MS = 2000;
+	// its teardown script runs. A status probe answered in that gap reads an
+	// ifdown as nobody's, and the kick that follows undoes it (the ifup
+	// re-arms autostart during the teardown, interface.c:1340-1344, and the
+	// setup after it clears the record). So before undoing such a down, ask
+	// once more after a pause; only a second status that is still not the
+	// operator's is ours to undo. alive(): the context is still the one the
+	// caller probed for.
+	//
+	// FIVE SECONDS, because that gap is not always short: an ifdown that
+	// lands while the shim's setup script still runs (it sleeps between
+	// retries — RADIO_HELD, WAITING_MODEM) has netifd SIGTERM the script and
+	// wait up to 1 s before the SIGKILL (proto-ext.c:780-788), then abort the
+	// setup (proto-ext.c:162-170), and only then does the teardown script
+	// start and reach context_down (netifd 2026.07.08~6088f7b3). A pause
+	// shorter than that answers before the record exists and undoes the
+	// ifdown after all.
+	const UNRECORDED_CONFIRM_MS = 5000;
 
 	let needs_confirm = (entry, st) =>
 		st?.autostart === false && !our_down(entry) && !self._admin_downs[entry?.cfg?.interface];
 
-	let confirm_then = (entry, alive, go) => {
-		let ms = self.timing?.unrecorded_confirm_ms ?? UNRECORDED_CONFIRM_MS;
-		let again = () => deps.iface_status(entry.cfg.interface, (st2) => {
-			if (!alive())
-				return;
+	// ONE SECOND LOOK PER ENTRY AT A TIME, and cancellable. The three sites
+	// that ask can all fire for one down (a registration, a settings event,
+	// a connect-first up — settings events come in bursts), and each look
+	// ends in a kick: one per event was as many kicks for one down. A look
+	// already pending answers for all of them. Cancelled wherever the daemon
+	// stops acting on the entry (stop_context, stop_local, shutdown): a
+	// timer outliving it probes and kicks for a context a reload replaced,
+	// or from a daemon that is on its way out.
+	let cancel_confirm = (entry) => {
+		if (!entry)
+			return;
 
-			if (operator_down(entry, st2)) {
-				if (entry.wanted) {
-					entry.wanted = false;
-					log('notice', sprintf('interface %s is administratively down (ifdown), leaving it alone',
-						entry.cfg.interface));
-				}
-				return;
-			}
-
-			go(st2);
-		});
-
-		(ms > 0) ? uloop.timer(ms, again) : again();
+		entry._confirm_timer?.cancel();
+		entry._confirm_timer = null;
+		entry._confirm = null;
 	};
 
+	let confirm_then = (entry, alive, go) => {
+		if (entry._confirm)
+			return;
+
+		let token = {};
+		let ms = self.timing?.unrecorded_confirm_ms ?? UNRECORDED_CONFIRM_MS;
+
+		entry._confirm = token;
+
+		let again = () => {
+			entry._confirm_timer = null;
+
+			deps.iface_status(entry.cfg.interface, (st2) => {
+				// cancelled while the probe was out
+				if (entry._confirm !== token)
+					return;
+
+				entry._confirm = null;
+
+				if (!alive())
+					return;
+
+				if (operator_down(entry, st2)) {
+					if (entry.wanted) {
+						entry.wanted = false;
+						log('notice', sprintf('interface %s is administratively down (ifdown), leaving it alone',
+							entry.cfg.interface));
+					}
+					return;
+				}
+
+				go(st2);
+			});
+		};
+
+		if (ms > 0)
+			entry._confirm_timer = uloop.timer(ms, again);
+		else
+			again();
+	};
 	// The SIM inventory (siminventory.uc): every card seen, by ICCID, and
 	// where it is. Refreshed from the modems' state on every sim_inventory
 	// call and every tick — in memory, no I/O — so it follows identity re-reads, slot
@@ -787,12 +925,18 @@ export function create(opts)
 							centry.cfg.interface));
 					}
 				}
-				else if (!(centry.cfg.auto ?? true)) {
+				else if (!(centry.cfg.auto ?? true) && !our_down(centry) && !centry.reconnect_on_register) {
 					// 'auto 0' and not up: dormant until an explicit ifup — and
 					// not wanted meanwhile. A SIM change's down-and-reconnect
 					// (modem_sim_refresh) and the low-power decision read
 					// `wanted`, and neither may dial or hold the radio for an
 					// interface nobody brought up.
+					//
+					// Not when the down is wwand's own (a give-up, a SIM block —
+					// the re-arm above marks it): `auto 0` says nobody brings
+					// the interface up at boot, and this one the operator HAD
+					// brought up. Taken for dormant, wwand's own give-up would
+					// keep it down until the next ifup.
 					centry.wanted = false;
 					log('debug', sprintf('interface %s is down and auto=0, not kicking', centry.cfg.interface));
 				}
@@ -1738,6 +1882,7 @@ export function create(opts)
 
 				if (deps.kick_interface && entry.cfg.interface) {
 					let kentry = entry, kiface = entry.cfg.interface, kctx = ctx;
+					let kseq = entry._conn_seq ?? 0;
 
 					let do_kick = () => {
 						log('info', sprintf('kicking interface %s to adopt the connected session', kiface));
@@ -1773,11 +1918,15 @@ export function create(opts)
 								return;
 							}
 
-							// no record of the ifdown yet: asked again first
+							// no record of the ifdown yet: asked again first —
+							// and, as at the renew site, only a session that is
+							// still this one is kicked for, and an interface
+							// netifd is bringing up by then is left to it
 							if (needs_confirm(kentry, st))
 								return confirm_then(kentry,
-									() => self.contexts[name] === kentry && kentry.ctx === kctx,
-									() => do_kick());
+									() => self.contexts[name] === kentry && kentry.ctx === kctx &&
+									      kctx.state == 'CONNECTED' && (kentry._conn_seq ?? 0) === kseq,
+									(st2) => (st2?.up || st2?.pending) ? null : do_kick());
 
 							// our own down is being undone. The marker is NOT cleared
 							// here: the kick is fire-and-forget, so an up that never
@@ -2064,6 +2213,7 @@ export function create(opts)
 			return;
 
 		clear_reconnect(name);
+		cancel_confirm(entry);
 
 		for (let p in entry.pending_up)
 			p({ error: 'reload' });
@@ -2971,6 +3121,18 @@ export function create(opts)
 		for (let cn in keys(self.contexts))
 			self.contexts[cn]._sig = ctx_sig(cn);
 
+		// an untrusted start: the guess, once, for every interface (see
+		// seed_admin_record)
+		{
+			let ifaces = {};
+
+			for (let cn, cfg in parsed.contexts)
+				if (cfg.interface)
+					ifaces[cfg.interface] = true;
+
+			seed_admin_record(keys(ifaces));
+		}
+
 		// board bring-up + periodic status tick (once): drives panel LEDs from the
 		// primary modem's reg+signal and re-logs a waited-on modem every 30 s.
 		if (!self._tick_started) {
@@ -3180,8 +3342,13 @@ export function create(opts)
 
 		// an up is the operator's intent whatever it is answered with: a
 		// record kept past an up that failed (modem absent, a context not
-		// built yet) would outlive the ifup that ended it
+		// built yet) would outlive the ifup that ended it. The same for our
+		// own down: the up answers it, and a marker kept past it sent an
+		// ifdown within its window — the modem still gone — down
+		// context_down's our_down branch, unrecorded, and the interface came
+		// back against the operator once the modem did.
 		set_admin_down(entry ?? iface_ref(ref), false);
+		clear_our_down(entry ?? iface_ref(ref));
 
 		if (!entry)
 			return cb({ error: 'no_such_context', ref: ref });
@@ -4461,6 +4628,7 @@ export function create(opts)
 	self.shutdown = function() {
 		for (let name, entry in self.contexts) {
 			clear_reconnect(name);
+			cancel_confirm(entry);
 
 			if (entry.ctx && entry.ctx.state != 'IDLE')
 				entry.ctx.down(() => null);
@@ -4482,8 +4650,12 @@ export function create(opts)
 	// interfaces. With no-proto-task the WAN stays up across the restart and the
 	// fresh daemon adopts the live session on modem-ready. Just cancel our timers.
 	self.stop_local = function() {
-		for (let name in keys(self.contexts))
+		// ...and no second look at an unrecorded down either: it ends in a
+		// kick, and the next daemon makes its own
+		for (let name, entry in self.contexts) {
 			clear_reconnect(name);
+			cancel_confirm(entry);
+		}
 
 		// the loop runs on for the plugins' hand-back (main.uc): nothing of
 		// the daemon's own may act in it — a tick would run the plugins

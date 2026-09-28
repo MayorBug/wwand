@@ -474,6 +474,7 @@ kicks = [];
 autostart = false;
 let dnorec = mk('ipv4', []);
 dnorec.d._admin_record_trusted = true;     // a start that could have recorded it
+delete dnorec.d._admin_downs.wan;          // ...and did not (the untrusted start's guess had)
 dnorec.modem()('registered');
 eq(kicks, [ 'wan' ], 'ifdown: autostart=false with no operator record is kicked up');
 

@@ -47,6 +47,15 @@ export function create(opts)
 		return true;
 	};
 
+	// default_fx.write_atomic: a whole-file replace, recorded under its own
+	// name so a test can tell it from an in-place write
+	self.write_atomic = function(path, data) {
+		push(self.actions, sprintf('write_atomic %s %s', path, trim(data)));
+		self.files[path] = data;
+
+		return true;
+	};
+
 	self.link_del = function(name) {
 		push(self.actions, sprintf('link_del %s', name));
 		delete self.present[sprintf('/sys/class/net/%s', name)];

@@ -8,11 +8,12 @@
 import { eq, ok, done } from './lib/check.uc';
 import * as uloop from 'uloop';
 import * as libubus from 'ubus';
-import { access } from 'fs';
+import { access, unlink } from 'fs';
 import * as mockhub from './lib/mockhub.uc';
 import * as fakefx from './lib/fakefx.uc';
 import * as config from 'wwand/config.uc';
 import * as daemon_mod from 'wwand/daemon.uc';
+import * as netlink_mod from 'wwand/netlink.uc';
 import * as ubus_api from 'wwand/ubus.uc';
 
 let sock = getenv('WWAND_TEST_UBUS_SOCK');
@@ -3041,6 +3042,32 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	   'first start (an upgrade): cleared autostart, no wwand error — the operator\'s, left alone');
 	d.shutdown();
 
+	// ...AND ON THE SECOND START TOO. The first one wrote its record, which
+	// the second trusts — so what the guess found has to be in it, or the
+	// second start after an upgrade undid the ifdown the first had honoured
+	calls = [];
+	d = mk();
+	ok(d._admin_record_trusted, 'second start: the record the first one wrote is trusted');
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq([ kicks(), d.contexts.wan.wanted ], [ [], false ],
+	   'second start after an upgrade: the guessed operator ifdown is still left alone');
+	d.shutdown();
+
+	// a restart before the first start's modem ever registered: the guess
+	// is made at the first apply_config already, for every interface, not
+	// only when a registration asks
+	calls = [];
+	delete fx.files[FILE];
+	d = mk();
+	d.shutdown();
+	d = mk();
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq([ kicks(), d.contexts.wan.wanted ], [ [], false ],
+	   'second start, the first one never registered: the guessed operator ifdown is still left alone');
+	d.shutdown();
+
+	// the cases below are later starts that recorded nothing
+	fx.files[FILE] = '[]';
 	calls = [];
 	st = { up: false, pending: false, autostart: false, errors: [ { subsystem: 'wwand', code: 'RADIO_HELD' } ] };
 	d = mk();
@@ -3127,7 +3154,271 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	} }));
 	hooks.m0(d.modems.m0.modem, 'registered', {});
 	eq([ kicks(), d.contexts.wan.wanted ], [ [], false ], 'auto 0, down: not kicked, not wanted');
+
+	// ...but an `auto 0` interface the operator HAD brought up, which wwand
+	// then gave up on (a hold expiry): its down is ours, and the give-up's
+	// re-arm is what brings it back — `auto 0` is about boot, not about this
+	calls = [];
+	d.contexts.wan.wanted = true;
+	d.contexts.wan._holdexpiry = true;
+	d.context_down('wan', () => null);
+	eq(d.contexts.wan.reconnect_on_register, true, 'auto 0, given up: re-armable');
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq([ kicks(), d.contexts.wan.wanted ], [ [ 'kick:wan' ], true ],
+	   'auto 0, wwand\'s own give-up: kicked back up on registration, still wanted');
 	d.shutdown();
+
+	// AN IFUP ANSWERS A DOWN OF OURS, also one that finds the modem gone. Our
+	// down (a hold expiry), the modem vanishes, the operator runs ifup
+	// (modem_absent) and then ifdown within the marker's window: that ifdown
+	// is the operator's and must be recorded — kept, the marker sent it down
+	// context_down's our_down branch and the interface came back with the modem
+	calls = [];
+	fx.files[FILE] = '[]';
+	d = mk();
+	d._our_downs.wan = time();
+	d.contexts.wan.ctx = null;
+	let uerr = null;
+	d.context_up('wan', (e) => { uerr = e; });
+	eq(uerr?.error, 'modem_absent', 'ifup with the modem gone: modem_absent');
+	d.context_down('wan', () => null);
+	ok(d._admin_downs.wan && index(fx.files[FILE] ?? '', '"wan"') >= 0,
+	   'our down, modem gone, ifup, ifdown: the ifdown is recorded as the operator\'s');
+	d.shutdown();
+
+	// THE RECORD IS REPLACED WHOLE (write_atomic), never truncated in place:
+	// a later start trusts what it finds there
+	calls = [];
+	fx.files[FILE] = '[]';
+	fx.actions = [];
+	d = mk();
+	d.contexts.wan.ctx.state = 'CONNECTED';
+	d.context_down('wan', () => null);
+	d.contexts.wan.ctx.state = 'CONNECTED';
+	d.context_up('wan', () => null);
+	d.contexts.wan._holdexpiry = true;
+	d.context_down('wan', () => null);
+	let wrote = (verb, f) => length(filter(fx.actions, (a) => index(a, verb + ' ' + f + ' ') == 0));
+	eq([ wrote('write_atomic', FILE) > 0, wrote('write', FILE) ], [ true, 0 ],
+	   'admin_downs: replaced whole, never written in place');
+	eq([ wrote('write_atomic', '/tmp/test-giveups3.json') > 0, wrote('write', '/tmp/test-giveups3.json') ],
+	   [ true, 0 ], 'giveups: replaced whole, never written in place');
+	d.shutdown();
+
+	// THE SHIM'S APPEND SURVIVES THE DAEMON'S NEXT WRITE. Its teardown could
+	// not reach the daemon (slow, or on its way out) and appended the name;
+	// the daemon then writes its own set — and must not write the
+	// operator's ifdown away with it.
+	let cfg2 = config.parse({ network: {
+		m0:   { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan:  { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: 'a' },
+		wan2: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3b', apn: 'b' },
+	} });
+	calls = [];
+	fx.files[FILE] = '[]';
+	st = { up: false, pending: false, autostart: false, errors: [] };
+	d = mk();
+	d.apply_config(cfg2);
+	fx.files[FILE] += '"wan2"\n';               // the shim, while this daemon runs
+	d.contexts.wan.ctx.state = 'CONNECTED';
+	d.context_down('wan', () => null);          // the daemon's own write
+	ok(index(fx.files[FILE], '"wan"') >= 0 && index(fx.files[FILE], '"wan2"') >= 0,
+	   'shim append: the daemon\'s write keeps the name the shim appended');
+	ok(match(fx.files[FILE], /^\[[^\]]*"wan2"[^\]]*\]/) != null,
+	   '...inside its own record, trusted by the next start');
+
+	// ...and the appended name counts at once, not only after a write
+	fx.files[FILE] = '[]\n"wan2"\n';
+	delete d._admin_downs.wan2;
+	d.contexts.wan2.ctx.state = 'IDLE';
+	d.contexts.wan2.wanted = true;
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	ok(index(calls, 'kick:wan2') < 0 && d.contexts.wan2.wanted == false,
+	   'shim append while the daemon runs: honoured at the next registration');
+	d.shutdown();
+
+	// A RECORD IS TRUSTED ONLY WHOLE. Empty, torn, or the shim's appends
+	// alone: read for the names, but "nothing recorded" is not believed —
+	// trusted, it would revive every ifdown whose record went with the rest
+	// of the file. (Interfaces up: the untrusted start's own guess is not
+	// what is read here.)
+	st = { up: true, pending: false, autostart: true, errors: [] };
+
+	for (let c in [
+		[ '',                    false, false, 'an empty file' ],
+		[ '[ "wan", "wa',        false, true,  'a torn one' ],
+		[ '"wan"\n',             false, true,  'the shim\'s appends alone' ],
+		[ '[ "x" ]\n"wan"\n',    true,  true,  'the daemon\'s record with an append' ],
+	]) {
+		fx.files[FILE] = c[0];
+		d = mk();
+		eq([ d._admin_record_trusted, !!d._admin_downs.wan ], [ c[1], c[2] ],
+		   sprintf('admin_downs: %s is %s', c[3], c[1] ? 'trusted' : 'read but not trusted'));
+		d.shutdown();
+	}
+})();
+
+// THE SECOND LOOK AT AN UNRECORDED DOWN IS ONE TIMER PER ENTRY, AND IT DIES
+// WITH THE DAEMON'S INTEREST IN THE ENTRY. All three sites that ask for it
+// (a registration, a settings event, a connect-first up) end in a kick; one
+// timer each was one kick per event, and a timer outliving stop_local kicked
+// from a daemon on its way out. Driven through a real loop with a short
+// window, since the timer is the thing under test.
+(() => {
+	let fx = fakefx.create({ files: { '/tmp/test-admin-confirm.json': '[]' } });
+	let calls = [], probes = 0, hook = null, ctxs = [];
+	let netifd = { up: false, pending: false, autostart: false, errors: [] };
+	let fake = {
+		modem: { create: (o) => {
+			hook = o.deps.on_event;
+			return { id: o.id, state: 'READY', config: o.config, start: () => null, stop: () => null,
+			         note_connect_success: () => null };
+		} },
+		context: { create: (o) => {
+			let ctx = { state: 'CONNECTED', name: o.name, modem: o.modem, config: o.config,
+			            settings: { ipv4: { addr: '10.11.12.99' } },
+			            on_event: o.deps.on_event,
+			            down: (cb) => cb ? cb() : null, up: (cb) => null, modem_event: () => null };
+			push(ctxs, ctx);
+			return ctx;
+		} },
+	};
+	let mk = () => {
+		calls = []; probes = 0;
+
+		let d = daemon_mod.create({ timing: { ...TIMING, unrecorded_confirm_ms: 40 }, deps: {
+			log: () => null, load_qmi: () => fake, datapath_fx: fx,
+			giveups_file: '/tmp/test-giveups-confirm.json', admin_downs_file: '/tmp/test-admin-confirm.json',
+			kick_interface:  (i) => push(calls, 'kick:' + i),
+			renew_interface: (i) => push(calls, 'renew:' + i),
+			down_interface:  (i) => push(calls, 'down:' + i),
+			iface_status: (i, cb) => { probes++; cb(netifd); },
+		} });
+
+		d.apply_config(config.parse({ network: {
+			m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+			wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3', apn: 'a', pdp_type: 'ipv4' },
+		} }));
+		d.contexts.wan.wanted = true;
+		return d;
+	};
+	let spin = (ms) => { uloop.timer(ms, () => uloop.end()); uloop.run(); };
+	let kicks = () => filter(calls, (c) => c == 'kick:wan');
+	let ev = (d, what) => d.contexts.wan.ctx.on_event(d.contexts.wan.ctx, what, d.contexts.wan.ctx.settings);
+
+	// the three sites, each armed and then stopped: no probe, no kick after
+	let sites = {
+		registration: (d) => { d.contexts.wan.ctx.state = 'IDLE'; hook(d.modems.m0.modem, 'registered', {}); },
+		settings: (d) => ev(d, 'settings'),
+		'connect-first': (d) => { d.contexts.wan._kick_after_connect = true; ev(d, 'up'); },
+	};
+
+	for (let site, arm in sites) {
+		let d = mk();
+
+		arm(d);
+		ok(d.contexts.wan._confirm_timer != null, sprintf('confirm (%s): a second look is armed', site));
+
+		let before = probes;
+
+		d.stop_local();
+		spin(120);
+		eq([ probes - before, kicks() ], [ 0, [] ], sprintf('confirm (%s): stop_local cancels it — no probe, no kick', site));
+		d.shutdown();
+	}
+
+	// ...and a reload (stop_context) and a shutdown cancel it too
+	{
+		let d = mk();
+		ev(d, 'settings');
+		d.shutdown();
+		let before = probes;
+		spin(120);
+		eq([ probes - before, kicks() ], [ 0, [] ], 'confirm: shutdown cancels it');
+
+		d = mk();
+		ev(d, 'settings');
+		let old = d.contexts.wan;
+		d.apply_config(config.parse({ network: {
+			m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+			wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3', apn: 'b', pdp_type: 'ipv4' },
+		} }));
+		ok(old._confirm_timer == null && old._confirm == null, 'confirm: a reload (stop_context) cancels the replaced entry\'s look');
+		d.shutdown();
+	}
+
+	// a burst of settings events for one down: one look, one kick
+	{
+		let d = mk();
+
+		let before = probes;
+
+		ev(d, 'settings'); ev(d, 'settings'); ev(d, 'settings');
+		spin(120);
+		eq(kicks(), [ 'kick:wan' ], 'confirm: three settings events for one down — one kick');
+		// three renew probes, and ONE second look
+		eq(probes - before, 4, 'confirm: ...and one second look, not three');
+		d.shutdown();
+	}
+
+	// THE SHIPPED WINDOW OUTLASTS netifd's SIGTERM->SIGKILL second before a
+	// teardown can even start (proto-ext.c:780-788, netifd
+	// 2026.07.08~6088f7b3): 2.3 s after the first look nothing is kicked yet
+	{
+		let d = mk();
+
+		d.timing = { ...d.timing };
+		delete d.timing.unrecorded_confirm_ms;
+		ev(d, 'settings');
+		spin(2300);
+		eq(kicks(), [], 'confirm: the default window is longer than netifd\'s kill timeout plus a teardown start');
+		d.shutdown();
+	}
+
+	// CONNECT-FIRST: the second look asks what the renew site asks — the
+	// session still this one, and netifd not bringing it up by itself
+	{
+		let d = mk();
+
+		d.contexts.wan._kick_after_connect = true;
+		ev(d, 'up');
+		netifd.pending = true;                      // netifd is setting it up now
+		spin(120);
+		eq(kicks(), [], 'connect-first: an interface netifd is bringing up is left to it');
+		netifd.pending = false;
+
+		d.contexts.wan._kick_after_connect = true;
+		ev(d, 'up');
+		d.contexts.wan.ctx.state = 'IDLE';          // the session went meanwhile
+		spin(120);
+		eq(kicks(), [], 'connect-first: a session that is gone is not kicked for');
+
+		d.contexts.wan.ctx.state = 'CONNECTED';
+		d.contexts.wan._kick_after_connect = true;
+		ev(d, 'up');
+		d.contexts.wan._conn_seq++;                 // ...or replaced by a newer one
+		spin(120);
+		eq(kicks(), [], 'connect-first: a superseded session is not kicked for');
+
+		d.contexts.wan._kick_after_connect = true;
+		ev(d, 'up');
+		spin(120);
+		eq(kicks(), [ 'kick:wan' ], 'connect-first: ...and the plain case still kicks');
+		d.shutdown();
+	}
+})();
+
+// write_atomic on a real filesystem: the content lands, the temporary does
+// not stay behind
+(() => {
+	let fx = netlink_mod.default_fx(() => null);
+	let p = '/tmp/wwand-test-write-atomic.json';
+
+	ok(fx.write_atomic(p, '[ "wan" ]') && fx.read(p) == '[ "wan" ]' && !fx.exists(p + '.tmp'),
+	   'write_atomic: replaces the file, no temporary left');
+	ok(fx.write_atomic(p, '[]') && fx.read(p) == '[]', 'write_atomic: ...again over an existing one');
+	ok(!fx.write_atomic('/nonexistent-dir/x.json', '[]'), 'write_atomic: false when it cannot write');
+	unlink(p);
 })();
 
 // THE OPERATOR'S IFDOWN AROUND A BLOCK. After the shim blocked a setup
@@ -3260,6 +3551,10 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
 		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3a', apn: apn },
 	} });
+	// a start after one that wrote its record: the first start's one look
+	// at every interface (seed_admin_record) is not what this is about
+	fx.files['/tmp/test-admin-stale.json'] = '[]';
+
 	let d = daemon_mod.create({ timing: TIMING, deps: {
 		log: () => null, load_qmi: () => fake, datapath_fx: fx,
 		giveups_file: FILE, admin_downs_file: '/tmp/test-admin-stale.json',

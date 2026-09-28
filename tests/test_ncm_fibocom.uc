@@ -11,6 +11,7 @@
 
 import { eq, ok, done } from './lib/check.uc';
 import * as telemetry_ncm from 'wwand/telemetry_ncm.uc';
+import * as ncm_vendors from 'wwand/ncm_vendors.uc';
 
 // capture #1 (post 7 debug trace): LTE anchor B3 + NR n77, one SCC
 let cap1 = [
@@ -409,5 +410,124 @@ eq(tca[1]?.rsrp, -860, 'ca: nr rsrp x10');
 eq(tca[1]?.rsrq, -110.0, 'ca: nr rsrq x10 (GTCCINFO-enriched)');
 eq(tca[1]?.bandwidth_mhz, 60, 'ca: nr bandwidth_mhz');
 eq(tca[2]?.role, 'SCC', 'ca: scc entry');
+
+// --- +GTACT band codec (ncm_vendors) ----------------------------------------
+// Commands and answers from an FM350-GL, fw 81600.0000.00.19.11.17
+// (ddimension/wwand#43): both writes below were accepted there, and the
+// tuple-17 read-back re-sent verbatim was refused.
+const LIVE20 = '+GTACT: 20,6,3,1,2,4,5,8,101,103,107,120,128,503,507,5020,5028,5078';
+const CAPS = '+GTACT: (1,2,4,10,14,16,17,20),(2,3,6),(2,3,6),(),(1,2,4,5,8),' +
+	'(101,103,107,108,120,128),(),(),(501,503,507,508,5020,5028,5078)';
+
+let st = ncm_vendors.parse_gtact([ LIVE20 ]);
+eq([ st?.rat, st?.act1, st?.act2 ], [ 20, 6, 3 ], 'gtact: tuple read');
+eq(st?.umts_bands, [ 1, 2, 4, 5, 8 ], 'gtact: umts group');
+eq(st?.lte_bands, [ 1, 3, 7, 20, 28 ], 'gtact: lte 100+band');
+eq(st?.nr_bands, [ 3, 7, 20, 28, 78 ], 'gtact: nr compact (503) and wide (5078) forms');
+eq(ncm_vendors.parse_gtact([ 'ERROR' ]), null, 'gtact: no +GTACT line -> null');
+
+let caps = ncm_vendors.parse_gtact_test([ CAPS ]);
+eq(caps?.umts, [ 1, 2, 4, 5, 8 ], 'gtact =?: umts catalogue');
+eq(caps?.lte, [ 1, 3, 7, 8, 20, 28 ], 'gtact =?: lte catalogue');
+eq(caps?.nr, [ 1, 3, 7, 8, 20, 28, 78 ], 'gtact =?: nr catalogue');
+eq(ncm_vendors.parse_gtact_test([ '+GTACT: (1,2-4),(2),(2),(),(1),(101-103),(),(),(501)' ])?.lte,
+	[ 1, 2, 3 ], 'gtact =?: a range form is expanded');
+
+eq(ncm_vendors.build_gtact(st, { umts: st.umts_bands, lte: st.lte_bands, nr: st.nr_bands }),
+	'AT+GTACT=20,6,3,1,2,4,5,8,101,103,107,120,128,503,507,5020,5028,5078',
+	'gtact build: the HW-accepted tuple-20 write, byte for byte');
+eq(ncm_vendors.build_gtact({ rat: 4, act1: 3, act2: 3 }, { umts: [ 1, 2, 4, 5, 8 ], lte: [ 3 ] }),
+	'AT+GTACT=4,3,3,1,2,4,5,8,103', 'gtact build: the HW-accepted single-band B3 lock');
+eq(ncm_vendors.build_gtact({ rat: 17, act1: 3, act2: 6 }, { umts: [ 1 ], lte: [ 3 ], nr: [ 78 ] }),
+	null, 'gtact build: tuple 17 is refused (its own read-back is rejected on HW)');
+eq(ncm_vendors.build_gtact({ rat: 20, act1: 6, act2: 3 }, { umts: [], lte: [ 3 ], nr: [ 78 ] }),
+	null, 'gtact build: an empty group is refused (the parser needs UMTS in front)');
+eq(ncm_vendors.build_gtact({ rat: 20, act1: 6, act2: 3 }, { umts: [ 1 ], lte: [ 72 ], nr: [ 78 ] }),
+	null, 'gtact build: a band with no encoding is refused');
+
+// settings_set through a scripted modem; `live` is what AT+GTACT? answers
+function fake_fm350(live)
+{
+	let m = { info: { model: 'FM350-GL' }, sent: [], live: live };
+
+	m.at = {
+		send: (cmd, cb) => {
+			push(m.sent, cmd);
+
+			if (cmd == 'AT+GTACT?')
+				return cb(null, { lines: [ m.live ] });
+			if (cmd == 'AT+GTACT=?')
+				return cb(null, { lines: [ CAPS ] });
+
+			// a write: the module now runs what was written
+			m.live = '+GTACT: ' + substr(cmd, 9);
+			cb(null, { lines: [] });
+		},
+	};
+
+	return m;
+}
+
+let fset = ncm_vendors.VENDORS.fibocom.settings_set;
+let writes = (m) => filter(m.sent, (c) => match(c, /^AT\+GTACT=[0-9]/));
+let r, e, fm;
+
+fm = fake_fm350(LIVE20);
+fset(fm, { lte_bands: [ 28, 20, 7, 3, 1 ] }, (err, res) => { e = err; r = res; });
+eq([ e, r?.unchanged, r?.persistent ], [ null, true, false ], 'gtact set: a running mask is unchanged, and not NV');
+eq(writes(fm), [], 'gtact set: ...and nothing is written');
+
+fm = fake_fm350(LIVE20);
+fset(fm, { lte_bands: [ 3 ] }, (err, res) => { e = err; r = res; });
+eq(writes(fm), [ 'AT+GTACT=20,6,3,1,2,4,5,8,103,503,507,5020,5028,5078' ],
+	'gtact set: a partial edit keeps the other groups');
+eq([ e, r?.applied, r?.verified ], [ null, [ 'lte' ], true ], 'gtact set: applied and verified');
+
+fm = fake_fm350('+GTACT: 20,6,3,1,2,4,5,8,103,503,507,5020,5028,5078');
+fset(fm, { lte_bands: [], nr5g_sa_bands: [ 78 ], nr5g_nsa_bands: [ 78 ] }, (err, res) => { e = err; });
+eq(writes(fm), [ 'AT+GTACT=20,6,3,1,2,4,5,8,101,103,107,108,120,128,5078' ],
+	'gtact set: an empty list is every band the module lists (the editor\'s "none ticked")');
+
+fm = fake_fm350(LIVE20);
+fset(fm, { lte_bands: [ 66 ] }, (err, res) => { e = err; });
+eq([ e?.error, e?.band ], [ 'invalid_setting', 66 ], 'gtact set: a band the module does not list is named');
+eq(writes(fm), [], 'gtact set: ...and not sent (it would abort the whole command)');
+
+fm = fake_fm350('+GTACT: 17,3,6,101,103,503');
+fset(fm, { lte_bands: [ 3 ] }, (err, res) => { e = err; });
+eq(e?.error, 'unsupported_tuple', 'gtact set: tuple 17 refused with a reason');
+eq(writes(fm), [], 'gtact set: ...and nothing sent');
+
+fm = fake_fm350(LIVE20);
+fset(fm, { nr5g_sa_bands: [ 78 ], nr5g_nsa_bands: [ 3 ] }, (err, res) => { e = err; });
+eq(e?.key, 'nr5g_bands', 'gtact set: two different NR lists cannot be one +GTACT list');
+
+fm = fake_fm350(LIVE20);
+fset(fm, { lte_bands: [ 3 ], roaming_preference: 1 }, (err, res) => { e = err; });
+eq([ e?.error, e?.key ], [ 'invalid_setting', 'roaming_preference' ], 'gtact set: a NAS preference is refused, not dropped');
+
+fm = fake_fm350(LIVE20);
+fm.at.send = ((send) => (cmd, cb) => {
+	// the module ignores the write: transport OK, state unchanged
+	if (match(cmd, /^AT\+GTACT=[0-9]/)) {
+		push(fm.sent, cmd);
+		return cb(null, { lines: [] });
+	}
+	send(cmd, cb);
+})(fm.at.send);
+fset(fm, { lte_bands: [ 3 ] }, (err, res) => { e = err; });
+eq([ e?.error, e?.group ], [ 'verify_failed', 'lte' ], 'gtact set: an OK the read-back contradicts is a failure');
+
+fm = fake_fm350(LIVE20);
+fm.at.send = ((send) => (cmd, cb) => {
+	// torn down while the catalogue was being read
+	if (cmd == 'AT+GTACT=?') {
+		fm.at = null;
+		return cb('closed');
+	}
+	send(cmd, cb);
+})(fm.at.send);
+fset(fm, { lte_bands: [ 3 ] }, (err, res) => { e = err; });
+eq(e?.error, 'modem_gone', 'gtact set: a teardown between read and write is not a crash');
 
 done('test_ncm_fibocom');

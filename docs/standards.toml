@@ -88,6 +88,12 @@ code = "src-ucode/{modem_ncm,context_ncm,telemetry_ncm,ncm_vendors}.uc"
   sections = "data call start/stop, authentication, IP read-back"
     [[component.standard.review]]
     review = "tbd"
+  [[component.standard]]
+  name = "Fibocom +GTACT (RAT and band selection)"
+  basis = "Fibocom AT Commands User Manual V2.10 §11.1.14; parser rules from FM350-GL fw 81600.0000.00.19.11.17 (ddimension/wwand#43)"
+  sections = "read, =? catalogue, write tuple shape, persistence"
+    [[component.standard.review]]
+    review = "tbd"
 
 [[component]]
 name = "AT command layer"

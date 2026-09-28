@@ -643,10 +643,16 @@ export function install(self, o)
 		// the lists as given — they are already in the neutral shape.
 		if (entry.modem.settings_set)
 			return entry.modem.settings_set(settings, (err, res) => {
-				if (!err)
-					return cb(null, res);
+				if (err)
+					return cb(err);
 
-				cb(err);
+				// the band command forgets (not NV): the edit is kept in uci
+				// and re-applied at bring-up — also for an `unchanged` answer,
+				// which says what the modem runs NOW, not after a power cycle
+				if (res?.persistent === false)
+					o.persist_bands?.(ref, settings);
+
+				cb(null, res);
 			});
 
 		// band-number lists (LuCI-safe) are converted to masks here. Both LTE

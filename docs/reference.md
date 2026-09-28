@@ -483,9 +483,9 @@ config wwand_modem 'm0'
 	option lock_4g '1300:246'        # earfcn:pci — LTE cell lock (repeatable / list)
 	option lock_5g '242:431070:15:1' # pci:arfcn:scs:band — NR SA cell lock
 	option lock_persist '0'          # store the cell lock in modem NV
-	list band_lte '1' '3' '7'        # LTE band allow-list (repeatable / list)
-	list band_nr '28' '78'           # NR band allow-list (5G)
-	list band_umts '1' '2'           # UMTS band allow-list (see the note below)
+	list band_lte '1' '3' '7'        # LTE bands — Fibocom FM350/FM150 only (see below)
+	list band_nr '28' '78'           # NR bands, one list for SA and NSA (same)
+	list band_umts '1' '2'           # UMTS bands (rarely wanted, see below)
 	option location '0'              # start the QMI LOC positioning session
 	option stats_interval '60'       # telemetry period in seconds (0 = off)
 	option delay '0'                 # seconds to wait before the first init
@@ -503,21 +503,29 @@ config wwand_modem 'm0'
 ```
 
 **Band allow-lists (`band_lte` / `band_nr` / `band_umts`).** A **list** of 3GPP
-band numbers, not a mask: the encoding belongs to the modem's own radio command,
-and one option per RAT is all any backend needs (u64 band words on QMI/MBIM,
-`+GTACT` tokens on Fibocom AT). Values are 3GPP numbers (`3`, `28`, `78`), not
-vendor tokens. An **unset or empty list leaves that RAT's bands alone** — a
-partial edit never drops the other RATs' bands, and never widens a mask you did
-not ask about. A modem with no such command reports
-`unsupported_on_backend` and keeps the NAS path.
+band numbers (`3`, `28`, `78`), not a mask or a vendor token. They exist for
+modems whose band command **does not persist**, and today that is one family:
+the Fibocom FM350-GL / FM150 over NCM, whose `+GTACT` is documented
+`Persistent: No` and was seen to lose its mask across a power cycle even when the
+write returned OK (evidence: ddimension/wwand#43). There wwand keeps the lists
+itself and applies them at **every bring-up, before the dial** — the write costs
+one re-registration (20–30 s measured), so it is paid on the way up and never on
+a bearer that was just established. A mask the modem already runs is not
+written, and every write is **verified with a read-back**.
 
-The list is **re-applied at every bring-up**, because a band mask usually does
-not survive in the modem: Fibocom `+GTACT` is documented `Persistent: No`, and
-was field-observed to lose its mask across a power cycle even when the write
-returned OK — so wwand re-asserts it instead of trusting modem NV. A successful
-write is **verified with a read-back** before it is reported as applied, and a
-mask the modem already runs is left alone: applying one costs a re-registration
-(~20 s measured), which must never be paid for a no-op.
+A QMI or MBIM modem keeps its bands in its own NV (the settings editor writes
+them with a permanent change duration), so these options are not applied there,
+nor on any other NCM modem: set the bands in *Modem Tools* instead. A list
+configured on such a modem is reported in `status` as a `band_lists` config
+warning, as is a list the FM350 could not take (see the tuple rule below).
+
+**The settings editor keeps them for you.** A band edit in *Modem Tools* (or the
+`modem_set_settings` ubus call) on an FM350 is written to the modem's
+`wwand_modem` section, so it survives a power cycle the way a QMI band edit does.
+Unticking every band of a RAT means "all bands the module supports" and removes
+that option. Editing the options by hand and reloading applies them to the
+running modem **without restarting it** — a band list is not part of the restart
+signature.
 
 ```sh
 # Orange Romania: LTE B1/B3/B7/B20/B28 + NR n3/n7/n20/n28/n78
@@ -535,21 +543,26 @@ uci commit network && wwandctl reload
 wwandctl settings          # read back what the modem actually runs
 ```
 
-These options do **not** choose the RAT. The band write preserves whatever
-RAT/preferred-RAT tuple the modem is running — a `+GTACT` write that contradicts
-the tuple is refused by the firmware, so the codec preserves it rather than
-synthesising one. `modes` and the modem's own RAT setting stay the way to pick
-LTE-only vs 5G-preferred; on Fibocom AT that is a tuple the operator sets, e.g.
-`AT+GTACT=20,6,3,…` (NR/WCDMA/LTE, NR preferred, LTE preferred), which wwand
-reads back and reports as `mode_preference` in the settings editor.
+An **unset list leaves that RAT's bands as the modem runs them**, so a partial
+edit never drops the other RATs' bands. Only bands the module lists in
+`AT+GTACT=?` are accepted; any other is refused by name instead of being sent,
+because one unknown token aborts the whole `+GTACT` command.
 
-> **`band_umts` is rarely what you want, and exists for a parser reason.** The
-> `+GTACT` band list is positional per RAT group: a write whose tuple contains
-> UMTS must carry a UMTS group or the whole command is rejected, because the
-> parser reads the first token as a UMTS band (verified on an FM350-GL —
-> `AT+GTACT=17,3,6,101,…` answers ERROR for exactly this reason). Leave it unset
-> and the modem's current UMTS bands are preserved, which is what a band edit
-> wants; set it only to pin 3G deliberately.
+These options do **not** choose the RAT. `+GTACT` carries the RAT tuple in front
+of the bands and refuses a write that contradicts it, so wwand keeps the tuple
+the modem runs and changes only the bands. And the tuple decides whether a band
+list can be written at all: the parser reads the first band as a **UMTS** band,
+so every write it accepted led with a UMTS group — `AT+GTACT=20,6,3,1,2,4,5,8,…`
+and `AT+GTACT=4,3,3,1,2,4,5,8,103` were taken, while the NR/LTE tuple's own
+read-back `AT+GTACT=17,3,6,101,…,503,…`, sent back verbatim, was refused.
+wwand therefore writes bands only while the modem runs tuple **20**
+(NR/WCDMA/LTE) or **4** (LTE/UMTS) — the shapes proven on the FM350-GL,
+firmware 81600.0000.00.19.11.17 — and says so for any other tuple instead of
+sending a command it knows to fail.
+
+> **`band_umts` is rarely what you want.** Because of that parser rule a
+> write always carries the UMTS group; leave the option unset and the modem's
+> current UMTS bands are kept. Set it only to pin 3G deliberately.
 
 **Dead-bearer detection on NCM (`bearer_poll_count`).** An AT dial-status query
 that succeeds and lists no context for the connection's cid means "no contexts" —
@@ -1468,7 +1481,7 @@ when called from LuCI).
 | `modem_cells` | `modem` | registration + `registration_detail` + signal + decoded cells + `dsd` + `ca` + `temperature` (also on `status`, which is the canonical place — same field, kept here for compatibility) |
 | `modem_location` | `modem` | last QMI LOC fix (when `location` is enabled) |
 | `modem_at` | `modem`, `command`, `timeout?` | run an AT command on the modem's AT port |
-| `modem_get_settings` / `modem_set_settings` | `modem`, `settings?` | NAS system-selection prefs (modes/bands) — the settings editor. Sets are **idempotent**: values the modem already carries are dropped; nothing left → `unchanged: true`, no NV write, no radio disturbance |
+| `modem_get_settings` / `modem_set_settings` | `modem`, `settings?` | NAS system-selection prefs (modes/bands) — the settings editor. Sets are **idempotent**: values the modem already carries are dropped; nothing left → `unchanged: true`, no NV write, no radio disturbance. On a Fibocom FM350/FM150 (NCM) the same calls speak `+GTACT` instead: the get adds `settable` (the keys a set may carry — band lists only, none on a tuple bands cannot be written for), `supported` (the module's own band catalogue), `nr_bands_shared: true` and `persistent: false`; a set refuses any other key, and an accepted band edit is also written to the modem's `band_*` options (see *Band allow-lists*) |
 | `modem_scan` / `modem_scan_start` / `modem_scan_status` | `modem` | visible-operator scan (sync, or async start+poll — a scan takes up to ~90 s) |
 | `modem_set_network_selection` | `modem`, `mode`, `mcc?`, `mnc?` | `auto` or `manual` PLMN selection (QMI NAS / MBIM passthrough / AT+COPS). Idempotent (`unchanged: true` when the modem already runs the requested selection); on deferred-apply models the result carries `deferred: true` + `apply: 'modem_reset'` |
 | `modem_reset` | `modem` | generic admin modem reset — the apply step for `deferred` results (write ACL). Priority: dedicated reset GPIO (per-modem `reset_gpio`, or the board default when only one modem is managed), then the backend soft reset (QMI: DMS offline→reset, MBIM: passthrough-DMS or `AT+CFUN=1,1`, NCM: `AT+CFUN=1,1`). Result reports `action: 'gpio'\|'backend'`. The modem re-enumerates and every `auto` interface comes back up on its own |

@@ -597,6 +597,457 @@ const DIAL_ICMAUTOCONN = {
 	status_state: () => null,
 };
 
+// --- Fibocom +GTACT: RAT and BAND selection ---------------------------------
+// +GTACT is the only band control on the Fibocom T700/Qualcomm families
+// (FM350-GL, FM150), so it is what a `band_lte` / `band_nr` option has to
+// speak on an AT/NCM modem. It is also the most parser-sensitive command in
+// the whole AT surface. The AT manual (V2.10 §11.1.14) documents the
+// parameters but not the parser; the rules below were established by
+// experiment on an FM350-GL, firmware 81600.0000.00.19.11.17 (evidence:
+// ddimension/wwand#43, 2026-09-26):
+//
+//   read:  AT+GTACT?   ->  +GTACT: <rat>,<act1>,<act2>,<band>...
+//   test:  AT+GTACT=?  ->  +GTACT: (rat...),(act1...),(act2...),(gsm...),
+//                               (umts...),(lte...),(cdma...),(evdo...),(nr...)
+//
+// 1. THE FIRST BAND TOKEN IS READ AS A UMTS BAND. The bands after the ACT
+//    triple are read in the =? order — umts, lte, cdma, evdo, nr — and a
+//    token that is not legal where the parser is aborts the ENTIRE command.
+//    Every write the firmware accepted led with a UMTS group:
+//      AT+GTACT=20,6,3,1,2,4,5,8,101,103,107,120,128,503,507,5020,5028,5078  OK
+//      AT+GTACT=4,3,3,1,2,4,5,8,103          (a single-band B3 lock)       OK
+//    and the NR/LTE tuple's OWN read-back, re-sent verbatim, was refused:
+//      AT+GTACT=17,3,6,101,103,107,120,128,503,507,5020,5028,5078        ERROR
+//    So a band list is written only for the tuples it was proven on
+//    (GTACT_WRITABLE); any other tuple is refused with a reason instead of
+//    being sent a command its own read-back shows the parser rejects.
+//
+// 2. THE ACT TRIPLE IS NOT FREE-FORM. A write that omits or contradicts it is
+//    refused, so the tuple is PRESERVED here, never synthesised: this codec
+//    reads it and writes back exactly what the modem had.
+//
+// 3. THE WRITE IS NOT NV. The manual's attribute table says Persistent: No,
+//    and the mask was field-observed to revert across a power cycle even
+//    when the write returned OK. The daemon therefore keeps a band edit in
+//    uci and modem_ncm re-applies it at every bring-up — the same survival a
+//    QMI band edit gets from the modem's own NV (change_duration permanent).
+//
+// TRANSPORT SUCCESS IS NOT STATE CHANGE, so every write is verified with a
+// read-back before it is reported applied. Applying a mask costs a
+// re-registration (20-30 s measured), so an `unchanged` verdict must never
+// reach the radio at all.
+
+// The band groups a WRITE carries for each tuple, in parser order. Only the
+// two tuples a write was accepted for on hardware (rule 1). Reading is
+// tuple-independent: a token's range says which RAT it belongs to.
+const GTACT_WRITABLE = {
+	'4': [ 'umts', 'lte' ],        // LTE/UMTS
+	'20': [ 'umts', 'lte', 'nr' ], // NR-RAN/WCDMA/LTE
+};
+
+function gtact_number(v)
+{
+	let s = trim(sprintf('%s', v ?? ''));
+
+	if (!match(s, /^[0-9]+$/))
+		return null;
+
+	return +s;
+};
+
+// A band token's RAT group and its 3GPP band number. The encodings are the
+// manual's: UMTS directly, LTE as 100+band, NR as 500+band for n1..n9,
+// 5000+band for n10..n99 and 50000+band above (50512 is the last it names).
+// GSM/CDMA/EVDO have no token here at all — their =? groups answer ().
+function gtact_classify(n)
+{
+	if (n == null || n <= 0)
+		return null;
+
+	if (n >= 1 && n <= 10)
+		return { rat: 'umts', band: n };
+	if (n >= 101 && n <= 171)
+		return { rat: 'lte', band: n - 100 };
+	if (n >= 501 && n <= 509)
+		return { rat: 'nr', band: n - 500 };
+	if (n >= 5010 && n <= 5099)
+		return { rat: 'nr', band: n - 5000 };
+	if (n >= 50100 && n <= 50512)
+		return { rat: 'nr', band: n - 50000 };
+
+	return null;
+};
+
+// 3GPP band -> +GTACT token, or null when the band has no encoding. NR is
+// written in the compact width the module's own read-back uses (500+n up to
+// n9, 5000+n up to n99): another documented width risks a value the parser
+// rejects or, worse, reads as a different band.
+function gtact_token(group, b)
+{
+	let n = gtact_number(b);
+
+	if (n == null)
+		return null;
+
+	if (group == 'umts')
+		return (n >= 1 && n <= 10) ? sprintf('%d', n) : null;
+
+	if (group == 'lte')
+		return (n >= 1 && n <= 71) ? sprintf('%d', 100 + n) : null;
+
+	if (n < 1 || n > 512)
+		return null;
+
+	return sprintf('%d', (n <= 9) ? 500 + n : (n <= 99) ? 5000 + n : 50000 + n);
+};
+
+// Order-insensitive set compare: the modem answers its bands in its own
+// order, which need not match the order they were configured in.
+function same_band_list(a, b)
+{
+	let key = (l) => join(',', sort(map(l ?? [], (n) => +n), (x, y) => x - y));
+
+	return key(a) == key(b);
+};
+
+// QMI MODE_BITS equivalent for the tuples the manual names, so the settings
+// editor — which thinks in mode_preference — can show the current RAT choice.
+// Read-only metadata: a write preserves the modem's tuple rather than
+// translating a QMI bitmask into one.
+function fm350_rat_mask(rat)
+{
+	switch (+rat) {
+	case 2:  return 1 << 4;                          // LTE
+	case 4:  return (1 << 4) | (1 << 3);             // LTE/UMTS
+	case 14: return 1 << 6;                          // NR
+	case 16: return (1 << 6) | (1 << 3);             // NR/WCDMA
+	case 17: return (1 << 6) | (1 << 4);             // NR/LTE
+	case 20: return (1 << 6) | (1 << 3) | (1 << 4);  // NR/WCDMA/LTE
+	default: return null;
+	}
+};
+
+// Band tokens -> { umts, lte, nr } 3GPP band lists; a token no range claims
+// (the `0` "automatic", a GSM value) is skipped.
+function gtact_bands(tokens)
+{
+	let out = { umts: [], lte: [], nr: [] };
+
+	for (let t in tokens) {
+		let c = gtact_classify(gtact_number(t));
+
+		if (c != null)
+			push(out[c.rat], c.band);
+	}
+
+	return out;
+};
+
+// AT+GTACT? -> { rat, act1, act2, umts_bands, lte_bands, nr_bands, raw },
+// or null when no line parses.
+export function parse_gtact(lines)
+{
+	for (let line in (lines ?? [])) {
+		let m = match(trim(line), /^\+GTACT:\s*(.*)$/i);
+
+		if (!m)
+			continue;
+
+		// NOT map(…, trim): a bare builtin as a map callback is handed the
+		// index as its second argument and misreads it, silently.
+		let f = map(split(replace(m[1], /"/g, ''), ','), (v) => trim(v));
+
+		if (length(f) < 3)
+			return null;
+
+		let rat = gtact_number(f[0]);
+		let act1 = gtact_number(f[1]);
+		let act2 = gtact_number(f[2]);
+
+		if (rat == null || act1 == null || act2 == null)
+			return null;
+
+		let b = gtact_bands(slice(f, 3));
+
+		return {
+			rat: rat, act1: act1, act2: act2,
+			umts_bands: b.umts, lte_bands: b.lte, nr_bands: b.nr,
+			raw: join(',', f),
+		};
+	}
+
+	return null;
+};
+
+// AT+GTACT=? -> { rats, umts, lte, nr } (3GPP band lists the module
+// accepts), or null. Each parenthesised group is a comma list; a range
+// `a-b` is expanded too, in case another firmware answers in that form.
+export function parse_gtact_test(lines)
+{
+	for (let line in (lines ?? [])) {
+		let m = match(trim(line), /^\+GTACT:\s*(.*)$/i);
+
+		if (!m)
+			continue;
+
+		let groups = map(match(m[1], /\(([^)]*)\)/g) ?? [], (g) => {
+			let toks = [];
+
+			for (let t in split(g[1], ',')) {
+				let r = match(trim(t), /^([0-9]+)-([0-9]+)$/);
+
+				if (r && +r[2] >= +r[1] && +r[2] - +r[1] <= 1000)
+					for (let n = +r[1]; n <= +r[2]; n++)
+						push(toks, sprintf('%d', n));
+				else if (trim(t) != '')
+					push(toks, trim(t));
+			}
+
+			return toks;
+		});
+
+		// rat, act1, act2, gsm, umts, lte, cdma, evdo, nr
+		if (length(groups) < 9)
+			return null;
+
+		return {
+			rats: map(groups[0], (t) => +t),
+			umts: gtact_bands(groups[4]).umts,
+			lte: gtact_bands(groups[5]).lte,
+			nr: gtact_bands(groups[8]).nr,
+		};
+	}
+
+	return null;
+};
+
+// The write for a tuple and its RESOLVED groups ({ umts, lte, nr }, every
+// group the tuple carries, non-empty): 'AT+GTACT=…', or null when the tuple
+// is not one a write is proven for, a group is empty (rule 1: the parser
+// needs the UMTS group in front, and an empty group would let the next
+// group's tokens be read as its members) or a band has no encoding.
+export function build_gtact(state, groups)
+{
+	let order = GTACT_WRITABLE[sprintf('%d', state?.rat ?? -1)];
+
+	if (order == null || state.act1 == null || state.act2 == null)
+		return null;
+
+	let out = [ sprintf('%d', state.rat), sprintf('%d', state.act1), sprintf('%d', state.act2) ];
+
+	for (let g in order) {
+		if (!length(groups?.[g] ?? []))
+			return null;
+
+		for (let b in groups[g]) {
+			let t = gtact_token(g, b);
+
+			if (t == null)
+				return null;
+
+			push(out, t);
+		}
+	}
+
+	return 'AT+GTACT=' + join(',', out);
+};
+
+// +GTACT is Fibocom-wide, but the band write is verified only on the T700
+// parts; keep the guard to what was actually tested and let anything else
+// fall through to the backend's "unsupported" answer.
+function gtact_capable(modem)
+{
+	return modem?.at != null &&
+	       match(lc(sprintf('%s', modem?.info?.model ?? '')),
+	             /^(fm350|fm150)([ -].*)?$/) != null;
+};
+
+const GTACT_SETTABLE = [ 'lte_bands', 'nr5g_sa_bands', 'nr5g_nsa_bands', 'umts_bands' ];
+
+function gtact_get(modem, cb)
+{
+	if (!gtact_capable(modem))
+		return cb({ error: 'unsupported_on_backend' });
+
+	let answer = (st) => {
+		let caps = modem._gtact_caps;
+		let writable = GTACT_WRITABLE[sprintf('%d', st.rat)] != null;
+
+		cb(null, {
+			mode_preference: fm350_rat_mask(st.rat),
+			rat: st.rat, act1: st.act1, act2: st.act2,
+			umts_bands: st.umts_bands,
+			lte_bands: st.lte_bands,
+			// ONE NR list, surfaced through both wwand NR lists — the
+			// marker keeps a caller from assuming two independent ones
+			nr5g_sa_bands: st.nr_bands,
+			nr5g_nsa_bands: st.nr_bands,
+			nr_bands_shared: true,
+			// what a set may carry: band lists only, and none at all on a
+			// tuple rule 1 forbids — the editor renders exactly this
+			settable: writable ? GTACT_SETTABLE : [],
+			settable_note: writable ? null :
+				sprintf('band lists can be written only while the modem runs RAT tuple 4 (LTE/UMTS) or 20 (NR/WCDMA/LTE); this one runs %d', st.rat),
+			supported: caps ? { umts_bands: caps.umts, lte_bands: caps.lte, nr_bands: caps.nr } : null,
+			// kept by the daemon in uci, re-applied at bring-up (rule 3)
+			persistent: false,
+			gtact: st.raw,
+		});
+	};
+
+	modem.at.send('AT+GTACT?', (err, res) => {
+		if (err)
+			return cb({ error: 'at', detail: err });
+
+		let st = parse_gtact(res?.lines);
+
+		if (!st)
+			return cb({ error: 'invalid_response',
+			            detail: 'AT+GTACT? carried no parseable +GTACT line' });
+
+		// the module's band catalogue does not change while it runs: asked
+		// once, and a firmware without a usable =? simply has none
+		if (modem._gtact_caps_read || !modem.at)
+			return answer(st);
+
+		modem.at.send('AT+GTACT=?', (terr, tres) => {
+			modem._gtact_caps_read = true;
+			modem._gtact_caps = terr ? null : parse_gtact_test(tres?.lines);
+			answer(st);
+		}, { timeout: 10000 });
+	}, { timeout: 10000 });
+};
+
+// settings: any of GTACT_SETTABLE (an absent key leaves that RAT alone; an
+// EMPTY list means every band the module supports — the settings editor's
+// "nothing ticked = all bands"), plus a mode_preference only if it equals
+// the running tuple. cb(err) or cb(null, { applied, unchanged?, verified,
+// persistent: false, gtact }).
+function gtact_set(modem, settings, cb)
+{
+	if (!gtact_capable(modem))
+		return cb({ error: 'unsupported_on_backend' });
+
+	settings = { ...(settings ?? {}) };
+
+	// +GTACT has ONE NR list, so two distinct wwand NR lists cannot be
+	// represented; refuse rather than silently keep one of them.
+	if (type(settings.nr5g_sa_bands) == 'array' && type(settings.nr5g_nsa_bands) == 'array' &&
+	    !same_band_list(settings.nr5g_sa_bands, settings.nr5g_nsa_bands))
+		return cb({ error: 'invalid_setting', key: 'nr5g_bands',
+		            detail: 'Fibocom +GTACT exposes one shared NR band list' });
+
+	// The RAT tuple is the operator's, not ours (rule 2): a mode_preference
+	// that disagrees with what the modem runs is reported, not translated.
+	let want_mode = settings.mode_preference;
+	delete settings.mode_preference;
+
+	let want = {};
+
+	for (let key, val in settings) {
+		let g = (key == 'lte_bands') ? 'lte'
+		      : (key == 'nr5g_sa_bands' || key == 'nr5g_nsa_bands') ? 'nr'
+		      : (key == 'umts_bands') ? 'umts' : null;
+
+		if (g == null)
+			return cb({ error: 'invalid_setting', key: key,
+			            detail: 'Fibocom +GTACT supports band lists only; other NAS preferences stay backend-specific' });
+
+		if (type(val) != 'array')
+			return cb({ error: 'invalid_setting', key: key, detail: 'a band list is an array of 3GPP band numbers' });
+
+		want[g] = val;
+	}
+
+	if (!length(keys(want)))
+		return cb(null, { applied: [], unchanged: true, verified: true, persistent: false });
+
+	gtact_get(modem, (gerr, cur) => {
+		if (gerr)
+			return cb(gerr);
+
+		if (want_mode != null && want_mode != cur.mode_preference)
+			return cb({ error: 'invalid_setting', key: 'mode_preference',
+			            detail: '+GTACT writes preserve the modem RAT/preferred-RAT tuple',
+			            requested: want_mode, actual: cur.mode_preference });
+
+		let order = GTACT_WRITABLE[sprintf('%d', cur.rat)];
+
+		if (order == null)
+			return cb({ error: 'unsupported_tuple', rat: cur.rat, detail: cur.settable_note });
+
+		let now = { umts: cur.umts_bands, lte: cur.lte_bands, nr: cur.nr5g_sa_bands };
+		let caps = modem._gtact_caps;
+		let target = {};
+
+		for (let g in order) {
+			// requested → as given; requested empty → all supported; not
+			// requested → what the modem runs (a partial edit must not drop
+			// the other RATs' bands), or all supported if it runs none
+			let t = (want[g] != null && length(want[g])) ? want[g]
+			      : (want[g] == null && length(now[g] ?? [])) ? now[g]
+			      : caps?.[g];
+
+			if (!length(t ?? []))
+				return cb({ error: 'invalid_setting', key: g + '_bands',
+				            detail: 'the module did not name its supported bands (AT+GTACT=?), so "all bands" cannot be written' });
+
+			// a band the module does not list aborts the whole command
+			// (rule 1) — say which one instead of sending it
+			if (caps?.[g] != null)
+				for (let b in t)
+					if (index(map(caps[g], (n) => +n), +b) < 0)
+						return cb({ error: 'invalid_setting', key: g + '_bands', band: +b,
+						            detail: sprintf('band %s is not one this module supports', b) });
+
+			target[g] = t;
+		}
+
+		let changed = filter(order, (g) => want[g] != null && !same_band_list(target[g], now[g]));
+
+		// idempotency: never disturb the radio for a mask it already runs
+		if (!length(changed))
+			return cb(null, { applied: [], unchanged: true, verified: true,
+			                  persistent: false, gtact: cur.gtact });
+
+		// torn down while the read ran: the NCM teardown nulls modem.at
+		// without failing what was in flight (see context_ncm read_rdp_once)
+		if (!modem.at)
+			return cb({ error: 'modem_gone' });
+
+		let cmd = build_gtact(cur, target);
+
+		if (!cmd)
+			return cb({ error: 'invalid_setting',
+			            detail: 'band list cannot be encoded for this RAT tuple' });
+
+		// Deliberately no reset and no reconnect here: the manual says the
+		// write takes effect immediately, and on the tested module it costs
+		// exactly one re-registration. The bearer re-establishes itself and
+		// wwand's monitor re-adopts the session.
+		modem.at.send(cmd, (werr) => {
+			if (werr)
+				return cb({ error: 'at', detail: werr, command: cmd });
+
+			// verify — transport OK is not state change
+			gtact_get(modem, (verr, live) => {
+				if (verr)
+					return cb({ error: 'verify_read', detail: verr, command: cmd });
+
+				let got = { umts: live.umts_bands, lte: live.lte_bands, nr: live.nr5g_sa_bands };
+
+				for (let g in order)
+					if (!same_band_list(target[g], got[g]))
+						return cb({ error: 'verify_failed', command: cmd, group: g,
+						            expected: target[g], actual: got[g], gtact: live.gtact });
+
+				cb(null, { applied: changed, verified: true, persistent: false,
+				           gtact: live.gtact });
+			});
+		}, { timeout: 10000 });
+	});
+};
+
 // Per-manufacturer AT recipe. Recipes with concrete commands are ported from
 // OpenWrt's /etc/gcom/ncm.json (the reference NCM implementation) and are
 // authoritative; the ones marked "best-effort" come from vendor docs and want a
@@ -627,414 +1078,11 @@ const DIAL_ICMAUTOCONN = {
 //                                generic AT+CGCONTRDP read)
 //   dials:                    ordered dial methods to resolve (probed at bring-up)
 //   stats / parse_stats(lines)  -> { tx_bytes, rx_bytes } (or null)
-// --- Fibocom +GTACT: RAT and BAND selection ---------------------------------
-// +GTACT is the only band control on the Fibocom T700/Qualcomm families
-// (FM350-GL, FM150), so it is what a `band_lte` / `band_nr` option has to
-// speak on an AT/NCM modem. It is also the most parser-sensitive command in
-// the whole AT surface, and the three rules below were each established by
-// experiment on an FM350-GL, firmware 81600.0000.00.19.11.17 (2026-09-26) —
-// the AT manual (V2.10 §11.1.14) documents the parameters but not the parser:
-//
-//   read:  AT+GTACT?  ->  +GTACT: <rat>,<act1>,<act2>,<band>...
-//   test:  AT+GTACT=?  ->  +GTACT: (rat...),(act1...),(act2...),(gsm...),
-//                               (umts...),(lte...),(cdma...),(evdo...),(nr...)
-//
-// 1. THE BAND LIST IS POSITIONAL PER RAT GROUP, IN A FIXED ORDER. The groups
-//    after the ACT triple are read as umts, lte, cdm, evdo, nr — the order
-//    the =? test answers them in — and a token that is not legal for the
-//    group currently being read aborts the ENTIRE command. So a NR/LTE tuple
-//    (17) carrying `101,103,...,503,...` answers ERROR: with no UMTS group in
-//    front, the parser reads 101 as a UMTS band, and 101 is not a UMTS band.
-//    Every command the tested firmware accepted carried the UMTS group
-//    first, including the single-band `AT+GTACT=4,3,3,1,2,4,5,8,103` a field
-//    deployment uses for a B3 lock (rooter 24.10, create_hostless.sh).
-//    Which groups a tuple needs is `GTACT_GROUPS` below.
-//
-// 2. THE ACT TRIPLE IS NOT FREE-FORM. A write that omits or contradicts it
-//    is refused, while the RAT-only write `AT+GTACT=<rat>,<act1>,<act2>` and
-//    a trailing `0` ("automatic bands for this RAT") are accepted. So the
-//    tuple is PRESERVED here, never synthesised: this codec reads it and
-//    writes back exactly what the modem had.
-//
-// 3. THE WRITE IS NOT NV. The manual's attribute table says Persistent: No /
-//    Effect Immediately: Yes, and field observation agrees — the mask reverts
-//    across a modem power-cycle even when the write returned OK. Hence the
-//    re-assert at bring-up in modem_ncm.uc.
-//
-// TRANSPORT SUCCESS IS NOT STATE CHANGE, so every write is verified with a
-// read-back before it is reported applied. Applying a mask costs a
-// re-registration (~20-30 s measured), so an `unchanged` verdict must never
-// reach the radio at all.
-const GTACT_GROUPS = {
-	'1': [ 'umts' ],               // UMTS
-	'2': [ 'lte' ],                // LTE
-	'4': [ 'umts', 'lte' ],        // LTE/UMTS
-	'10': [ 'umts', 'lte', 'nr' ], // automatic — every RAT the module knows
-	'14': [ 'nr' ],                // NR-RAN
-	'16': [ 'umts', 'nr' ],        // NR-RAN/WCDMA
-	'17': [ 'lte', 'nr' ],         // NR-RAN/LTE
-	'20': [ 'umts', 'lte', 'nr' ], // NR-RAN/WCDMA/LTE
-};
-
-function gtact_number(v)
-{
-	let n = +trim(sprintf('%s', v ?? ''));
-
-	return (n == int(n)) ? n : null;
-}
-
-// A band token's RAT group and its 3GPP band number. The encodings are the
-// manual's: UMTS directly, LTE as 100+band, NR as 500+band for n1..n9 and
-// 5000+band above (50512 is the last one it names). Anything outside them is
-// not a band this codec will write — GSM/CDMA/EVDO have no token here at all,
-// their =? groups answer ().
-function gtact_classify(n)
-{
-	if (n == null || n <= 0)
-		return null;
-
-	if (n >= 1 && n <= 10)
-		return { rat: 'umts', band: n };
-	if (n >= 101 && n <= 171)
-		return { rat: 'lte', band: n - 100 };
-	if (n >= 501 && n <= 509)
-		return { rat: 'nr', band: n - 500 };
-	if (n >= 5010 && n <= 5099)
-		return { rat: 'nr', band: n - 5000 };
-	if (n >= 50100 && n <= 50512)
-		return { rat: 'nr', band: n - 50000 };
-
-	return null;
-};
-
-function gtact_token_umts(b)
-{
-	let n = +b;
-
-	return (n == int(n) && n >= 1 && n <= 10) ? sprintf('%d', n) : null;
-};
-
-function gtact_token_lte(b)
-{
-	let n = +b;
-
-	return (n == int(n) && n >= 1 && n <= 71) ? sprintf('%d', 100 + n) : null;
-};
-
-// The manual documents several decimal widths for NR; the module's own
-// read-back uses the compact 500+band form for n1..n9 and 5000+band above,
-// so that is what is written — anything else risks a value the parser
-// rejects (or, worse, one it reads as a different band).
-function gtact_token_nr(b)
-{
-	let n = +b;
-
-	// n512 is the last band the manual names (50512 in the 50000+band form),
-	// and the ceiling this codec's own parser reads back — anything above it
-	// has NO encoding, so it must be refused rather than wrapped into a token
-	// the modem would reject (or, worse, read as a different band).
-	if (n != int(n) || n < 1 || n > 512)
-		return null;
-
-	if (n <= 9)
-		return sprintf('%d', 500 + n);
-	if (n <= 99)
-		return sprintf('%d', 5000 + n);
-
-	return sprintf('%d', 50000 + n);
-};
-
-// Order-insensitive multiset compare: the modem answers its bands in its own
-// order, which need not match the order they were configured in.
-function same_band_list(a, b)
-{
-	let x = a ?? [], y = b ?? [];
-
-	if (length(x) != length(y))
-		return false;
-
-	let have = {};
-
-	for (let n in x) {
-		let k = sprintf('%d', +n);
-		have[k] = (have[k] ?? 0) + 1;
-	}
-
-	for (let n in y) {
-		let k = sprintf('%d', +n);
-
-		if ((have[k] ?? 0) <= 0)
-			return false;
-
-		have[k]--;
-	}
-
-	return true;
-};
-
-// QMI MODE_BITS equivalent for the tuples the manual names, so the settings
-// editor — which thinks in mode_preference — can show the current RAT choice.
-// Read-only metadata: a write preserves the modem's tuple rather than
-// translating a QMI bitmask into one.
-function fm350_rat_mask(rat)
-{
-	switch (+rat) {
-	case 2:  return 1 << 4;                          // LTE
-	case 4:  return (1 << 4) | (1 << 3);             // LTE/UMTS
-	case 14: return 1 << 6;                          // NR
-	case 16: return (1 << 6) | (1 << 3);             // NR/WCDMA
-	case 17: return (1 << 6) | (1 << 4);             // NR/LTE
-	case 20: return (1 << 6) | (1 << 3) | (1 << 4);  // NR/WCDMA/LTE
-	default: return null;
-	}
-}
-
-export function parse_gtact(lines)
-{
-	for (let line in (lines ?? [])) {
-		let m = match(trim(line), /^\+GTACT:\s*(.*)$/i);
-
-		if (!m)
-			continue;
-
-		// NOT map(…, trim) and NOT join(array, sep): a bare builtin as a map
-		// callback does not receive the value (ucode passes the INDEX as its
-		// second argument, so every field read as null), and the join()
-		// signature is join(<sep>, <array>). Both mistakes are silent — they
-		// yield a command string of "null" rather than an error.
-		let f = map(split(replace(m[1], /"/g, ''), ','), (v) => trim(v));
-
-		if (length(f) < 3)
-			return null;
-
-		let rat = gtact_number(f[0]);
-		let act1 = gtact_number(f[1]);
-		let act2 = gtact_number(f[2]);
-
-		if (rat == null || act1 == null || act2 == null)
-			return null;
-
-		let umts = [], lte = [], nr = [];
-
-		for (let i = 3; i < length(f); i++) {
-			let c = gtact_classify(gtact_number(f[i]));
-
-			if (c == null)
-				continue;
-
-			if (c.rat == 'umts')
-				push(umts, c.band);
-			else if (c.rat == 'lte')
-				push(lte, c.band);
-			else
-				push(nr, c.band);
-		}
-
-		return {
-			rat: rat, act1: act1, act2: act2,
-			umts_bands: umts, lte_bands: lte, nr_bands: nr,
-			raw: join(',', f),
-		};
-	}
-
-	return null;
-};
-
-// Build the write for `state`'s RAT tuple. `bands` names the groups to
-// APPLY ({ umts, lte, nr }); every group the caller does not name is taken
-// from `state`, i.e. from what the modem currently runs. That is deliberate
-// on two counts: a partial edit must not silently drop the other RATs'
-// bands, and per rule 1 a group the parser expects but does not get makes
-// the whole command invalid.
-export function build_gtact(state, bands)
-{
-	if (!state || state.rat == null)
-		return null;
-
-	let groups = GTACT_GROUPS[sprintf('%d', state.rat)];
-
-	if (groups == null)
-		return null;
-
-	let out = [ sprintf('%d', state.rat) ];
-
-	if (state.act1 != null)
-		push(out, sprintf('%d', state.act1));
-	if (state.act2 != null)
-		push(out, sprintf('%d', state.act2));
-
-	for (let g in groups) {
-		// length(), not `??`: an EMPTY list is the documented "leave this
-		// RAT alone" (that is what an unset config option parses to), and
-		// `??` would treat [] as a request to clear the group to automatic.
-		let want = bands?.[g];
-		let toks = [];
-
-		if (want == null || !length(want))
-			want = state[g + '_bands'] ?? [];
-
-		for (let b in (want ?? [])) {
-			let t = (g == 'umts') ? gtact_token_umts(b)
-			      : (g == 'lte') ? gtact_token_lte(b)
-			      : gtact_token_nr(b);
-
-			// An unrepresentable band would shift every group after it —
-			// refuse the whole command rather than write a mask nobody asked
-			// for. (Verified on hardware: the write is the only evidence.)
-			if (t == null)
-				return null;
-
-			push(toks, t);
-		}
-
-		// An empty group still occupies its position, or the groups after it
-		// are read as its members (rule 1). '0' is the manual's "automatic
-		// band selection for the <rat>"; the firmware only exercises the
-		// case where the group is non-empty, and a refusal there is caught
-		// by the read-back verify rather than acted on.
-		push(out, length(toks) ? join(',', toks) : '0');
-	}
-
-	return 'AT+GTACT=' + join(',', out);
-};
-
-// +GTACT is Fibocom-wide, but the band write is verified only on the T700
-// parts; keep the guard to what was actually tested and let anything else
-// fall through to the backend's "unsupported" answer.
-function gtact_capable(modem)
-{
-	return match(lc(sprintf('%s', modem?.info?.model ?? '')),
-	             /^(fm350|fm150)([ -].*)?$/) != null && modem.at != null;
-};
-
-function gtact_get(modem, cb)
-{
-	if (!gtact_capable(modem))
-		return cb({ error: 'unsupported_on_backend' });
-
-	modem.at.send('AT+GTACT?', (err, res) => {
-		if (err)
-			return cb({ error: 'at', detail: err });
-
-		let st = parse_gtact(res?.lines);
-
-		if (!st)
-			return cb({ error: 'invalid_response',
-			            detail: 'AT+GTACT? carried no parseable +GTACT line' });
-
-		cb(null, {
-			mode_preference: fm350_rat_mask(st.rat),
-			rat: st.rat, act1: st.act1, act2: st.act2,
-			umts_bands: st.umts_bands,
-			lte_bands: st.lte_bands,
-			// ONE NR list, surfaced through both wwand NR lists — the
-			// marker keeps a caller from assuming two independent ones
-			nr5g_sa_bands: st.nr_bands,
-			nr5g_nsa_bands: st.nr_bands,
-			nr_bands_shared: true,
-			gtact: st.raw,
-		});
-	}, { timeout: 10000 });
-};
-
-function gtact_set(modem, settings, cb)
-{
-	if (!gtact_capable(modem))
-		return cb({ error: 'unsupported_on_backend' });
-
-	settings = { ...(settings ?? {}) };
-
-	// +GTACT has ONE NR list, so two distinct wwand NR lists cannot be
-	// represented; refuse rather than silently keep one of them.
-	let has_sa = type(settings.nr5g_sa_bands) == 'array';
-	let has_nsa = type(settings.nr5g_nsa_bands) == 'array';
-
-	if (has_sa && has_nsa && !same_band_list(settings.nr5g_sa_bands,
-	                                        settings.nr5g_nsa_bands))
-		return cb({ error: 'invalid_setting', key: 'nr5g_bands',
-		            detail: 'Fibocom +GTACT exposes one shared NR band list' });
-
-	// The RAT tuple is the operator's, not ours (rule 2): a mode_preference
-	// that disagrees with what the modem runs is reported, not translated.
-	let want_mode = settings.mode_preference;
-	delete settings.mode_preference;
-
-	let want = {};
-
-	for (let key, val in settings) {
-		if (key == 'lte_bands')
-			want.lte = val;
-		else if (key == 'nr5g_sa_bands' || key == 'nr5g_nsa_bands')
-			want.nr = val;
-		else if (key == 'umts_bands')
-			want.umts = val;
-		else
-			return cb({ error: 'invalid_setting', key: key,
-			            detail: 'Fibocom +GTACT supports band lists only; other NAS preferences stay backend-specific' });
-	}
-
-	if (!length(keys(want)))
-		return cb(null, { applied: [], unchanged: true, verified: true });
-
-	gtact_get(modem, (gerr, cur) => {
-		if (gerr)
-			return cb(gerr);
-
-		if (want_mode != null && want_mode != cur.mode_preference)
-			return cb({ error: 'invalid_setting', key: 'mode_preference',
-			            detail: '+GTACT writes preserve the modem RAT/preferred-RAT tuple',
-			            requested: want_mode, actual: cur.mode_preference });
-
-		// idempotency: never disturb the radio for a mask it already runs
-		let changed = [];
-
-		for (let g in [ 'umts', 'lte', 'nr' ])
-			if (length(want[g] ?? []) && !same_band_list(want[g], cur[g + '_bands']))
-				push(changed, g);
-
-		if (!length(changed))
-			return cb(null, { applied: [], unchanged: true, verified: true,
-			                  gtact: cur.gtact });
-
-		let cmd = build_gtact({ rat: cur.rat, act1: cur.act1, act2: cur.act2,
-		                        umts_bands: cur.umts_bands,
-		                        lte_bands: cur.lte_bands,
-		                        nr_bands: cur.nr_bands }, want);
-
-		if (!cmd)
-			return cb({ error: 'invalid_setting',
-			            detail: 'band list cannot be encoded for this RAT tuple' });
-
-		// Deliberately no reset and no reconnect here: the manual says the
-		// write takes effect immediately, and on the tested module it costs
-		// exactly one re-registration. The bearer re-establishes itself and
-		// wwand's monitor re-adopts the session. A modem_reset stays a
-		// separate admin action for firmwares that need one.
-		modem.at.send(cmd, (werr) => {
-			if (werr)
-				return cb({ error: 'at', detail: werr, command: cmd });
-
-			// verify — transport OK is not state change
-			gtact_get(modem, (verr, live) => {
-				if (verr)
-					return cb({ error: 'verify_read', detail: verr, command: cmd });
-
-				for (let g in changed)
-					if (!same_band_list(want[g], live[g + '_bands']))
-						return cb({ error: 'verify_failed', command: cmd,
-						            group: g,
-						            expected: want[g],
-						            actual: live[g + '_bands'],
-						            gtact: live.gtact });
-
-				cb(null, { applied: changed, verified: true, gtact: live.gtact,
-				           umts_bands: live.umts_bands,
-				           lte_bands: live.lte_bands,
-				           nr_bands: live.nr_bands });
-			}, { timeout: 10000 });
-		}, { timeout: 10000 });
-	});
-};
+//   settings_capable(modem)  -> true when settings_get/_set can drive THIS
+//                               model (the codec's own tested-model guard)
+//   settings_get(modem, cb) / settings_set(modem, settings, cb)
+//                            -> the vendor's radio/band command, in the NAS
+//                               settings shape (see the +GTACT codec above)
 
 export const VENDORS = {
 	// Quectel: QICSGP carries apn+user+pass+auth. Prefer QNETDEVCTL, fall back
@@ -1443,6 +1491,7 @@ export const VENDORS = {
 		esims_probes: [ 'AT+SIMTYPE?', 'AT+ESLOTSINFO?', 'AT+EID' ],
 		// +GTACT is the only band control on this family, and the codec
 		// owns the parser's positional rules — see the +GTACT section above.
+		settings_capable: gtact_capable,
 		settings_get: gtact_get,
 		settings_set: gtact_set,
 		auth_cmds: (cid, ctxtype, apn, cfg) => {

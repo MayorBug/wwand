@@ -24,6 +24,7 @@ row. That is the whole maintenance rule.
 | Which mux channel is really used (`auto` resolved)? | `config.uc effective_mux_id` |
 | Which `wwand_sim` section matches the card in the slot? | `modem_common.uc match_sim_override` |
 | What does a `proto qmi/mbim/ncm` interface become when migrated? | `config.uc migrate_plan` |
+| Which band list does the modem run, and why did a `band_lte` do nothing? | QMI/MBIM keep bands in modem NV (`netsel_ops.uc install`, `modem_set_settings`); only a Fibocom FM350/FM150 applies `band_*`, through `ncm_vendors.uc gtact_set` at bring-up (`modem_ncm.uc apply_config_bands`) and live on reload (`daemon.uc apply_config`). A list nothing applies, or one that failed, is the `band_lists` warning from `daemon.uc band_warnings`. |
 
 ## The connection, from decision to netifd
 
@@ -35,7 +36,7 @@ row. That is the whole maintenance rule.
 | What exactly is netifd told — addresses, routes, DNS, MTU? | `files/wwand-proto.sh _wwand_apply_settings` |
 | Why does my interface have a default route with no gateway? | `files/wwand-proto.sh _wwand_apply_settings` — it branches on `IFF_NOARP`: a point-to-point link gets a device route, an ARP-resolving one a host route plus a via-default. Setup and renew both go through it. |
 | Where does the dhcpv6 `<parent>_6` subinterface come from, and who switches it off? | `deps.uc ensure_wan6` / `deps.uc retire_wan6` — both dispatched from the connected handler in `daemon.uc`, on complementary `effective_pdp` conditions. |
-| Which code writes `/etc/config/network` on its own, and what does it leave alone? | `deps.uc autosetup_create` / `deps.uc autosetup_fill` (the first modem on an empty box), `deps.uc ensure_wan6`, and `deps.uc sim_upsert` (a plugin's `wwsim_<iccid>` section, never a user's `wwand_sim`). |
+| Which code writes `/etc/config/network` on its own, and what does it leave alone? | `deps.uc autosetup_create` / `deps.uc autosetup_fill` (the first modem on an empty box), `deps.uc ensure_wan6`, `deps.uc sim_upsert` (a plugin's `wwsim_<iccid>` section, never a user's `wwand_sim`), and `deps.uc record_bands` (a settings-editor band edit on a modem that does not keep it, `daemon.uc persist_bands`). |
 
 ## Telemetry, signal and cells
 

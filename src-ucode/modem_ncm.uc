@@ -433,9 +433,9 @@ export function create(opts)
 	// Radio SETTINGS through the vendor's own command, for the AT families
 	// that have one (Fibocom +GTACT). Deliberately thin: the codec in
 	// ncm_vendors owns the command, its parser's rules and the read-back
-	// verify, and reports `unsupported_on_backend` when the modem has no
-	// such command — which is what netsel_ops checks before falling back
-	// to the NAS path. A backend without either answers unsupported.
+	// verify. An NCM modem has no NAS to fall back to, so a vendor without
+	// such a command answers `unsupported_on_backend` — what the settings
+	// editor already showed for every NCM modem.
 	self.settings_get = function(cb) {
 		if (!self.vendor?.settings_get)
 			return cb({ error: 'unsupported_on_backend' });
@@ -448,6 +448,51 @@ export function create(opts)
 			return cb({ error: 'unsupported_on_backend' });
 
 		self.vendor.settings_set(self, settings, cb);
+	};
+
+	// Whether this modem applies `band_lte` / `band_nr` / `band_umts` at all —
+	// the daemon warns about a configured list that nothing would apply.
+	self.bands_applicable = () => !!self.vendor?.settings_capable?.(self);
+
+	// Apply the configured band lists (config wwand_modem). An unset list
+	// leaves that RAT alone, so nothing configured is no write at all.
+	// cb(err, res) always; errors are logged here, never fatal to bring-up.
+	self.apply_config_bands = function(cb) {
+		let c = self.config ?? {};
+		let want = {};
+
+		if (length(c.band_lte ?? []))
+			want.lte_bands = c.band_lte;
+		if (length(c.band_nr ?? [])) {
+			want.nr5g_sa_bands = c.band_nr;
+			want.nr5g_nsa_bands = c.band_nr;
+		}
+		if (length(c.band_umts ?? []))
+			want.umts_bands = c.band_umts;
+
+		self.band_apply_error = null;
+
+		if (!length(keys(want)))
+			return cb(null, { applied: [], unchanged: true });
+
+		if (!self.bands_applicable()) {
+			log('warn', sprintf('configured band lists not applied: no band command wwand drives on %s',
+				self.info?.model ?? 'this modem'));
+			return cb({ error: 'unsupported_on_backend' });
+		}
+
+		self.settings_set(want, (err, res) => {
+			// kept for status (daemon band_warnings): a refused tuple or
+			// an unsupported band is otherwise only in the log
+			self.band_apply_error = err;
+
+			if (err)
+				log('warn', sprintf('configured band lists not applied (%J)', err));
+			else if (!res?.unchanged)
+				log('notice', sprintf('configured band lists applied (%s)', join(', ', res.applied ?? [])));
+
+			cb(err, res);
+		});
 	};
 
 	// attach PDP context config: the first attached context (interface-bound
@@ -918,39 +963,6 @@ export function create(opts)
 									ep_next();
 								}
 
-								// Re-assert a configured band mask, once per bring-up.
-								// Fibocom +GTACT is documented Persistent: No and
-								// was field-observed to lose its mask across a power
-								// cycle even when the write returned OK, so the
-								// modem NV is not a place to trust here: wwand
-								// re-applies the configured lists itself. Fire and
-								// forget, like the fcc/eSIM probes above, and a
-								// no-op for a vendor with no settings_set or a
-								// modem with no band list configured.
-								//
-								// Placed BEFORE registration on purpose: the write
-								// costs one re-registration, and doing it first
-								// means that cost is paid once, on the way up,
-								// rather than on a live bearer.
-								if (self.vendor?.settings_set &&
-								    (length(self.config?.band_lte ?? []) ||
-								     length(self.config?.band_nr ?? []) ||
-								     length(self.config?.band_umts ?? []))) {
-								self.settings_set({
-									lte_bands: self.config.band_lte ?? [],
-									nr5g_sa_bands: self.config.band_nr ?? [],
-									nr5g_nsa_bands: self.config.band_nr ?? [],
-									umts_bands: self.config.band_umts ?? [],
-								}, (serr, sres) => {
-									if (serr)
-										log('warn', sprintf('modem %s: configured band mask not applied (%J)',
-											self.info.model ?? '?', serr));
-									else if (!sres?.unchanged)
-										log('notice', sprintf('modem %s: configured band mask applied (%s)',
-											self.info.model ?? '?', join(', ', sres.applied ?? [])));
-								});
-							}
-
 								// per-SIM override (config wwand_sim) — parity
 								// with the QMI backend; consumed via conn_cfg
 								self.active_sim = modem_common.match_sim_override(
@@ -963,7 +975,18 @@ export function create(opts)
 								if (!modem_common.check_identity(self, { emit: emit, log: log }))
 									return;
 
-								step_resolve_dial();
+								// The configured band lists, AWAITED before the dial:
+								// the write costs one re-registration, and paid here
+								// it lands before registration is waited for instead
+								// of on a bearer that was just brought up. Not NV on
+								// +GTACT (ncm_vendors, rule 3), hence every bring-up;
+								// a mask the modem already runs is not written.
+								self.apply_config_bands(() => {
+									if (!self.at)
+										return;   // torn down while the band write ran
+
+									step_resolve_dial();
+								});
 							};
 						});
 					});
@@ -1037,7 +1060,7 @@ export function create(opts)
 		// down and re-enumerates it, so `self.at` can be null by the time the
 		// call lands. Reading `.send` off it throws inside a uloop callback,
 		// which does not fail the call: it takes the daemon with it. Field-seen
-		// at modem_ncm.uc:854, and only with `sim_slot` configured — that is
+		// at modem_ncm.uc:899, and only with `sim_slot` configured — that is
 		// what makes step_simslot walk the second pass at all
 		// (ddimension/wwand#32).
 		if (!self.at)

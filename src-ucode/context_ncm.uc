@@ -359,7 +359,7 @@ export function create(opts)
 	// than asking the question again.
 	let read_rdp_once = (cb) => {
 		// THE VENDOR BRANCH NEEDS THE SAME GUARD. It dereferences modem.at
-		// itself (ncm_vendors.uc:879, :1116 and friends) instead of going
+		// itself (ncm_vendors.uc:1331, :1573 and friends) instead of going
 		// through at_send, and the NCM teardown nulls modem.at without
 		// notifying the contexts — so an ACTIVATING context whose retry fires a
 		// second later used to call `.send` on null. A throw inside a uloop

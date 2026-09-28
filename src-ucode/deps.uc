@@ -208,6 +208,30 @@ export function create(o)
 			logmod.log('notice', 'modem %s: switched to %s — cleared the stale `option protocol %s` (a pin the driver contradicts disarms hardware recovery)',
 				section, target, pin);
 		},
+		// A band edit the modem does not keep (daemon persist_bands): the lists
+		// go onto its wwand_modem section, an empty one removes the option.
+		// commit() only — the reload that may follow applies nothing, the
+		// daemon has already updated its running config. false = no such
+		// section (a compat_* modem synthesized from a legacy interface).
+		record_bands: (section, lists) => {
+			let cursor = o.cursor();
+
+			if (cursor.get('network', section) != 'wwand_modem')
+				return false;
+
+			for (let k, v in lists) {
+				if (length(v))
+					cursor.set('network', section, k, v);
+				else
+					cursor.delete('network', section, k);
+			}
+
+			cursor.commit('network');
+			logmod.log('notice', 'modem %s: band lists kept in uci (%s) — the modem does not store them itself',
+				section, join(', ', map(keys(lists), (k) => sprintf('%s=%s', k,
+					length(lists[k]) ? join(' ', lists[k]) : 'all'))));
+			return true;
+		},
 		// learn-back: record the resolved l3 device name on the interface as
 		// `option device` (one stable handle for VRF/firewall/LuCI). Idempotent;
 		// NEVER overwrites a user value. commit() only (no netifd reload → no bounce).

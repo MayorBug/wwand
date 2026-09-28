@@ -2786,6 +2786,72 @@ push(scenarios, {
 	},
 });
 
+// s9x..s9z: configured band lists on an FM350-GL (+GTACT). The read-back and
+// =? answers are the ones captured on that module (ddimension/wwand#43).
+const GTACT_LIVE = '+GTACT: 20,6,3,1,2,4,5,8,101,103,107,120,128,503,507,5020,5028,5078';
+const GTACT_CAPS = '+GTACT: (1,2,4,10,14,16,17,20),(2,3,6),(2,3,6),(),(1,2,4,5,8),' +
+	'(101,103,107,108,120,128),(),(),(501,503,507,508,5020,5028,5078)';
+const GTACT_B3 = 'AT+GTACT=20,6,3,1,2,4,5,8,103,503,507,5020,5028,5078';
+
+push(scenarios, {
+	name: 's9x_fibocom_band_lists_before_dial',
+	script: fscript([
+		{ re: /^AT\+GTACT\?$/, after: GTACT_B3, lines: [ '+GTACT: 20,6,3,1,2,4,5,8,103,503,507,5020,5028,5078' ] },
+		{ re: /^AT\+GTACT\?$/, lines: [ GTACT_LIVE ] },
+		{ re: /^AT\+GTACT=\?$/, lines: [ GTACT_CAPS ] },
+		{ re: /^AT\+GTACT=20,/, lines: [] },
+	]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4v6' },
+	mconfig: { apn: 'internet', band_lte: [ '3' ] },
+	run: (env) => {
+		let m = env.modem;
+
+		ok(m.state == 'READY', 's9x: modem READY');
+		eq(env.tr.saw(/^AT\+GTACT=[0-9]/), GTACT_B3,
+			's9x: the write keeps the UMTS group in front and the NR bands, LTE narrowed to B3');
+		ok(env.tr.at_pos(/^AT\+GTACT=[0-9]/) < env.tr.at_pos(/^AT\+GTRNDIS=\?$/),
+			's9x: the band write is done before the dial is resolved');
+		eq(env.tr.count(/^AT\+GTACT\?$/), 2, 's9x: read, write, read back');
+		eq(m.band_apply_error, null, 's9x: no band error to report');
+		env.finish();
+	},
+});
+
+push(scenarios, {
+	name: 's9y_fibocom_band_lists_already_running',
+	script: fscript([
+		{ re: /^AT\+GTACT\?$/, lines: [ GTACT_LIVE ] },
+		{ re: /^AT\+GTACT=\?$/, lines: [ GTACT_CAPS ] },
+	]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4v6' },
+	mconfig: { apn: 'internet', band_lte: [ '28', '20', '1', '3', '7' ] },
+	run: (env) => {
+		ok(env.modem.state == 'READY', 's9y: modem READY');
+		eq(env.tr.saw(/^AT\+GTACT=[0-9]/), null,
+			's9y: a mask the modem already runs is not written (order does not matter)');
+		env.finish();
+	},
+});
+
+push(scenarios, {
+	name: 's9z_fibocom_band_lists_on_a_refused_tuple',
+	script: fscript([
+		// the NR/LTE tuple: its own read-back, re-sent, is refused on HW
+		{ re: /^AT\+GTACT\?$/, lines: [ '+GTACT: 17,3,6,101,103,107,120,128,503,507,5020,5028,5078' ] },
+		{ re: /^AT\+GTACT=\?$/, lines: [ GTACT_CAPS ] },
+	]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4v6' },
+	mconfig: { apn: 'internet', band_lte: [ '3' ] },
+	run: (env) => {
+		let m = env.modem;
+
+		ok(m.state == 'READY', 's9z: a band list that cannot be written does not stop the bring-up');
+		eq(env.tr.saw(/^AT\+GTACT=[0-9]/), null, 's9z: nothing is sent for tuple 17');
+		eq(m.band_apply_error?.error, 'unsupported_tuple', 's9z: the reason is kept for status');
+		env.finish();
+	},
+});
+
 // s9o: the same option on a modem with NO vendor slots recipe keeps the
 // warning (the identify-time gate) — the active slot stays untouched
 push(scenarios, {

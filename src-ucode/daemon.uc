@@ -104,6 +104,44 @@ let load_ncm = lazy_backend('wwand.ncm_lazy', loaded_note('ncm'));
 // optional eSIM module (wwand-esim); absent => feature reports esim_not_installed
 let load_esim = lazy_backend('wwand.esim', loaded_note('esim'));
 
+// The per-modem band allow-lists (config wwand_modem). Applied live and kept
+// out of the restart signature — see apply_config.
+const BAND_OPTS = [ 'band_lte', 'band_nr', 'band_umts' ];
+
+function band_sig(cfg)
+{
+	return sprintf('%J', map(BAND_OPTS, (k) => cfg?.[k] ?? []));
+}
+
+// status' config_warnings, plus the two ways a configured band list can be
+// dead: the modem has no band command wwand drives (a QMI/MBIM modem keeps
+// its bands in its own NV, set through the settings editor), or the last
+// apply failed. Said here because nothing else would — an ignored band
+// list looks exactly like one the network happens to agree with.
+function band_warnings(entry)
+{
+	let w = entry?.modem?.config_warnings;
+	let m = entry?.modem;
+	let configured = length(filter(BAND_OPTS, (k) => length(entry?.cfg?.[k] ?? [])));
+
+	if (!configured || m?.info?.model == null)
+		return w;
+
+	let note = null;
+
+	if (!m.bands_applicable?.())
+		note = 'band_lte/band_nr/band_umts are applied only where the band command does not persist (Fibocom FM350/FM150, +GTACT); this modem keeps its bands itself — set them in Modem Tools';
+	else if (m.band_apply_error)
+		note = sprintf('configured band lists not applied: %s',
+			m.band_apply_error.detail ?? m.band_apply_error.error ?? '?');
+
+	if (!note)
+		return w;
+
+	return [ ...(w ?? []), { check: 'band_lists', severity: 'warn', message: note,
+	                          expected: null, actual: null } ];
+}
+
 // QMI UIM Remote (UIMRMT, service 0x32): what a modem needs to run on a card
 // that is not in its slot (wwand-rsim) — libqmi 1.38.0 qmi-enums.h
 // QMI_SERVICE_UIMRMT = 0x32.
@@ -397,7 +435,7 @@ export function create(opts)
 	// KEYED BY INTERFACE, NOT CARRIED ON THE ENTRY. The marker is evidence
 	// about an interface, and the context entry lives SHORTER than the
 	// interface. A config reload that cannot resolve an interface's modem
-	// produces no entry for it at all (config.uc:881-884 warns "references
+	// produces no entry for it at all (config.uc:880-883 warns "references
 	// unknown modem" and skips it), so a marker on the entry would have nothing
 	// to be carried over from. Re-adding the modem would then build a fresh
 	// entry with no marker, the status poll would see netifd's cleared
@@ -3069,11 +3107,18 @@ export function create(opts)
 		// the running modem and re-matches its card against it; a modem held
 		// at SIM_BLOCKED is still restarted (step 1), because the override may
 		// carry the PIN it is waiting for and only the SIM step tries one.
+		// ...and its band lists (BAND_OPTS): the band command changes them in
+		// place for the cost of one re-registration, so a restart would drop
+		// the connections for nothing — and the settings editor writes them to
+		// uci on every band edit of a modem that does not keep them itself.
 		let modem_sig = (mn) => {
 			let cfg = { ...(parsed.modems[mn] ?? {}) };
 
 			delete cfg.ext;
 			delete cfg.sims;
+
+			for (let k in BAND_OPTS)
+				delete cfg[k];
 
 			return sprintf('%J', { cfg: cfg, mux: mux_by_modem[mn], l3: l3_by_modem[mn] });
 		};
@@ -3151,6 +3196,25 @@ export function create(opts)
 						log('info', sprintf('modem %s: SIM overrides changed — none for the card in use', mn));
 				}
 			}
+		}
+
+		// the band lists, live — applied by the running modem (left out of
+		// the signature above). A modem started by this reload already has
+		// them in its cfg, so only an edit to a running one gets here.
+		for (let mn in keys(self.modems)) {
+			let e = self.modems[mn];
+
+			if (!e.cfg || !parsed.modems[mn] || band_sig(e.cfg) == band_sig(parsed.modems[mn]))
+				continue;
+
+			for (let k in BAND_OPTS) {
+				e.cfg[k] = parsed.modems[mn][k];
+
+				if (e.modem?.config)
+					e.modem.config[k] = parsed.modems[mn][k];
+			}
+
+			e.modem?.apply_config_bands?.(() => null);
 		}
 
 		for (let cn in keys(self.contexts))
@@ -3966,7 +4030,7 @@ export function create(opts)
 				// summary { rats, iot_modes, ntn }
 				rat: entry.modem?.rat_label,
 				caps: entry.modem?.caps,
-				config_warnings: entry.modem?.config_warnings,
+				config_warnings: band_warnings(entry),
 				// FCC-lock probe (Fibocom GTFCCEFFSTATUS?): 0/1/2, null = not probed
 				fcc_lock: entry.modem?.fcc_lock,
 				// eSIM surface from the bring-up refresh (eUICC active only)
@@ -4140,8 +4204,50 @@ export function create(opts)
 		return { mcc: p.mcc ?? null, mnc: p.mnc ?? null, name: p.description ?? null };
 	};
 
+	// A band edit on a modem whose band command is not NV (settings result
+	// `persistent: false`, Fibocom +GTACT) is kept in the modem's uci section,
+	// where the bring-up re-applies it — the survival a QMI band edit gets
+	// from the modem itself. An EMPTY list ("all bands") removes the option,
+	// which is what leaves the RAT to the modem's own default after a power
+	// cycle. The in-memory config is updated too, so the reload that follows
+	// the commit sees nothing to apply.
+	let persist_bands = (name, settings) => {
+		let lists = {};
+		let as_list = (l) => map(l, (b) => sprintf('%d', +b));
+
+		if (type(settings?.lte_bands) == 'array')
+			lists.band_lte = as_list(settings.lte_bands);
+
+		let nr = settings?.nr5g_sa_bands ?? settings?.nr5g_nsa_bands;
+
+		if (type(nr) == 'array')
+			lists.band_nr = as_list(nr);
+
+		if (type(settings?.umts_bands) == 'array')
+			lists.band_umts = as_list(settings.umts_bands);
+
+		if (!length(keys(lists)))
+			return;
+
+		if (!deps.record_bands?.(name, lists)) {
+			log('warn', sprintf('modem %s: no wwand_modem section to keep the band lists in — the edit lasts until the modem power-cycles', name));
+			return;
+		}
+
+		let e = self.modems[name];
+
+		for (let k, v in lists) {
+			if (e?.cfg)
+				e.cfg[k] = v;
+
+			if (e?.modem?.config)
+				e.modem.config[k] = v;
+		}
+	};
+
 	// settings / network-selection / operator-scan ubus ops — in netsel_ops.uc
-	netsel_ops.install(self, { log: log, check_modem: check_modem, reg_plmn: reg_plmn });
+	netsel_ops.install(self, { log: log, check_modem: check_modem, reg_plmn: reg_plmn,
+	                           persist_bands: persist_bands });
 
 	// SIM/SMS/eSIM/APDU + hardware reset/repower ops live in their own modules
 	// (same install pattern); the daemon keeps lifecycle, config and status.

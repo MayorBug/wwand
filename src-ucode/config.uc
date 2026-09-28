@@ -318,6 +318,9 @@ const MODEM_KNOWN_OPTS = [ 'protocol', 'device', 'netdev', 'path', 'usb_path', '
 	// neither was listed here or copied below — so setting either produced an
 	// "unknown option" warning AND did nothing.
 	'at_over_mbim', 'at_mbim',
+	// band allow-lists, applied where the modem's band command is not NV
+	// (Fibocom +GTACT, re-applied at every bring-up)
+	'band_lte', 'band_nr', 'band_umts',
 	// SIM Application Toolkit routing (QMI CAT). Unset = leave the modem as the
 	// vendor configured it; 'disabled' stops the card expecting a terminal that
 	// can render proactive commands, which a headless CPE cannot.
@@ -486,12 +489,12 @@ function modem_from_section(s, warnings)
 		         (s.lock_4g != null ? [ s.lock_4g ] : []),
 		lock_5g: s.lock_5g,
 		lock_persist: bool_opt(s.lock_persist, false),
-		// Band allow-lists. A LIST, never a mask string: the vendor codec
-		// owns the encoding (u64 words on QMI/MBIM, +GTACT tokens on
-		// Fibocom AT), and one option per RAT is all any of them need.
-		// An empty/unset list means "leave this RAT's bands alone" — the
-		// codec keeps whatever the modem runs, so a partial edit never
-		// drops the other RATs' bands.
+		// Band allow-lists of 3GPP numbers, never a mask string: the codec
+		// owns the encoding. Applied only where the band command is not NV
+		// (Fibocom +GTACT, modem_ncm apply_config_bands) — a QMI/MBIM modem
+		// keeps its bands in its own NV and the daemon warns about a list
+		// here that nothing applies. Unset means "leave this RAT alone", so
+		// a partial edit never drops the other RATs' bands.
 		band_lte: (type(s.band_lte) == 'array') ? s.band_lte :
 		          (s.band_lte != null ? [ s.band_lte ] : []),
 		band_nr: (type(s.band_nr) == 'array') ? s.band_nr :
@@ -743,11 +746,7 @@ export function parse_netdev(device)
 // by seven keys when a review checked it, which is precisely how a warning like
 // this decays into a half-truth.
 export const IFACE_MODEM_ONLY_OPTS = [ 'pincode', 'modes', 'mcc', 'mnc',
-	'at_init', 'lock_4g', 'lock_5g', 'lock_persist',
-	// band allow-lists, applied through the vendor's own radio command
-	// (Fibocom +GTACT on the AT/NCM modems that have one). Lists, because
-	// a band mask is a SET and the order carries no meaning.
-	'band_lte', 'band_nr', 'band_umts', 'sim_slot', 'location',
+	'at_init', 'lock_4g', 'lock_5g', 'lock_persist', 'sim_slot', 'location',
 	'delay', 'failreboot', 'serial', 'imei', 'repower_time',
 	'proto_error_limit', 'zero_rx_timeout', 'bearer_poll_count',
 	'stats_interval' ];

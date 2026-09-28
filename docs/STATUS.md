@@ -1,6 +1,6 @@
 # wwand — current state
 
-_State of 2026-09-24, after v1.6.8. 58 host suites, all green (`cd tests && sh
+_State of 2026-09-29, after v1.6.8. 59 host suites, all green (`cd tests && sh
 run_tests.sh` — it prints the count, which moves too often to be worth repeating
 here)._
 
@@ -966,6 +966,33 @@ misconfigured, and again when the modem lets go of it.
     `drop_pt`'s release burst, given up (and logged) after
     `PT_RELEASE_TRIES`. A timed-out RELEASE_CID left a CID in the modem's
     table that nothing tracked, one per hold/wake.
+
+## Band lists on the FM350 (ddimension/wwand#43, 2026-09-29)
+
+`band_lte` / `band_nr` / `band_umts` on a `wwand_modem`, contributed for the
+Fibocom FM350-GL, whose only band command `+GTACT` is not NV. What holds now:
+
+- The lists are applied at every bring-up, awaited **before** the dial is
+  resolved, so the one re-registration a write costs never lands on a fresh
+  bearer. A mask the modem runs is not written; every write is read back.
+- A band edit in the settings editor on such a modem is written to its uci
+  section (`persistent: false` from the codec → `daemon.uc persist_bands`), so
+  it survives a power cycle like a QMI edit does in modem NV. A reload applies
+  changed lists to the running modem; band lists are out of the restart
+  signature.
+- Written only for RAT tuples 20 and 4, the shapes accepted on hardware. The
+  parser reads the first band as UMTS, and tuple 17's own read-back sent back
+  verbatim was refused, so any other tuple is refused with a reason
+  (`unsupported_tuple`, shown as a `band_lists` status warning).
+- Only bands the module lists in `AT+GTACT=?` are sent; "no band ticked" is
+  that whole list, not the unverified `0` token.
+- QMI/MBIM and other NCM modems do not apply the options; a list there is a
+  `band_lists` warning instead of silence.
+- LuCI shows only what the backend can set (`settable`): one NR list, the
+  module's own bands, the RAT boxes read-only.
+
+Not verified on hardware in this form: the awaited bring-up write and the
+`=?`-driven "all bands" (the codec is tested against the captures in #43).
 
 ## Known open
 

@@ -28,8 +28,9 @@ No check recorded yet.
 <tr><td rowspan="1"><b>QMI-over-MBIM passthrough</b><br><code>src-ucode/{qmi_over_mbim,atcmd_mbim}.uc, codec/mbim_schema/qmi_passthrough.uc</code></td><td rowspan="1">Qualcomm QMI service over MBIM (QMI passthrough UUID)</td><td rowspan="1">libmbim 1.32, libqmi 1.38.0 (qmi-device over MBIM)</td><td rowspan="1">QMI message CID, indications per service, no CTL SYNC</td><td>tbd</td><td></td><td></td></tr>
 </tbody>
 <tbody>
-<tr><td rowspan="2"><b>NCM / ECM backend</b><br><code>src-ucode/{modem_ncm,context_ncm,telemetry_ncm,ncm_vendors}.uc</code></td><td rowspan="1">3GPP TS 27.007 (AT commands for the UE)</td><td rowspan="1"></td><td rowspan="1">+CGDCONT, +CGACT, +CGPADDR, +CGCONTRDP, +CEREG/+C5GREG, +COPS, +CFUN, +CEER</td><td>tbd</td><td></td><td></td></tr>
+<tr><td rowspan="3"><b>NCM / ECM backend</b><br><code>src-ucode/{modem_ncm,context_ncm,telemetry_ncm,ncm_vendors}.uc</code></td><td rowspan="1">3GPP TS 27.007 (AT commands for the UE)</td><td rowspan="1"></td><td rowspan="1">+CGDCONT, +CGACT, +CGPADDR, +CGCONTRDP, +CEREG/+C5GREG, +COPS, +CFUN, +CEER</td><td>tbd</td><td></td><td></td></tr>
 <tr><td rowspan="1">Vendor AT dial/auth sets (Quectel, Fibocom, MeiG, Huawei, …)</td><td rowspan="1">vendor AT manuals, per entry in ncm_vendors.uc</td><td rowspan="1">data call start/stop, authentication, IP read-back</td><td>tbd</td><td></td><td></td></tr>
+<tr><td rowspan="1">Fibocom +GTACT (RAT and band selection)</td><td rowspan="1">Fibocom AT Commands User Manual V2.10 §11.1.14; parser rules from FM350-GL fw 81600.0000.00.19.11.17 (ddimension/wwand#43)</td><td rowspan="1">read, =? catalogue, write tuple shape, persistence</td><td>tbd</td><td></td><td></td></tr>
 </tbody>
 <tbody>
 <tr><td rowspan="2"><b>AT command layer</b><br><code>src-ucode/{atcmd,atcmd_parse,atport}.uc</code></td><td rowspan="1">ITU-T V.250</td><td rowspan="1"></td><td rowspan="1">command line, final result codes, echo, S3/S4</td><td>tbd</td><td></td><td></td></tr>

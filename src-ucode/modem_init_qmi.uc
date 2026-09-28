@@ -340,6 +340,27 @@ export function install(self, o)
 		// list + SIM/network state (the actual restore runs at CONFIGURE_NET,
 		// after SIM unlock, so a per-SIM configured list can resolve).
 		sim.log_preradio(self, log, () => {
+			// A plugin holds the radio off (its card is lent, or it waits for
+			// a remote SIM): low power instead of online, as the plugin's park.
+			// Switched on and registered only then, the modem registered with
+			// its own card first — at boot every time, within 2 s, while the
+			// remote SIM needs 3 (HW-seen on 245, RG650E, 2026-09-28). The
+			// SIM and UIM Remote work with the radio off; the daemon's tick
+			// wakes it once the hold is gone, and REGISTERING waits for that.
+			let hold = self.radio_hold?.();
+
+			if (hold) {
+				log('notice', sprintf('radio stays off at init — %s', hold));
+				self._plugin_held = true;
+
+				return self.set_opmode('low_power', (err) => {
+					if (err)
+						return fail('opmode', err);
+
+					tm.settle = uloop.timer(self.timing.settle, step_simslot);
+				});
+			}
+
 			self._opmode_set('online', (err) => {
 				// (set_opmode already treats "no effect / already online" as success)
 				if (err)
@@ -705,6 +726,12 @@ export function install(self, o)
 			if (!changed)
 				return step_register();
 
+			// parked (a plugin's hold at init): the attach runs with the new
+			// profile when the radio is woken — a cycle ending online here
+			// would register behind the park's back
+			if (self.lowpower_parked)
+				return step_register();
+
 			log('notice', 'attach profile changed, cycling radio to re-attach');
 			self._opmode_set('low_power', () => {
 				tm.settle = uloop.timer(self.timing.settle, () => {
@@ -758,9 +785,20 @@ export function install(self, o)
 				});
 			});
 
-			tm.reg = uloop.timer(self.timing.reg_timeout, () => {
+			let reg_timeout;
+
+			reg_timeout = () => {
 				if (self.state != 'REGISTERING')
 					return;
+
+				// parked on purpose (a plugin's hold at init): not registered
+				// because the radio is off, not a fault — failing here would
+				// walk the recovery ladder over a modem doing as told. Waits
+				// on: the timer re-arms, so a woken modem still times out.
+				if (self.lowpower_parked) {
+					tm.reg = uloop.timer(self.timing.reg_timeout, reg_timeout);
+					return;
+				}
 
 				// surface WHY we're still not registered before failing — EMM
 				// reject cause / limited service (see reg #33 attach finding)
@@ -772,7 +810,9 @@ export function install(self, o)
 
 					fail('registration_timeout', { reg: self.reg, detail: d });
 				});
-			});
+			};
+
+			tm.reg = uloop.timer(self.timing.reg_timeout, reg_timeout);
 
 			self.nas.request('GET_SERVING_SYSTEM', {}, (e2, d2) => {
 				if (!e2)

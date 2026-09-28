@@ -309,11 +309,12 @@ proto_wwand_setup() {
 				sleep 5
 				;;
 			radio_held)
-				# the modem's card is lent to another modem (a plugin such as
-				# wwand-rsim), and its radio stays off until it comes back.
-				# Not blocked: the interface waits in setup (see below) and
-				# the daemon brings it up when the woken modem registers
-				echo "radio off: the modem's SIM card is in use by another modem"
+				# a plugin such as wwand-rsim holds the modem's radio off: its
+				# card is lent to another modem, or it has a remote SIM that
+				# is not connected yet. Not blocked: the interface waits in
+				# setup (see below) and the daemon brings it up when the
+				# woken modem registers
+				echo "radio off: held by a plugin (the modem's status says why)"
 				proto_notify_error "$interface" RADIO_HELD
 				sleep 60
 				;;

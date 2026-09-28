@@ -2600,6 +2600,12 @@ export function create(opts)
 		// at_init), with the control protocol: a plugin can tell a Qualcomm
 		// modem (QMI) from others without an identity of its own
 		entry.modem.at_init_extra = (info) => self.plugins_at_init?.(name, { ...(info ?? {}), protocol: proto }) ?? [];
+		// Why the radio must stay off, asked by the init chain before it
+		// switches the radio on (plugins.uc radio_hold): a modem whose card is
+		// lent, or that waits for a remote SIM, must not register even once —
+		// on LTE a registration is an attach, the network sees the IMSI. Parked
+		// at init as a plugin park, so the tick wakes it when the hold is gone.
+		entry.modem.radio_hold = () => self.plugins_radio_hold?.(name) ?? null;
 		// A setting the init sequence changed that only a modem reset makes
 		// real (an EFS item is read at boot): reset once. Once per modem and
 		// setting for the daemon's life — should the reset not make it stick,
@@ -3755,6 +3761,11 @@ export function create(opts)
 				// rows optional packages report about this modem (plugins.uc
 				// plugins_status); rendered generically by LuCI and wwandctl
 				plugins: self.plugins_status ? self.plugins_status(name) : [],
+				// why a plugin holds the radio off (plugins.uc radio_hold): its
+				// card is lent to another modem, or its remote SIM is not in use
+				// yet. Its interfaces fail with RADIO_HELD meanwhile, and the
+				// status pages say why in one place, whichever plugin it is.
+				radio_held: self.plugins_radio_hold?.(name) ?? null,
 			};
 		}
 

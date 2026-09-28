@@ -115,6 +115,9 @@ function cmd_status(args)
 			m.control_note ? sprintf('  [%s]', m.control_note) : '');
 		printf('  SIM         imsi %s  iccid %s\n', m.imsi ?? '-', m.iccid ?? '-');
 
+		if (m.radio_held)
+			printf('  radio       off — %s\n', m.radio_held);
+
 		// what optional packages report about this modem (a remote SIM, say)
 		for (let r in (m.plugins ?? []))
 			printf('  %-11s %s%s\n', r.label, r.text,

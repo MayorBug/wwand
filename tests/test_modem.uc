@@ -179,6 +179,70 @@ scenario('happy', { handlers: base_handlers() }, 'registered',
 		eq(modem.counters.attempts, 0, 'happy: attempts reset');
 	});
 
+// --- 1a: a plugin holds the radio off at init ----------------------------------
+// A modem waiting for a remote SIM (or lending its card) must not register even
+// once: switched online at SET_OPMODE, the RG650E on 245 registered with its own
+// card 2 s later, before the remote SIM was up (2026-09-28). Held, the init goes
+// to low power instead, waits in REGISTERING without failing, and registers when
+// the daemon wakes it.
+let hold_at_init = { hold: 'rsim: its remote SIM x is not connected yet', woke: false };
+
+scenario('plugin hold at init', {
+	handlers: base_handlers({
+		// asked by a registration timeout (the reject detail) — which is
+		// what a hold at init must not run into
+		GET_SYSTEM_INFO: { __error: 71 },
+		GET_PROFILE_SETTINGS: { __error: 71 },
+		GET_SERVING_SYSTEM: (args, meta) => ({
+			serving_system: { registration: 0, cs_attach: 0, ps_attach: 0,
+			                  selected_network: 0, radio_ifs: [] },
+		}),
+	}),
+	guard_ms: 4000,
+	setup: (mock, modem) => {
+		modem.radio_hold = () => hold_at_init.hold;
+
+		// three registration timeouts parked, then the hold goes: the daemon's
+		// tick wakes the radio (plugin_radio), and the modem registers
+		uloop.timer(1600, () => {
+			hold_at_init.parked_state = modem.state;
+			hold_at_init.parked_modes = map(mock.calls_for('SET_OPERATING_MODE'), (c) => c.args?.mode);
+			hold_at_init.parked = modem.lowpower_parked;
+			hold_at_init.held = modem._plugin_held;
+			hold_at_init.hold = null;
+			modem.set_opmode('online', () => {
+				// without the hold at init the modem is long gone (failed
+				// registration, stopped): the checks below say so
+				if (!modem.nas)
+					return;
+
+				hold_at_init.woke = true;
+				mock.indicate(3, modem.nas.cid, 'SERVING_SYSTEM_IND', {
+					serving_system: { registration: 1, cs_attach: 1, ps_attach: 1,
+					                  selected_network: 1, radio_ifs: [ 8 ] },
+					current_plmn: { mcc: 262, mnc: 1, description: 'Telekom.de' },
+				});
+			});
+		});
+	},
+}, 'registered',
+	(modem, mock, events) => {
+		eq(hold_at_init.parked_modes, [ 1 ],
+		   'hold at init: low power instead of online — the radio never went on');
+		eq([ hold_at_init.parked, hold_at_init.held ], [ true, true ],
+		   'hold at init: parked, as the plugin\'s park (the daemon\'s tick wakes it)');
+		eq(hold_at_init.parked_state, 'REGISTERING',
+		   'hold at init: the chain waits in REGISTERING...');
+		eq(length(filter(events, (e) => e.event == 'error')), 0,
+		   '...through three registration timeouts, without a failure (no recovery ladder)');
+		ok(hold_at_init.woke, 'hold at init: woken by the daemon');
+		eq(modem.state, 'READY', 'hold at init: once woken, it registers');
+		eq(map(mock.calls_for('SET_OPERATING_MODE'), (c) => c.args?.mode), [ 1, 0 ],
+		   'hold at init: online only once the hold is gone');
+		eq(length(filter(events, (e) => e.event == 'registered')), 1, 'hold at init: registered once');
+		eq(modem._wake_pending, false, 'hold at init: no second registered to come from the wake');
+	});
+
 // --- 1b: GSM-7-bit packed operator name (issue #2) ---------------------------
 // EG06-class firmware GSM-7-bit packs the Current-PLMN name. "PLAY" packs to the
 // octets 50 66 30 0b, which as raw ASCII read "Pf0\x0b" (note the 0x0b control

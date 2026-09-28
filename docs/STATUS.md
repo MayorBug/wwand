@@ -851,6 +851,35 @@ wwand-ipa answers ipad's new `notify` event with it. Host-tested
 (`test_esim_bridge`: that one notification with `-r`, never `-a`; lpac's
 result line decides; refused outside a waiting session); not run on hardware.
 
+## A modem waiting for its remote SIM stays off its own card (2026-09-28)
+
+A modem with a remote SIM assigned (wwand-rsim) runs on that card or not at
+all: the plugin's `radio_hold` answers for it until the modem has taken the
+remote card (CONNECT_IND), also when the remote SIM failed or its reader is
+misconfigured, and again when the modem lets go of it.
+
+- **At init (QMI):** SET_OPMODE asks the plugins first (`modem.radio_hold`,
+  set by the daemon next to `at_init_extra`). Held, the radio goes to low
+  power instead of online, as the plugin's park; the init reads the SIM,
+  waits in REGISTERING without failing (no recovery ladder), and an
+  attach-profile change does not cycle it online. The daemon's tick wakes it
+  when the hold is gone; that READY entry is the one `registered`. Before,
+  the RG650E on 245 registered with its own card 2 s after every boot — on
+  LTE an attach, the network saw the local IMSI — and was parked only after.
+  HW-checked on 245 (2026-09-28): after a reboot no registration on the
+  local card; the remote card was taken with the radio off, the radio went
+  on after.
+- **While running:** the plugin parks a modem registered on its own card
+  although held (a remote SIM configured while online, or one the modem let
+  go of); the core parks only at a new registration or an interface
+  bring-up.
+- **Status:** `status()` carries `radio_held` (the reason, from any plugin);
+  `wwandctl status` prints it, the modem status page (luci-app-wwand) shows
+  a Radio row, the RADIO_HELD interface error names both reasons.
+- **Open:** the init-time hold is QMI's only. An MBIM modem — a remote SIM
+  works there through the QMI passthrough — and a sponsor on MBIM or NCM
+  still register at init and are parked after.
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

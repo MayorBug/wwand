@@ -1505,6 +1505,10 @@ uloop.run();
 		dh.context_up('wanA', (e) => { herr = e; });
 		eq([ ops, herr?.error, herr?.detail ], [ [], 'radio_held', 'rsim: lends its card to m1' ],
 		   'radio hold: an ifup does not wake a radio parked for a lent card, and says why');
+		eq(dh.status().modems.m0.radio_held, 'rsim: lends its card to m1',
+		   'radio hold: the status says why the radio is off, for the status pages');
+		eq(dh.modems.m0.modem.radio_hold?.(), 'rsim: lends its card to m1',
+		   'radio hold: the modem\'s init chain asks the plugins before it switches the radio on');
 
 		// a modem re-initialised while its card is lent comes up online and
 		// unparked: the bring-up is refused all the same, and a registration
@@ -1524,6 +1528,7 @@ uloop.run();
 		dh.modems.m0.modem.lowpower_parked = true;
 		dh.context_up('wanA', () => null);
 		eq(ops[0], 'm0:online', 'radio hold: once the card is back, the ifup wakes it as before');
+		eq(dh.status().modems.m0.radio_held, null, 'radio hold: ...and the status no longer says off');
 	}
 
 	// a plugin handing the radio back does not override `option lowpower`:

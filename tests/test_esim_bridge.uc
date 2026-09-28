@@ -31,6 +31,8 @@ let bridge = require('wwand.esim_bridge');
 	ok(index(bridge.apdu_summary('81E2110103AABBCC', '9000'), 'blk 1') >= 0 &&
 	   index(bridge.apdu_summary('81E2110103AABBCC', '9000'), 'AA') == -1,
 	   'apdu: a later block has no tag of its own and shows none');
+	eq(bridge.apdu_summary('00C0000000', substr(sprintf('%0160d', 0), 0, 160) + '6110', true),
+	   'INS C0 -> SW 6110 (80 B more)', 'apdu: the middle of a long answer is no tag');
 }
 
 ok(type(bridge) == 'object', 'bridge: module loads via require()');

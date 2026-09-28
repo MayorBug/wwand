@@ -186,7 +186,10 @@ function first_tag(h)
 // An answer is shown in full only while it is short (<= 32 bytes): that is
 // where the error codes are (an AuthenticateServerResponse error is
 // BF38 xx A1 xx 02 01 <code>), and nothing that short is a profile.
-function apdu_summary(cmd, resp)
+// `cont`: this answer continues one the card is still handing out (a GET
+// RESPONSE after a GET RESPONSE that ended 61xx) — its first bytes are the
+// middle of a data object, not a tag, and are not shown as one.
+function apdu_summary(cmd, resp, cont)
 {
 	cmd = uc(cmd ?? '');
 	resp = uc(resp ?? '');
@@ -212,9 +215,12 @@ function apdu_summary(cmd, resp)
 	if (length(rdata)) {
 		let rtag = first_tag(rdata);
 
-		ans += (length(rdata) <= 64)
-			? sprintf(' %s', rdata)
-			: sprintf(' %s (%d B)', rtag ?? '?', length(rdata) / 2);
+		if (cont)
+			ans += sprintf(' (%d B more)', length(rdata) / 2);
+		else
+			ans += (length(rdata) <= 64)
+				? sprintf(' %s', rdata)
+				: sprintf(' %s (%d B)', rtag ?? '?', length(rdata) / 2);
 	}
 
 	return what + ' -> ' + ans;
@@ -317,7 +323,7 @@ return {
 
 			log('notice', sprintf('modem %s: esim[%s]: stdio bridge', ref, op));
 
-			let chan = 0, uh = null, buf = '';
+			let chan = 0, uh = null, buf = '', c0_more = false;
 
 			// protocol-level lines (results, progress, bridge errors) always
 			// reach the syslog; the process's own chatter at opts.log_level
@@ -467,12 +473,18 @@ return {
 				case 'transmit':
 					// apdu_send yields the response hex directly (modem_apdu is
 					// what wraps it as {response}); use it as-is
+					// a GET RESPONSE after a GET RESPONSE that ended 61xx
+					// hands out the middle of the same answer
+					let cont = (uc(substr(rec.param ?? '', 2, 2)) == 'C0') && c0_more;
+
 					sim.apdu_send(entry.modem, slot, chan, rec.param, (err, res) => {
+						c0_more = !err && uc(substr(rec.param ?? '', 2, 2)) == 'C0' &&
+						          uc(substr(res ?? '', length(res ?? '') - 4, 2)) == '61';
 						// the ES10 sequence of a run, for whoever debugs a
 						// download or an eIM package: tags and status words
 						// only (apdu_summary)
 						logline(err ? sprintf('%s -> error %J', apdu_summary(rec.param, ''), err)
-						            : apdu_summary(rec.param, res), 'debug');
+						            : apdu_summary(rec.param, res, cont), 'debug');
 						send(err ? -1 : 0, err ? '' : (res ?? ''));
 					}); break;
 				case 'logic_channel_close':

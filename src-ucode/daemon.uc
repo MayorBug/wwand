@@ -104,6 +104,50 @@ let load_ncm = lazy_backend('wwand.ncm_lazy', loaded_note('ncm'));
 // optional eSIM module (wwand-esim); absent => feature reports esim_not_installed
 let load_esim = lazy_backend('wwand.esim', loaded_note('esim'));
 
+// QMI UIM Remote (UIMRMT, service 0x32): what a modem needs to run on a card
+// that is not in its slot (wwand-rsim) — libqmi 1.38.0 qmi-enums.h
+// QMI_SERVICE_UIMRMT = 0x32.
+const QMI_SERVICE_UIM_REMOTE = sprintf('%d', 0x32);
+
+// Can this modem run on a remote SIM? From the services the modem itself
+// lists (CTL GET_VERSION_INFO): natively over QMI, or over the
+// QMI-over-MBIM passthrough — never guessed from the model. Listed is not
+// the same as switched on: a Quectel lists it with the EFS switch off, and
+// `wwandctl rsim MODEM switch` reads that switch.
+//   { supported: true, via: 'qmi' | 'mbim-passthrough' }
+//   { supported: false, reason }   the modem cannot
+//   { supported: null, reason }    not known yet (services not read, the
+//                                  passthrough not set up)
+//   null                           no modem object
+function remote_sim_support(protocol, m)
+{
+	if (!m)
+		return null;
+
+	if (protocol == 'qmi') {
+		if (type(m.services) != 'object')
+			return { supported: null, reason: 'the modem\'s QMI services are not read yet' };
+
+		return m.services[QMI_SERVICE_UIM_REMOTE]
+			? { supported: true, via: 'qmi' }
+			: { supported: false, reason: 'the modem offers no QMI UIM Remote service' };
+	}
+
+	if (protocol == 'mbim') {
+		if (type(m.pt?.services) == 'object')
+			return m.pt.services[QMI_SERVICE_UIM_REMOTE]
+				? { supported: true, via: 'mbim-passthrough' }
+				: { supported: false, reason: 'the QMI passthrough offers no UIM Remote service' };
+
+		if (m._pt_failed)
+			return { supported: false, reason: 'the modem has no QMI passthrough over MBIM' };
+
+		return { supported: null, reason: 'the QMI passthrough is not set up yet' };
+	}
+
+	return { supported: false, reason: sprintf('no QMI on a %s modem', protocol ?? 'modem of unknown protocol') };
+}
+
 // "registered" across backends: QMI stores the numeric NAS value, MBIM/NCM
 // store 1/0 — never compare against a string. Radio list is the strongest
 // signal (a modem camped on a RAT is registered whatever the field says).
@@ -3766,6 +3810,7 @@ export function create(opts)
 				// yet. Its interfaces fail with RADIO_HELD meanwhile, and the
 				// status pages say why in one place, whichever plugin it is.
 				radio_held: self.plugins_radio_hold?.(name) ?? null,
+				remote_sim: remote_sim_support(entry.protocol, entry.modem),
 			};
 		}
 

@@ -3454,4 +3454,42 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	d.shutdown();
 })();
 
+// REMOTE SIM SUPPORT, from the services the modem lists: QMI UIM Remote
+// (0x32 = 50) natively, or over the QMI-over-MBIM passthrough — never from
+// the model. HW: RG650E lists 50(1.5) (yes), E392 does not (no), 245,
+// 2026-09-28.
+{
+	let mods = {};
+	let fake = {
+		modem: { create: (o) => (mods[o.id] = { id: o.id, state: 'READY', config: o.config,
+		                                        start: () => null, stop: () => null }) },
+		context: { create: (o) => ({ state: 'IDLE', down: (cb) => cb ? cb() : null, up: (cb) => cb(null),
+		                             modem_event: () => null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: { log: () => null, load_qmi: () => fake, load_mbim: () => fake } });
+
+	d.apply_config(config.parse({ network: {
+		q:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		mb: { '.type': 'wwand_modem', device: '/dev/mock1', protocol: 'mbim' },
+	} }));
+
+	let rs = (n) => d.status().modems[n].remote_sim;
+
+	eq(rs('q')?.supported, null, 'remote SIM: QMI services not read yet — unknown, not no');
+	mods.q.services = { '1': {}, '50': { major: 1, minor: 5 } };
+	eq(rs('q'), { supported: true, via: 'qmi' }, 'remote SIM: UIM Remote listed over QMI — yes');
+	mods.q.services = { '1': {}, '26': {} };
+	eq(rs('q')?.supported, false, 'remote SIM: not listed — no');
+
+	eq(rs('mb')?.supported, null, 'remote SIM: MBIM before its passthrough is up — unknown');
+	mods.mb.pt = { services: { '3': true, '50': true } };
+	eq(rs('mb'), { supported: true, via: 'mbim-passthrough' }, 'remote SIM: MBIM, UIM Remote over the passthrough — yes');
+	mods.mb.pt = { services: { '3': true } };
+	eq(rs('mb')?.supported, false, 'remote SIM: the passthrough without UIM Remote — no');
+	mods.mb.pt = null;
+	mods.mb._pt_failed = true;
+	eq(rs('mb')?.supported, false, 'remote SIM: no passthrough on this MBIM modem — no');
+	d.shutdown();
+}
+
 done('test_daemon');

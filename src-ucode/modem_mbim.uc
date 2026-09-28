@@ -1389,6 +1389,48 @@ export function create(opts)
 
 		self._plugin_held = false;
 
+		// A DMS LOW POWER LEFT BY AN EARLIER DAEMON. A park over the
+		// passthrough's DMS outlives the modem object that made it (a daemon
+		// restart), and the Radio State query below cannot see it — the two
+		// are independent switches — so the modem sat in REGISTERING until
+		// the recovery ladder's reset. Asked once per modem object, and only
+		// here, not held. Low power is switched online; OFFLINE is left to
+		// that reset — libqmi calls it RF off and "partially shutdown"
+		// (qmi-enums-dms.h, 1.38.0), and it is left only by a reset. No
+		// passthrough: nothing to ask, the Radio State path as before.
+		if (self._dms_unknown && !self._dms_checked) {
+			self._dms_checked = true;
+
+			return self._pt_get_opmode((err, mode) => {
+				if (err?.error == 'cancelled')
+					return;
+
+				if (err || mode != dmsmod.OPMODE_LOW_POWER) {
+					if (!err)
+						self._dms_unknown = false;
+
+					if (!err && mode == dmsmod.OPMODE_OFFLINE)
+						log('warn', 'the modem reports DMS offline — only a reset leaves that');
+
+					return step_register();
+				}
+
+				log('notice', 'the modem was left in low power by an earlier park, switching it online');
+
+				self._pt_opmode('online', (e2) => {
+					if (e2?.error == 'cancelled')
+						return;
+
+					if (e2)
+						log('warn', sprintf('switching it online failed: %J', e2));
+					else
+						self._dms_unknown = false;
+
+					step_register();
+				});
+			});
+		}
+
 		// The SOFTWARE radio can be off, and stay off across reboots: some modems
 		// ship that way. Nothing else in this backend ever turns it on — the two
 		// existing RADIO_STATE writers both cycle off->on inside a flow that only
@@ -2262,14 +2304,14 @@ export function create(opts)
 		});
 	};
 
-	// One DMS SET_OPERATING_MODE over the QMI passthrough, on a CID held for
-	// that request only (the reattach's pattern). cb(err): { error:
-	// 'no_passthrough' } when there is no QMI to ask, `cancelled` when the
-	// session ended meanwhile. Never a CTL SYNC: over the passthrough it
-	// resets the modem's embedded QMI state and ends the MBIM data session
-	// (qmi_over_mbim.uc blocks it). A method, so a test can stand in for a
-	// passthrough the MBIM mock does not have.
-	self._pt_opmode = function(mode, cb) {
+	// One DMS request over the QMI passthrough, on a CID held for that
+	// request only (the reattach's pattern): fn(dms, done) runs it, and
+	// done(err, data) gives the CID back and answers cb(err, data). err
+	// { error: 'no_passthrough' } when there is no QMI to ask, `cancelled`
+	// when the session ended meanwhile. Never a CTL SYNC: over the
+	// passthrough it resets the modem's embedded QMI state and ends the MBIM
+	// data session (qmi_over_mbim.uc blocks it).
+	let pt_dms = (fn, cb) => {
 		let gen = self._gen;
 
 		self._ensure_pt((up) => {
@@ -2295,12 +2337,26 @@ export function create(opts)
 				dms._pt_gen = self._gen;
 				dms._pt = self.pt;
 
-				qmi_backend.set_opmode(dms, mode, (err) => {
+				fn(dms, (err, data) => {
 					pt_release(dms);
-					cb(err);
+					cb(err, data);
 				});
 			}, { no_recovery: true });
 		});
+	};
+
+	// SET_OPERATING_MODE over the passthrough; cb(err). Methods, both, so a
+	// test can stand in for a passthrough the MBIM mock does not have.
+	self._pt_opmode = function(mode, cb) {
+		pt_dms((dms, done) => qmi_backend.set_opmode(dms, mode, (err) => done(err)), (err) => cb(err));
+	};
+
+	// GET_OPERATING_MODE over the passthrough (libqmi 1.38.0
+	// qmi-service-dms.json "Get Operating Mode", 0x002D, output Mode 0x01);
+	// cb(err, mode).
+	self._pt_get_opmode = function(cb) {
+		pt_dms((dms, done) => dms.request('GET_OPERATING_MODE', {}, (err, d) => done(err, d?.mode),
+			{ no_recovery: true }), cb);
 	};
 
 	// Backend operation `set_opmode` (docs/backend-interface.md): online /

@@ -804,4 +804,5 @@ passthrough, and the Basic Connect Radio State. Undoing one leaves the other
 off. A DMS low power also outlives the modem object that set it — a daemon
 restart — so the object that wakes the radio does not necessarily know what
 parked it; `modem_mbim.uc set_opmode` wakes DMS too until this object has set
-it itself (`_dms_unknown`).
+it itself (`_dms_unknown`), and an unheld init asks DMS once and switches a
+low power left by an earlier daemon online (`step_register`).

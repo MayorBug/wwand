@@ -953,7 +953,12 @@ misconfigured, and again when the modem lets go of it.
     daemon restart) — a new object that parked over the switch woke only
     the switch and left DMS in low power for good. A modem object that has
     not set DMS itself (`_dms_unknown`) wakes both; one it parked over DMS
-    is woken over DMS, without falling back to the switch;
+    is woken over DMS, without falling back to the switch. And a start
+    with NO hold asks DMS once (GET_OPERATING_MODE over the passthrough,
+    step_register): a low power an earlier daemon left is switched online
+    ("left in low power by an earlier park") — the Radio State query saw a
+    radio that was on, and the modem sat in REGISTERING until the ladder's
+    reset. OFFLINE is left to that reset; no passthrough, nothing to ask;
   - a **failed wake of an earlier pass's park** keeps the park flags and
     how it was made, is tried again, and fails the init after `WAKE_TRIES`;
   - **passthrough CID releases are tracked** until acknowledged

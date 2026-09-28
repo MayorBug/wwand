@@ -2066,6 +2066,77 @@ function assert_mbim_wake_after_restart() {
 
 assert_mbim_wake_after_restart();
 
+// ...and with NO hold at the new start: the init asks DMS once, and a low
+// power an earlier daemon left is switched online — without it the Radio
+// State path saw a radio that was on and the modem never registered
+function assert_mbim_unheld_start_after_dms_park() {
+	uloop.init();
+
+	let st = { on: true, dms: 'online' };
+	let h = radio_modem_handlers(st);
+	let bc_reg = h.REGISTER_STATE;
+
+	h.REGISTER_STATE = (args, meta) => {
+		let r = bc_reg(args, meta);
+
+		if (st.dms != 'online') {
+			r.register_state = bc.REGISTER_STATE_SEARCHING;
+			r.provider_id = '';
+		}
+
+		return r;
+	};
+
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: h });
+	let set = (mode, cb) => { st.dms = mode; cb(null); };
+	let get = (cb) => { push(st.asked, st.dms); cb(null, (st.dms == 'online') ? 0 : 1); };
+	let events1 = [], events2 = [], seen = {};
+	let m1 = mk_radio_modem('m_unheld1', mock, events1);
+	let m2 = null;
+
+	st.asked = [];
+	m1._pt_opmode = set;
+	m1._pt_get_opmode = get;
+	m1.start();
+
+	uloop.timer(120, () => {
+		seen.m1_asked = length(st.asked);
+		m1.set_opmode('low_power', () => {
+			m1.stop();               // the daemon restarts, nothing holds the modem
+
+			m2 = mk_radio_modem('m_unheld2', mock, events2);
+			m2._pt_opmode = set;
+			m2._pt_get_opmode = get;
+			m2.start();
+		});
+	});
+
+	uloop.timer(300, () => { seen.state = m2.state; m2.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(seen.m1_asked, 1, 'unheld restart: an unheld init asks DMS once');
+	eq(st.dms, 'online', 'unheld restart: the low power the earlier daemon left is switched online');
+	eq([ seen.state, index(events2, 'registered') >= 0, index(events2, 'error') ], [ 'READY', true, -1 ],
+	   'unheld restart: the modem registers, no failure, no reset needed');
+
+	// a held start does not ask: its radio stays off, the wake does the rest
+	uloop.init();
+
+	let asked = 0;
+	let mock3 = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers({ on: true }) });
+	let m3 = mk_radio_modem('m_heldnoask', mock3, []);
+
+	m3.radio_hold = () => 'rsim: its remote SIM x is not connected yet';
+	m3._pt_get_opmode = (cb) => { asked++; cb(null, 0); };
+	m3.start();
+	uloop.timer(150, () => { m3.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(asked, 0, 'held start: DMS is not asked (nothing is switched online while held)');
+}
+
+assert_mbim_unheld_start_after_dms_park();
+
 // A FAILED WAKE OF AN EARLIER PARK KEEPS THE PARK, and is tried again
 function assert_mbim_reinit_wake_fails_once() {
 	uloop.init();

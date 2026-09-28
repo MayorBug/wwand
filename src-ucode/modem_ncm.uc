@@ -279,9 +279,12 @@ export function create(opts)
 	let last_reg_stat = null;    // last logged registration <stat> (log on change only)
 	let poll;   // the register poll (forward-declared; the URC fast path re-runs it)
 
-	// Backend operation `set_opmode`, the AT spelling. CFUN 0 is the radio off
-	// (what `option lowpower` wants), CFUN 1 is on, CFUN 1,1 is the reset.
-	// `offline` maps to 0 as well: AT has no separate offline state.
+	// Backend operation `set_opmode`, the AT spelling. The radio off (what
+	// `option lowpower` wants) is CFUN 4 — like QMI's LOW_POWER, the radio
+	// only: CFUN 0 powers the SIM down too on most modems, and a card that
+	// is lent through AT+CSIM then answers +CME ERROR: 13 (HW-seen on a
+	// MeiG SLM770A, 2026-09-27). A modem without CFUN 4 gets 0. CFUN 1 is
+	// on, CFUN 1,1 the reset; `offline` is 0: AT has no separate offline state.
 	self.set_opmode = function(mode, cb) {
 		cb = cb ?? (() => null);
 
@@ -289,7 +292,7 @@ export function create(opts)
 			return cb({ error: 'unsupported', detail: 'no at channel' });
 
 		const AT_MODE = {
-			online: 'AT+CFUN=1', low_power: 'AT+CFUN=0',
+			online: 'AT+CFUN=1', low_power: 'AT+CFUN=4',
 			offline: 'AT+CFUN=0', reset: 'AT+CFUN=1,1',
 		};
 
@@ -298,20 +301,43 @@ export function create(opts)
 		if (!cmd)
 			return cb({ error: 'unsupported', mode: mode });
 
-		self.at.send(cmd, (e) => {
+		let was_parked = self.lowpower_parked;
+		// 0 only when the modem REFUSES 4 (ERROR, CME 3/4: not allowed /
+		// not supported) — never on a timeout or a busy SIM, where 4 may well
+		// have been applied and 0 would take the SIM down after all
+		let refused = (e) => e?.error == 'ERROR' ||
+			(e?.error == 'cme' && (+e.code == 3 || +e.code == 4 ||
+			                       match(`${e.code}`, /not (allowed|supported)/i)));
+		let send = (c, done) => self.at.send(c, (e) =>
+			(c == 'AT+CFUN=4' && refused(e)) ? self.at.send('AT+CFUN=0', done, { timeout: 15000 }) : done(e),
+			{ timeout: 15000 });
+
+		send(cmd, (e) => {
 			if (!e)
 				self.lowpower_parked = (mode == 'low_power');
 
+			// woken from a park: the next registration is reported as one
+			// (modem.uc set_opmode has the reason)
+			if (!e && was_parked && mode == 'online')
+				self._wake_pending = true;
+
 			cb(e ?? null);
-		}, { timeout: 15000 });
+		});
 	};
 
 	// shared radio cycle: CFUN 0 -> settle -> CFUN 1 -> settle -> then()
 	// (the recovery ladder's opmode_cycle and step_attach's re-attach both
 	// use exactly this dance)
+	// A parked radio (`option lowpower`, a lent card) stays off: see
+	// modem.uc online_unless_parked.
 	let cfun_cycle = (then) => {
 		self.at.send('AT+CFUN=0', () => {
 			settle_timer = uloop.timer(self.timing.settle, () => {
+				if (self.lowpower_parked) {
+					settle_timer = uloop.timer(0, then);
+					return;
+				}
+
 				self.at.send('AT+CFUN=1', () => {
 					settle_timer = uloop.timer(self.timing.settle, then);
 				}, { timeout: 15000 });
@@ -1011,7 +1037,7 @@ export function create(opts)
 		// down and re-enumerates it, so `self.at` can be null by the time the
 		// call lands. Reading `.send` off it throws inside a uloop callback,
 		// which does not fail the call: it takes the daemon with it. Field-seen
-		// at modem_ncm.uc:833, and only with `sim_slot` configured — that is
+		// at modem_ncm.uc:854, and only with `sim_slot` configured — that is
 		// what makes step_simslot walk the second pass at all
 		// (ddimension/wwand#32).
 		if (!self.at)
@@ -1704,6 +1730,12 @@ export function create(opts)
 					notify_contexts('suspend', self.reg);
 					step_register();
 					return;
+				}
+
+				if (r?.registered && self._wake_pending) {
+					self._wake_pending = false;
+					log('notice', 'registered again after the radio was parked');
+					emit('registered', r);
 				}
 
 				refresh_signal(() => refresh_cells(() => refresh_reg_detail(() =>

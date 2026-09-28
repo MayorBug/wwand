@@ -308,24 +308,45 @@ proto_wwand_setup() {
 				proto_notify_error "$interface" NO_CONTEXT
 				sleep 5
 				;;
+			radio_held)
+				# a plugin such as wwand-rsim holds the modem's radio off: its
+				# card is lent to another modem, or it has a remote SIM that
+				# is not connected yet. Not blocked: the interface waits in
+				# setup (see below) and the daemon brings it up when the
+				# woken modem registers
+				echo "radio off: held by a plugin (the modem's status says why)"
+				proto_notify_error "$interface" RADIO_HELD
+				sleep 60
+				;;
 			modem_absent)
 				# the modem's control device is not present yet (after boot, a
 				# modem reboot or a power-cycle). Surface it distinctly so the
 				# network overview shows "waiting for modem" instead of a generic
-				# failure; keep retrying (the daemon binds it once hotplug fires).
+				# failure. The daemon brings it up once hotplug binds the modem
+				# and it registers.
 				echo "waiting for modem (control device not present)"
 				proto_notify_error "$interface" WAITING_MODEM
 				sleep 8
 				;;
 			*)
 				proto_notify_error "$interface" CONNECT_FAILED
-				# netifd re-runs setup immediately after a failed task; without
-				# a pause here a no-service condition becomes a hot loop that
-				# also climbs the daemon's recovery ladder
+				# the pause spaces out a netifd that DOES re-run setup (an ifup
+				# loop, an older netifd); this one does not, see below
 				sleep 10
 				;;
 		esac
 
+		# NETIFD DOES NOT RETRY THIS BY ITSELF. A failed setup of a handler
+		# with no_proto_task is never torn down (proto_ext_task_finish tears
+		# down only without PROTO_FLAG_NO_TASK, proto-ext.c:147-152, netifd
+		# 2026.07.08): the interface stays pending with the error on it,
+		# which works like a block. Only a link or availability change
+		# (interface_check_state) or an ifdown/ifup moves it. The daemon owns the retry — the
+		# reconnect engine for a failed activation, the next `registered` for
+		# a modem that was not usable (it resets a stuck-pending interface
+		# and kicks it). The error is also its evidence that a cleared
+		# autostart is ours and not an operator's ifdown (daemon.uc,
+		# operator_down).
 		return 1
 	}
 
@@ -348,7 +369,24 @@ proto_wwand_setup() {
 proto_wwand_teardown() {
 	local interface="$1"
 
-	ubus -t 30 call wwand context_down "{\"interface\":\"$interface\"}" >/dev/null 2>&1
+	ubus -t 30 call wwand context_down "{\"interface\":\"$interface\"}" >/dev/null 2>&1 || {
+		# no daemon to tell (stopped for an upgrade, say): this ifdown is
+		# still the operator's, and the error the failed setup left on the
+		# interface would otherwise read as wwand's own block when the daemon
+		# comes back (daemon.uc operator_down). The daemon reads the names in
+		# this file by pattern, so an appended one is enough; its next up
+		# clears it. Under the daemon's lock (daemon.uc admin_locked): a
+		# daemon that is running but did not answer re-reads, merges and
+		# renames a new file over this one, and an append landing between
+		# its read and its rename went to the replaced file and was lost.
+		# busybox has flock on OpenWrt (CONFIG_BUSYBOX_DEFAULT_FLOCK=y); one
+		# without it appends unlocked, as before.
+		mkdir -p /tmp/wwand/state
+		(
+			command -v flock >/dev/null 2>&1 && flock -x 9
+			echo "\"$interface\"" >> /tmp/wwand/state/admin_downs.json
+		) 9>>/tmp/wwand/state/admin_downs.lock
+	}
 	# no link-down update here: netifd rejects notify_proto while in S_TEARDOWN
 	# and drops the link itself once this script exits
 }

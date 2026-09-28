@@ -11,6 +11,10 @@ import * as uloop from 'uloop';
 import * as sim from 'wwand.sim';
 import * as sms from 'wwand.sms';
 
+// The states of a modem's init chain up to and including the SIM step: a
+// modem in one of them reads its card as part of that chain.
+const INIT_STATES = [ 'INIT_TRANSPORT', 'INIT_SERVICES', 'SIM_UNLOCK' ];
+
 export function install(self, o)
 {
 	let log = o.log;
@@ -31,9 +35,18 @@ export function install(self, o)
 		if (!entry)
 			return;
 
-		sim.slot_status(entry.modem, (err, slots) => {
+		let m = entry.modem;
+
+		sim.slot_status(m, (err, slots) => {
 			if (err)
 				return cb({ error: 'sim_transport', detail: err });
+
+			// the last reading, for the SIM inventory: the cards in the
+			// slots that are not active are known from here only. Kept on
+			// the modem it was read from — a modem gone or replaced
+			// meanwhile must not get it (or throw on a null)
+			if (self.modems?.[ref]?.modem === m)
+				m.slots = slots;
 
 			// alongside the slots, what SHAPE of multi-SIM this modem is. Purely
 			// descriptive — see sim.multisim. It is the one thing we cannot
@@ -68,6 +81,128 @@ export function install(self, o)
 		});
 	};
 
+	// A different card sits behind the modem now: forget everything about the
+	// one that left and read the one that arrived. One process for every way a
+	// card changes underneath a running modem — a slot switch, and a plugin
+	// that swaps the card itself (wwand-rsim: the modem moves to a card in a
+	// reader on the router and back, and nothing in the modem's own init chain
+	// re-reads the identity for that; HW-observed on 245, 2026-09-26: the
+	// status kept the local SIM's IMSI while the remote one was in use).
+	// `why` goes into the log.
+	self.card_changed = function(ref, why) {
+		let m = self.modems?.[ref]?.modem;
+
+		if (!m)
+			return false;
+
+		// a different slot may hold a different eUICC — drop the cached
+		// eSIM/APDU backends so they are re-probed, and clear the
+		// once-per-object refresh guard + the stale surface data
+		delete m._esim_be;
+		delete m._apdu_be;
+		delete m._esim_refreshed;
+		delete m.esim_info;
+
+		// AND THE CARD ITSELF, which that list forgot. Everything cleared
+		// below describes the card that just left: its identity, the slot
+		// it sat in, and the card-side events the UIM indications reported
+		// about it. None of it is re-read on its own — a slot switch does
+		// not restart the init chain — so the status page went on showing
+		// the previous SIM's ICCID and its parting "session closed: card
+		// removed" indefinitely, through a switch BACK as well, because
+		// nothing on either path ever clears them (evidence:
+		// ddimension/wwand#39, NR7101).
+		//
+		// modem.uc:1686-1691 already states the rule — card-side
+		// diagnostics belong to the card we were talking to — and acts on
+		// it during teardown. This path is the other place a card changes
+		// underneath us, and it did not.
+		m.sim_note = null;
+		m.sim_busy = false;
+		m.active_slot = null;
+
+		// AND THE MATCHED PER-SIM OVERRIDE, which is the one that can do
+		// damage rather than merely mislead. `active_sim` is the wwand_sim
+		// entry resolved for the card that just left, and effective_pincode
+		// prefers its `pincode` over the modem's own (sim.uc:57-70) — so
+		// the unlock scheduled below would have offered the OLD card's PIN
+		// to the new one and spent one of three attempts on it. Its APN and
+		// credentials would have applied too, until a reapply replaced it.
+		m.active_sim = null;
+
+		if (m.info) {
+			m.info.iccid = null;
+			m.info.imsi = null;
+			m.info.msisdn = null;
+		}
+
+		// ...then read the card that arrived, the way an eSIM profile
+		// switch does (esim_bridge apply_sim_reset): give the firmware a
+		// moment, unlock — a PIN can re-arm with a different card — and
+		// run the full per-SIM reapply, which re-matches the wwand_sim
+		// override and the attach profile.
+		//
+		// RE-CHECKED WHEN THE TIMER FIRES, not when it is armed, and on TWO
+		// counts. On the AT backends the switch ends in a CFUN reset that
+		// re-enumerates the modem, so `entry.modem` can by then be a
+		// different object or gone — identity covers that. But ordinary
+		// backend recovery tears the SAME object down and starts it again
+		// (modem_common make_fail), which identity does not see: the timer
+		// belongs to this module, not to the modem, so it outlives the
+		// teardown and would talk to a client that is mid-initialisation.
+		// `_gen` is the counter both backends already bump on teardown
+		// (modem.uc:1638, modem_mbim.uc:2592); NCM has none and degrades to
+		// the identity check, which is the case its reset already answers.
+		let gen = m._gen;
+		// ...and a card change of its own: a remote SIM that comes and goes
+		// within the two seconds arms a second re-read without a teardown in
+		// between, and the first must not apply the card that has already left
+		let cgen = m._card_change_gen = +(m._card_change_gen ?? 0) + 1;
+
+		if (m.reapply_sim)
+			defer(2000, () => {
+				if (self.modems?.[ref]?.modem !== m || m._gen !== gen || m._card_change_gen !== cgen)
+					return;
+
+				// a modem that stopped for lack of a card resumes its init
+				// from the SIM step instead: re-reading the identity alone
+				// would leave it SIM_BLOCKED on a card that is now there
+				if (m.retry_sim?.())
+					return;
+
+				// still in its init chain (resumed by an earlier change, or
+				// starting): that chain reads the card itself, and a second
+				// unlock + re-read beside it is two writers on one SIM
+				if (index(INIT_STATES, m.state) >= 0)
+					return;
+
+				// fresh: no firmware-cached IMSI, which is the old card's
+				// for a while. A card that is slow to initialise (a remote
+				// SIM, ~1 s a command) has no IMSI to read yet: asked again,
+				// a few times, as long as this is still the card that came
+				let tries = 0;
+				let read;
+				read = () => m.reapply_sim(() => {
+					if (m.info?.imsi != null || ++tries >= 6)
+						return;
+
+					defer(15000, () => {
+						// the same checks as the first read: this card, this
+						// modem object, and not inside its init chain, which
+						// reads the card itself (NCM has no _gen)
+						if (self.modems?.[ref]?.modem === m && m._gen === gen && m._card_change_gen === cgen &&
+						    index(INIT_STATES, m.state) < 0)
+							read();
+					});
+				}, { fresh: true });
+
+				sim.unlock(m, read);
+			});
+
+		log('notice', sprintf('modem %s: card changed (%s) — re-reading the SIM', ref, why ?? '?'));
+		return true;
+	};
+
 	self.modem_sim_switch_slot = function(ref, physical, cb) {
 		let entry = check_modem(ref, cb);
 
@@ -87,75 +222,7 @@ export function install(self, o)
 				return cb(null, { slot: physical, unchanged: true });
 			}
 
-			// a different slot may hold a different eUICC — drop the cached
-			// eSIM/APDU backends so they are re-probed, and clear the
-			// once-per-object refresh guard + the stale surface data
-			delete entry.modem._esim_be;
-			delete entry.modem._apdu_be;
-			delete entry.modem._esim_refreshed;
-			delete entry.modem.esim_info;
-
-			// AND THE CARD ITSELF, which that list forgot. Everything cleared
-			// below describes the card that just left: its identity, the slot
-			// it sat in, and the card-side events the UIM indications reported
-			// about it. None of it is re-read on its own — a slot switch does
-			// not restart the init chain — so the status page went on showing
-			// the previous SIM's ICCID and its parting "session closed: card
-			// removed" indefinitely, through a switch BACK as well, because
-			// nothing on either path ever clears them (evidence:
-			// ddimension/wwand#39, NR7101).
-			//
-			// modem.uc:1531-1536 already states the rule — card-side
-			// diagnostics belong to the card we were talking to — and acts on
-			// it during teardown. This path is the other place a card changes
-			// underneath us, and it did not.
-			let m = entry.modem;
-
-			m.sim_note = null;
-			m.sim_busy = false;
-			m.active_slot = null;
-
-			// AND THE MATCHED PER-SIM OVERRIDE, which is the one that can do
-			// damage rather than merely mislead. `active_sim` is the wwand_sim
-			// entry resolved for the card that just left, and effective_pincode
-			// prefers its `pincode` over the modem's own (sim.uc:57-70) — so
-			// the unlock scheduled below would have offered the OLD card's PIN
-			// to the new one and spent one of three attempts on it. Its APN and
-			// credentials would have applied too, until a reapply replaced it.
-			m.active_sim = null;
-
-			if (m.info) {
-				m.info.iccid = null;
-				m.info.imsi = null;
-				m.info.msisdn = null;
-			}
-
-			// ...then read the card that arrived, the way an eSIM profile
-			// switch does (esim_bridge apply_sim_reset): give the firmware a
-			// moment, unlock — a PIN can re-arm with a different card — and
-			// run the full per-SIM reapply, which re-matches the wwand_sim
-			// override and the attach profile.
-			//
-			// RE-CHECKED WHEN THE TIMER FIRES, not when it is armed, and on TWO
-			// counts. On the AT backends the switch ends in a CFUN reset that
-			// re-enumerates the modem, so `entry.modem` can by then be a
-			// different object or gone — identity covers that. But ordinary
-			// backend recovery tears the SAME object down and starts it again
-			// (modem_common make_fail), which identity does not see: the timer
-			// belongs to this module, not to the modem, so it outlives the
-			// teardown and would talk to a client that is mid-initialisation.
-			// `_gen` is the counter both backends already bump on teardown
-			// (modem.uc:1475, modem_mbim.uc:1891); NCM has none and degrades to
-			// the identity check, which is the case its reset already answers.
-			let gen = m._gen;
-
-			if (m.reapply_sim)
-				defer(2000, () => {
-					if (self.modems?.[ref]?.modem !== m || m._gen !== gen)
-						return;
-
-					sim.unlock(m, () => m.reapply_sim());
-				});
+			self.card_changed(ref, sprintf('SIM slot %d', physical));
 
 			log('notice', sprintf('modem %s: switched to SIM slot %d', ref, physical));
 			cb(null, { slot: physical });
@@ -269,7 +336,82 @@ export function install(self, o)
 	};
 
 	// eSIM download/notification bridge (optional wwand-esim, esim_bridge.uc); lazy.
+	// The card's profile list changed (bridge `changed`): read it again into
+	// modem.esim_info, which status `esim` and the SIM inventory derive from.
+	// Delayed, because an enable is followed by the SIM power-cycle and the
+	// card answers nothing while it is down; one retry for the same reason.
+	// The EID is read again too: card_changed drops esim_info along with it.
+	// the bridge instance (load_esim_bridge below); declared ahead of the
+	// re-read, which asks it whether a host session is running
 	let esim_bridge = null;
+
+	// One re-read per modem at a time: several quick operations (enable,
+	// then notify) coalesce into the one already armed.
+	let profiles_pending = {};
+	// a change reported while a re-read is armed or running: that read may
+	// already have the old list, so one more follows it
+	let profiles_dirty = {};
+	let profiles_changed;   // forward-declared: it re-arms itself (ucode TDZ)
+
+	// the read ended (read, given up, modem gone): a change that came in
+	// meanwhile gets its own
+	let profiles_done = (ref, slot) => {
+		delete profiles_pending[ref];
+
+		if (profiles_dirty[ref]) {
+			delete profiles_dirty[ref];
+			profiles_changed(ref, slot);
+		}
+	};
+	profiles_changed = (ref, slot, retry, waited) => {
+		if (!retry && !waited && profiles_pending[ref]) {
+			profiles_dirty[ref] = true;
+			return;
+		}
+
+		profiles_pending[ref] = true;
+
+		defer(retry ? 15000 : 5000, () => {
+			let m = self.modems?.[ref]?.modem;
+
+			if (!m) {
+				profiles_done(ref, slot);
+				return;
+			}
+
+			// another host session on the ISD-R (a download, a plugin's
+			// session) is running: a read beside it corrupts that session
+			// (esim_bridge busy) — wait for it, up to a minute
+			if (esim_bridge?.busy?.()) {
+				if (+(waited ?? 0) < 12)
+					return profiles_changed(ref, slot, retry, +(waited ?? 0) + 1);
+
+				profiles_done(ref, slot);
+				return;
+			}
+
+			let again = () => {
+				if (!retry)
+					return profiles_changed(ref, slot, true);
+				profiles_done(ref, slot);
+			};
+
+			self.modem_esim(ref, 'eid', { slot: slot }, (e1, r1) => {
+				if (e1)
+					return again();
+
+				self.modem_esim(ref, 'profiles', { slot: slot }, (e2, r2) => {
+					if (e2 || self.modems?.[ref]?.modem !== m)
+						return again();
+
+					profiles_done(ref, slot);
+					m.esim_info = { eid: r1?.eid ?? m.esim_info?.eid ?? null, profiles: r2?.profiles ?? [] };
+					log('info', sprintf('modem %s: eSIM profile list re-read (%d profiles)', ref, length(m.esim_info.profiles)));
+				});
+			});
+		});
+	};
+
 	let load_esim_bridge = () => {
 		if (esim_bridge === false)
 			return null;
@@ -292,6 +434,7 @@ export function install(self, o)
 				esim: esim,
 				log: log,
 				modem_of: (ref) => self.modems[ref],
+				changed: (ref, slot) => profiles_changed(ref, slot),
 			});
 		}
 

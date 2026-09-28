@@ -18,12 +18,24 @@
 // PIN (wwand_sim -> wwand_modem). The interface value is the generic default;
 // card-provisioned values remain the last fallback where supported. Empty
 // strings count as unset on both levels.
+// The login belongs to the APN it authenticates against. A card whose
+// wwand_sim names its own APN therefore brings its own credentials — none,
+// if it gives none — and never the interface's: those were written for the
+// interface's APN. Taken field by field, a Telekom card with its own APN got
+// the CHAP login of an M2M card configured on the interface, in the attach
+// profile and in its data calls (HW-seen on 245, 2026-09-27).
+const CREDENTIALS = { auth: true, username: true, password: true };
+
 export function conn_cfg(ctx, field)
 {
-	let s = ctx.modem?.active_sim?.[field];
+	let sim = ctx.modem?.active_sim;
+	let s = sim?.[field];
 
 	if (s != null && s != '')
 		return s;
+
+	if (CREDENTIALS[field] && sim?.apn != null && sim.apn != '')
+		return null;
 
 	let v = ctx.config?.[field];
 

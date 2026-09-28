@@ -25,7 +25,11 @@ import * as qmi_pt from 'wwand.codec.mbim_schema.qmi_passthrough';
 // create(mc, opts): mc is an opened mbim_client. Returns a hub-shaped object.
 export function create(mc, opts)
 {
-	let self = { clients: {}, closed: false };
+	// failures: passthrough requests that failed IN A ROW, reset by the next
+	// one that is answered; modem_mbim rebuilds the stack when it runs up.
+	// failing_since: time() of the first failure of that run (0 = none) — the
+	// log states how long QMI was gone, which the count alone cannot say.
+	let self = { clients: {}, closed: false, failures: 0, failing_since: 0 };
 	let log = opts?.log ?? ((level, msg) => null);
 
 	// route a decoded QMUX frame (response or indication) to its client
@@ -85,7 +89,22 @@ export function create(mc, opts)
 
 		mc.command_raw(qmi_pt.service, qmi_pt.CID_QMI_MSG, frame, (err, info) => {
 			if (err) {
-				log('debug', sprintf('qmi-over-mbim: passthrough error %J', err));
+				self.failures++;
+
+				// THE FIRST FAILURE OF A RUN IS A NOTICE, the rest stay debug:
+				// the one line an operator's default log keeps has to say when
+				// QMI went away and what the modem answered, because by the time
+				// the rebuild line appears the cause has scrolled off
+				// (ddimension/wwand#30, where it took a debug log to see it).
+				if (self.failures == 1) {
+					self.failing_since = time();
+					log('notice', sprintf('qmi-over-mbim: passthrough request failed (svc %d msg 0x%04x: %s) — QMI over MBIM may be gone; counting',
+						req?.service ?? -1, req?.msg_id ?? 0,
+						(err.error == 'mbim') ? (mbim.status_name(err.status) ?? sprintf('status %d', err.status))
+						                      : (err.error ?? '?')));
+				}
+
+				log('debug', sprintf('qmi-over-mbim: passthrough error %J (%d in a row)', err, self.failures));
 
 				// The modem has no QMI passthrough service (or rejected it). There
 				// is no QMUX reply to dispatch, so synthesize a QMI error response
@@ -99,6 +118,12 @@ export function create(mc, opts)
 				return;
 			}
 
+			if (self.failures > 0)
+				log('notice', sprintf('qmi-over-mbim: passthrough answering again after %d failed request%s over %d s',
+					self.failures, (self.failures == 1) ? '' : 's', time() - self.failing_since));
+
+			self.failures = 0;
+			self.failing_since = 0;
 			deliver(info);
 		}, { no_recovery: true });   // a vendor CID's refusal is not a channel fault
 
@@ -110,16 +135,36 @@ export function create(mc, opts)
 	self.close = function() {
 		self.closed = true;
 		self.clients = {};
+
+		if (mc._qom_route?.shim == self)
+			mc._qom_route.shim = null;
 	};
 
 	// unsolicited QMI indications arrive as MBIM INDICATE_STATUS on the QMI CID;
 	// the passthrough info is the raw QMUX indication frame (2nd on() arg = msg).
-	// NOTE (HW finding 2026-08): the EG06 and RM520N accept NAS REGISTER_INDICATIONS
-	// over the passthrough but never actually push indications this way — the
-	// passthrough is request/response only, so MBIM telemetry stays poll-based.
-	// This path is kept correct (0xff broadcast fan-out in deliver) for any
-	// firmware that does forward them.
-	mc.on(qmi_pt, 'QMI_MSG', (data, msg) => deliver(msg.info));
+	// Which indications come this way depends on the SERVICE, not on the
+	// passthrough: the EG06 and the RM520N accept NAS REGISTER_INDICATIONS
+	// here but never push a NAS indication (HW finding 2026-08) — so MBIM
+	// telemetry stays poll-based — while the RM520N pushes every UIM Remote
+	// indication (connect, power, APDU) this way, which is what a remote SIM
+	// runs on (HW-observed on the GL-X3000, RM520NGLAAR03A03M4G, 2026-09-27:
+	// a session of 431 APDUs through wwand-rsim). The path is kept correct
+	// (0xff broadcast fan-out in deliver) for every service.
+	//
+	// ONE handler per MBIM client, routed to its current shim. mc.on only
+	// appends (mbim_client.uc:369) and has no counterpart, while a shim is made
+	// per bring-up: every rebuild of a passthrough that stopped answering would
+	// leave a handler behind, and every indication would run through all of
+	// them. The route lives on the client because the client outlives shims.
+	if (!mc._qom_route) {
+		let route = { shim: null };
+
+		mc._qom_route = route;
+		mc.on(qmi_pt, 'QMI_MSG', (data, msg) => route.shim?._deliver(msg.info));
+	}
+
+	self._deliver = deliver;
+	mc._qom_route.shim = self;
 
 	return self;
 };

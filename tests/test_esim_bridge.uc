@@ -13,6 +13,28 @@ import { eq, ok, done } from './lib/check.uc';
 
 let bridge = require('wwand.esim_bridge');
 
+// --- the debug line of one card command: the ES10 tag, never its data -------
+{
+	let s = bridge.apdu_summary('81E29100' + '0C' + 'BF3809A0078001AA81020102', '');
+
+	ok(index(s, 'BF38 AuthenticateServer') >= 0, 'apdu: STORE DATA names its ES10 function');
+	eq(index(s, 'A0078001AA'), -1, 'apdu: ...and leaves the command data out');
+
+	let e = bridge.apdu_summary('81E2910003BF3800', 'BF3805A103020106' + '9000');
+
+	ok(index(e, 'SW 9000 BF3805A103020106') >= 0, 'apdu: a short answer (an error code) is shown');
+
+	let big = bridge.apdu_summary('81E2110003BF3600', 'BF36' + '8182' + substr(sprintf('%0130d', 0), 0, 130) + '9000');
+
+	ok(index(big, 'BF36 (') >= 0 && index(big, '000000000000') == -1,
+	   'apdu: a long answer only by tag and length');
+	ok(index(bridge.apdu_summary('81E2110103AABBCC', '9000'), 'blk 1') >= 0 &&
+	   index(bridge.apdu_summary('81E2110103AABBCC', '9000'), 'AA') == -1,
+	   'apdu: a later block has no tag of its own and shows none');
+	eq(bridge.apdu_summary('00C0000000', substr(sprintf('%0160d', 0), 0, 160) + '6110', true),
+	   'INS C0 -> SW 6110 (80 B more)', 'apdu: the middle of a long answer is no tag');
+}
+
 ok(type(bridge) == 'object', 'bridge: module loads via require()');
 ok(type(bridge.parse_lpac_line) == 'function', 'bridge: parser exposed');
 
@@ -126,8 +148,12 @@ let esim_fake = {
 // _esim_op is a REFCOUNT (0 = idle, n>0 = quiet); readers only test
 // truthiness, so the assertions below pin exactly that contract
 let entry = { modem: { id: 'm0', _esim_op: 0 } };
+// `changed`: everything that may alter the profile list reports it, so the
+// host's copy (status esim, SIM inventory) is read again
+let changed = [];
 let br = bridge.create({ esim: esim_fake, log: () => null,
 	modem_of: (r) => (r == 'm0') ? entry : null,
+	changed: (ref, slot) => push(changed, ref),
 	lpac_path: '/nonexistent-lpac' });
 
 let chain = [];
@@ -152,7 +178,10 @@ run_chain = (idx) => {
 				eq(!!entry.modem._esim_op, true,
 					'router: a parallel op completing leaves the running download quiet');
 
+				let before = length(changed);
+
 				dl_completion(null, { ret: 0 });   // simulate the modem finishing
+				eq(length(changed), before + 1, 'changed: a finished in-modem download reports a list change');
 				eq(!!entry.modem._esim_op, false, 'router: quiet cleared at download completion');
 				lpac_stdio_tests();
 			});
@@ -195,6 +224,7 @@ expect('enable', { iccid: 'x' }, 'invalid_argument');
 expect('enable', {}, 'missing_argument');
 expect('enable', { iccid: '89358152000000075749' }, null, (res) => {
 	eq(res, { ok: true, via: 'esim' }, 'router enable: no lpac -> esim.enable fallback');
+	eq(changed, [ 'm0' ], 'changed: a successful enable reports a list change, the failed ops before it none');
 });
 expect('profiles', {}, null, (res) => {
 	eq(res, { profiles: [] }, 'router profiles: passthrough');
@@ -253,8 +283,10 @@ let mute_pidf = sprintf('%s/wwand-test-lpac-mute.pid', tmp);
 write_stub(fake_mute, sprintf("#!/bin/sh\necho $$ > %s\nsleep 3\nexit 0\n", mute_pidf));
 
 let entry2 = { modem: { id: 'm0', _esim_op: 0 } };
+let changed2 = 0;
 let mk = (path, idle) => bridge.create({ esim: esim_fake, log: () => null,
 	modem_of: (r) => (r == 'm0') ? entry2 : null,
+	changed: () => changed2++,
 	lpac_path: path, idle_ms: idle });
 
 // poll download_status until the run leaves 'running' (bounded, so a
@@ -267,6 +299,70 @@ await_state = (b, left, cb) =>
 
 		uloop.timer(50, () => await_state(b, left - 1, cb));
 	});
+
+// session_notify: the PIR of an assistant's direct download goes to the SM-DP+
+// through lpac while the assistant waits in an event (SGP.32 v1.3 3.2.3.1 step
+// 14). What lpac is asked to do is the point: that ONE notification, removed
+// only after the SM-DP+ acknowledged it (-r), never `-a`, which would also send
+// every notification the assistant delivers through its eIM.
+let notify_tests = (then) => {
+	let rec_args = sprintf('%s/wwand-test-lpac-args', tmp);
+	let fake_rec = sprintf('%s/wwand-test-lpac-rec.sh', tmp);
+	let fake_bad = sprintf('%s/wwand-test-lpac-bad.sh', tmp);
+	let fake_ipa = sprintf('%s/wwand-test-ipa.sh', tmp);
+	let ipa_ans = sprintf('%s/wwand-test-ipa-answer', tmp);
+
+	write_stub(fake_rec, sprintf("#!/bin/sh\necho \"$*\" > %s\n", rec_args) +
+		"printf '%s\\n' '{\"type\":\"lpa\",\"payload\":{\"code\":0,\"message\":\"success\"}}'\n");
+	write_stub(fake_bad,
+		"printf '%s\\n' '{\"type\":\"lpa\",\"payload\":{\"code\":-1,\"message\":\"es9p_handle_notification\"}}'\n");
+	// the assistant: asks for seq 7, writes down the host's answer, ends
+	write_stub(fake_ipa, "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"type\":\"event\",\"payload\":{\"event\":\"notify\",\"seq\":7}}'\n" +
+		sprintf("read -r line; echo \"$line\" > %s\n", ipa_ans));
+
+	let b = mk(fake_rec, null);
+
+	b.session_notify('m0', 7, (e0) => {
+		eq(e0?.error, 'no_session', 'session_notify: refused outside a waiting session');
+
+		let got = null;
+
+		b.session_run('m0', 1, 'ipa', fake_ipa, 'notice', (rec, reply) => {
+			b.session_notify('m0', '7; reboot', (e1) => {
+				eq(e1?.error, 'invalid_argument', 'session_notify: a seq that is no integer is refused');
+
+				b.session_notify('m0', rec.payload?.seq, (e2) => {
+					got = e2;
+					reply({ ok: !e2 });
+				});
+			});
+		}, () => {
+			eq(got, null, 'session_notify: delivered');
+			eq(trim(fs.readfile(rec_args) ?? ''), 'notification process -r 7',
+				'session_notify: lpac sends that one notification and removes it after the ack');
+			ok(match(fs.readfile(ipa_ans) ?? '', /"ok": *true/), 'session_notify: the assistant hears ok');
+
+			// lpac's result line says the SM-DP+ refused: the assistant hears failed
+			let bb = mk(fake_bad, null);
+			let got2 = 'none';
+
+			bb.session_run('m0', 1, 'ipa', fake_ipa, 'notice', (rec, reply) => {
+				bb.session_notify('m0', rec.payload?.seq, (e3) => {
+					got2 = e3?.error;
+					reply({ ok: !e3 });
+				});
+			}, () => {
+				eq(got2, 'notify_failed', 'session_notify: an lpac failure is a failure');
+				ok(match(fs.readfile(ipa_ans) ?? '', /"ok": *false/), 'session_notify: the assistant hears failed');
+
+				for (let f in [ rec_args, fake_rec, fake_bad, fake_ipa, ipa_ans ])
+					fs.unlink(f);
+				then();
+			});
+		});
+	});
+};
 
 lpac_stdio_tests = () => {
 	backend_at = false;   // back to the host-side (lpac) download path
@@ -282,6 +378,7 @@ lpac_stdio_tests = () => {
 			eq(st?.state, 'done',
 				'lpac stdio: result line arriving with EOF is still parsed');
 			eq(!!entry2.modem._esim_op, false, 'lpac stdio: quiet claim released');
+			eq(changed2, 1, 'changed: a finished lpac download reports a list change');
 
 			// the watchdog: a child that says nothing must not wedge the
 			// bridge at 'running' forever (every later op would answer 'busy')
@@ -376,10 +473,12 @@ lpac_stdio_tests = () => {
 											eq(n3, null,
 												'notifications: ...and again, so the claim was released');
 
-											fs.unlink(fake_ok);
-											fs.unlink(fake_mute);
-											fs.unlink(mute_pidf);
-											done('test_esim_bridge');
+											notify_tests(() => {
+												fs.unlink(fake_ok);
+												fs.unlink(fake_mute);
+												fs.unlink(mute_pidf);
+												done('test_esim_bridge');
+											});
 										});
 									});
 									});

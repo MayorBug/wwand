@@ -456,25 +456,38 @@ export function create(opts)
 			let need_apn = configured && (card_apn != apn);
 			let need_pdp = (want_pdp != null && data.pdp_type != want_pdp);
 
-			// the attach bearer's own credentials, when one was named. Read
-			// back for comparison where the modem returns them — the password
-			// never is, so a configured one always writes.
-			let want_auth = (init && mc.init_auth != null)
-				? (AUTH_MAP[mc.init_auth] ?? wdsmod.AUTH_BOTH) : null;
+			// The attach bearer's credentials come from wherever its APN does:
+			// the modem's init_* with an init_apn, otherwise the connection's
+			// own (conn_cfg: the card's wwand_sim, then the interface) — an
+			// APN whose network demands CHAP rejects an attach without it
+			// ("EMM attach failed" while data calls with the same APN and
+			// login worked: HW-seen on the RG650E with a CHAP-only M2M card,
+			// 2026-09-27). Only with a configured APN: credentials applied to
+			// whatever APN the card provisioned would be a change nobody asked
+			// for (config.uc warns about init_user without init_apn).
+			// Read back for comparison where the modem returns them — the
+			// password never is.
+			let c_auth = init ? mc.init_auth : (configured ? cfg('auth') : null);
+			let c_user = init ? mc.init_user : (configured ? cfg('username') : null);
+			let c_pass = init ? mc.init_pass : (configured ? cfg('password') : null);
+			let creds = init || configured;
+			let want_auth = (creds && c_auth != null)
+				? (AUTH_MAP[c_auth] ?? wdsmod.AUTH_BOTH) : null;
 			// A password can never be read back, so it cannot be compared — and
 			// comparing nothing means "always differs". Left that way it wrote
 			// the attach profile on EVERY bring-up, which during an outage is
 			// once per retry: an NV write per retry, against a tree whose rule
 			// everywhere else is read-before-write precisely to avoid that.
 			//
-			// So a configured password forces the write ONCE per modem object.
-			// The object is rebuilt when the config signature changes, so a
-			// changed password still lands; a reconnect loop does not rewrite.
-			let pass_pending = init && mc.init_pass != null && !self.modem._init_pass_written;
+			// So a configured password is written once per VALUE and modem
+			// object: a reconnect loop does not rewrite it, and a password
+			// changed live (a wwand_sim edit, which no longer rebuilds the
+			// modem) still lands.
+			let pass_pending = creds && c_pass != null && self.modem._attach_pass !== c_pass;
 
-			let need_auth = init && ((want_auth != null && data.auth != want_auth) ||
-			                         (mc.init_user != null && data.username != mc.init_user) ||
-			                         pass_pending);
+			let need_auth = creds && ((want_auth != null && data.auth != want_auth) ||
+			                          (c_user != null && data.username != c_user) ||
+			                          pass_pending);
 
 			if (!need_apn && !need_pdp && !need_auth) {
 				log('debug', sprintf('attach profile %d up to date (apn %J pdp %J)',
@@ -493,20 +506,21 @@ export function create(opts)
 				if (want_auth != null)
 					mod.auth = want_auth;
 
-				if (mc.init_user != null)
-					mod.username = mc.init_user;
+				if (c_user != null)
+					mod.username = c_user;
 
-				if (mc.init_pass != null)
-					mod.password = mc.init_pass;
+				if (c_pass != null)
+					mod.password = c_pass;
 			}
 
 			if (want_pdp != null)
 				mod.pdp_type = want_pdp;
 
-			log('notice', sprintf('attach profile %d: apn %J%s, pdp %J->%J',
+			log('notice', sprintf('attach profile %d: apn %J%s, pdp %J->%J%s',
 				index, need_apn ? apn : card_apn,
 				init ? ' (init_apn — distinct from the data APN)' : '',
-				data.pdp_type, want_pdp));
+				data.pdp_type, want_pdp,
+				need_auth ? sprintf(', auth %J%s', c_auth ?? '(kept)', c_user != null ? sprintf(' user %J', c_user) : '') : ''));
 
 			wds.request('MODIFY_PROFILE', mod, (e2) => {
 				if (torn_down(e2, wds))
@@ -519,7 +533,7 @@ export function create(opts)
 					// or cancelled write suppressed the password on every later
 					// retry with this modem object — the credential would then
 					// never reach the profile at all.
-					self.modem._init_pass_written = true;
+					self.modem._attach_pass = mod.password;
 
 				done(!e2);
 			});
@@ -696,7 +710,7 @@ export function create(opts)
 					// here (client.uc:176 — no `no_recovery` on the dial, and
 					// there must not be: a dial that genuinely fails has to
 					// climb). That is deliberate and harmless: the very next
-					// successful request zeroes it (recovery.uc:368-369), and
+					// successful request zeroes it (recovery.uc:388-389), and
 					// the same is already true of the NO_EFFECT that
 					// qmi_backend.set_opmode normalises.
 					if (e3?.error == 'qmi' && e3.code == QMI_ERR_NO_EFFECT) {

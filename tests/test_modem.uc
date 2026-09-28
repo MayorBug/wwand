@@ -179,6 +179,213 @@ scenario('happy', { handlers: base_handlers() }, 'registered',
 		eq(modem.counters.attempts, 0, 'happy: attempts reset');
 	});
 
+// --- 1a: a plugin holds the radio off at init ----------------------------------
+// A modem waiting for a remote SIM (or lending its card) must not register even
+// once: switched online at SET_OPMODE, the RG650E on 245 registered with its own
+// card 2 s later, before the remote SIM was up (2026-09-28). Held, the init goes
+// to low power instead, waits in REGISTERING without failing, and registers when
+// the daemon wakes it.
+let hold_at_init = { hold: 'rsim: its remote SIM x is not connected yet', woke: false };
+
+scenario('plugin hold at init', {
+	handlers: base_handlers({
+		// asked by a registration timeout (the reject detail) — which is
+		// what a hold at init must not run into
+		GET_SYSTEM_INFO: { __error: 71 },
+		GET_PROFILE_SETTINGS: { __error: 71 },
+		GET_SERVING_SYSTEM: (args, meta) => ({
+			serving_system: { registration: 0, cs_attach: 0, ps_attach: 0,
+			                  selected_network: 0, radio_ifs: [] },
+		}),
+	}),
+	guard_ms: 4000,
+	setup: (mock, modem) => {
+		modem.radio_hold = () => hold_at_init.hold;
+
+		// three registration timeouts parked, then the hold goes: the daemon's
+		// tick wakes the radio (plugin_radio), and the modem registers
+		uloop.timer(1600, () => {
+			hold_at_init.parked_state = modem.state;
+			hold_at_init.parked_modes = map(mock.calls_for('SET_OPERATING_MODE'), (c) => c.args?.mode);
+			hold_at_init.parked = modem.lowpower_parked;
+			hold_at_init.held = modem._plugin_held;
+			hold_at_init.hold = null;
+			modem.set_opmode('online', () => {
+				// without the hold at init the modem is long gone (failed
+				// registration, stopped): the checks below say so
+				if (!modem.nas)
+					return;
+
+				hold_at_init.woke = true;
+				mock.indicate(3, modem.nas.cid, 'SERVING_SYSTEM_IND', {
+					serving_system: { registration: 1, cs_attach: 1, ps_attach: 1,
+					                  selected_network: 1, radio_ifs: [ 8 ] },
+					current_plmn: { mcc: 262, mnc: 1, description: 'Telekom.de' },
+				});
+			});
+		});
+	},
+}, 'registered',
+	(modem, mock, events) => {
+		eq(hold_at_init.parked_modes, [ 1 ],
+		   'hold at init: low power instead of online — the radio never went on');
+		eq([ hold_at_init.parked, hold_at_init.held ], [ true, true ],
+		   'hold at init: parked, as the plugin\'s park (the daemon\'s tick wakes it)');
+		eq(hold_at_init.parked_state, 'REGISTERING',
+		   'hold at init: the chain waits in REGISTERING...');
+		eq(length(filter(events, (e) => e.event == 'error')), 0,
+		   '...through three registration timeouts, without a failure (no recovery ladder)');
+		ok(hold_at_init.woke, 'hold at init: woken by the daemon');
+		eq(modem.state, 'READY', 'hold at init: once woken, it registers');
+		eq(map(mock.calls_for('SET_OPERATING_MODE'), (c) => c.args?.mode), [ 1, 0 ],
+		   'hold at init: online only once the hold is gone');
+		eq(length(filter(events, (e) => e.event == 'registered')), 1, 'hold at init: registered once');
+		eq(modem._wake_pending, false, 'hold at init: no second registered to come from the wake');
+	});
+
+// --- 1a2: a re-init after the hold ended leaves no park behind ----------------
+// The modem object outlives a failed init (make_fail: teardown, then start()
+// on the same instance). Parked at the first pass, online at the second: the
+// park flags must go with the online switch, or REGISTERING waits forever and
+// the next registration loss is read as "radio parked" and swallowed.
+let reinit = { hold: 'rsim: its remote SIM x is not connected yet' };
+
+scenario('plugin hold at init, re-init without it', {
+	handlers: base_handlers({
+		GET_SYSTEM_INFO: { __error: 71 },
+		GET_PROFILE_SETTINGS: { __error: 71 },
+		// the parked radio does not register; online (second pass) it does
+		GET_SERVING_SYSTEM: () => reinit.hold ? {
+			serving_system: { registration: 0, cs_attach: 0, ps_attach: 0,
+			                  selected_network: 0, radio_ifs: [] },
+		} : {
+			serving_system: { registration: 1, cs_attach: 1, ps_attach: 1,
+			                  selected_network: 1, radio_ifs: [ 8 ] },
+			current_plmn: { mcc: 262, mnc: 1, description: 'Telekom.de' },
+		},
+	}),
+	guard_ms: 4000,
+	setup: (mock, modem) => {
+		modem.radio_hold = () => reinit.hold;
+
+		// the first pass parks; then the hold ends and the init runs again —
+		// what make_fail does after a failure
+		uloop.timer(400, () => {
+			reinit.parked = [ modem.lowpower_parked, modem._plugin_held ];
+			reinit.hold = null;
+			modem.teardown();
+			modem.start();
+		});
+	},
+}, 'registered',
+	(modem, mock, events) => {
+		eq(reinit.parked, [ true, true ], 're-init: the first pass parked (the plugin\'s hold)');
+		eq([ modem.lowpower_parked, modem._plugin_held ], [ false, false ],
+		   're-init: online at the second pass, and no park left recorded');
+
+		// a registration loss now is a fault, not a park's consequence
+		modem._update_serving({ serving_system: { registration: 0, cs_attach: 0, ps_attach: 0,
+		                                          selected_network: 0, radio_ifs: [] } });
+		eq(modem.state, 'REGISTERING', 're-init: a later registration loss re-registers, it is not swallowed');
+	});
+
+// --- 1a3: a modem that refuses low power at init stays held -------------------
+// fail() on the refused park walked the recovery ladder — radio cycles and
+// resets that end online, the registration the hold is there to prevent.
+let refused = { hold: 'rsim: its remote SIM x is not connected yet' };
+
+scenario('plugin hold at init, low power refused', {
+	handlers: base_handlers({
+		SET_OPERATING_MODE: (args) => (args?.mode == 1) ? { __error: 0x0001 } : {},
+		GET_SYSTEM_INFO: { __error: 71 },
+		GET_PROFILE_SETTINGS: { __error: 71 },
+		GET_SERVING_SYSTEM: (args, meta) => refused.woke ? {
+			serving_system: { registration: 1, cs_attach: 1, ps_attach: 1,
+			                  selected_network: 1, radio_ifs: [ 8 ] },
+			current_plmn: { mcc: 262, mnc: 1, description: 'Telekom.de' },
+		} : {
+			serving_system: { registration: 0, cs_attach: 0, ps_attach: 0,
+			                  selected_network: 0, radio_ifs: [] },
+		},
+	}),
+	guard_ms: 4000,
+	setup: (mock, modem) => {
+		modem.radio_hold = () => refused.hold;
+
+		// past two registration timeouts: still waiting, held, no failure
+		uloop.timer(1300, () => {
+			refused.state = modem.state;
+			refused.held = [ modem._plugin_held, modem.lowpower_parked ];
+			refused.hold = null;
+			refused.woke = true;
+			modem._plugin_held = false;     // the daemon's tick hands it back
+
+			// failed and torn down instead (what the checks below catch)
+			if (!modem.nas)
+				return;
+
+			mock.indicate(3, modem.nas.cid, 'SERVING_SYSTEM_IND', {
+				serving_system: { registration: 1, cs_attach: 1, ps_attach: 1,
+				                  selected_network: 1, radio_ifs: [ 8 ] },
+				current_plmn: { mcc: 262, mnc: 1, description: 'Telekom.de' },
+			});
+		});
+	},
+}, 'registered',
+	(modem, mock, events) => {
+		eq(refused.state, 'REGISTERING', 'refused park: the init goes on and waits in REGISTERING');
+		eq(refused.held, [ true, false ], 'refused park: held, not parked (the modem said no)');
+		eq(length(filter(events, (e) => e.event == 'error')), 0,
+		   'refused park: no failure, so no recovery ladder');
+		eq(map(mock.calls_for('SET_OPERATING_MODE'), (c) => c.args?.mode), [ 1 ],
+		   'refused park: low power asked once, no offline fallback, never online behind the hold');
+		eq(modem.state, 'READY', 'refused park: registers once the hold is gone');
+	});
+
+// --- 1a4: the FCC check skipped with the held radio runs at the wake ----------
+// An RF-locked laptop SKU accepts set-online and stays in low power until it is
+// authenticated; the held init skipped verify_online with the radio, so the
+// wake must run it, or the woken modem never registers.
+let fcc_held = { hold: 'rsim: its remote SIM x is not connected yet', unlocked: false };
+
+scenario('plugin hold at init, FCC at the wake', {
+	handlers: base_handlers({
+		GET_OPERATING_MODE: () => ({ mode: fcc_held.unlocked ? 0 : 6 }),
+		SET_FCC_AUTHENTICATION: (args) => { fcc_held.unlocked = true; return {}; },
+		GET_SYSTEM_INFO: { __error: 71 },
+		GET_PROFILE_SETTINGS: { __error: 71 },
+		GET_SERVING_SYSTEM: (args, meta) => ({
+			serving_system: { registration: 0, cs_attach: 0, ps_attach: 0,
+			                  selected_network: 0, radio_ifs: [] },
+		}),
+	}),
+	guard_ms: 4000,
+	setup: (mock, modem) => {
+		modem.radio_hold = () => fcc_held.hold;
+
+		uloop.timer(700, () => {
+			fcc_held.at_init = length(mock.calls_for('SET_FCC_AUTHENTICATION'));
+			fcc_held.hold = null;
+			modem.set_opmode('online', () => {
+				fcc_held.answered_unlocked = fcc_held.unlocked;
+				if (!modem.nas)
+					return;
+				mock.indicate(3, modem.nas.cid, 'SERVING_SYSTEM_IND', {
+					serving_system: { registration: 1, cs_attach: 1, ps_attach: 1,
+					                  selected_network: 1, radio_ifs: [ 8 ] },
+					current_plmn: { mcc: 262, mnc: 1, description: 'Telekom.de' },
+				});
+			});
+		});
+	},
+}, 'registered',
+	(modem, mock, events) => {
+		eq(fcc_held.at_init, 0, 'fcc held: no FCC message while the radio stays off at init');
+		eq(length(mock.calls_for('SET_FCC_AUTHENTICATION')), 1, 'fcc held: ...and the wake sends it');
+		eq(fcc_held.answered_unlocked, true, 'fcc held: the wake answers once the modem is unlocked');
+		eq(modem._fcc_due, false, 'fcc held: done once, not again at the next wake');
+	});
+
 // --- 1b: GSM-7-bit packed operator name (issue #2) ---------------------------
 // EG06-class firmware GSM-7-bit packs the Current-PLMN name. "PLAY" packs to the
 // octets 50 66 30 0b, which as raw ASCII read "Pf0\x0b" (note the 0x0b control
@@ -244,11 +451,61 @@ scenario('late-reg', {
 		modem._update_serving({ serving_system: { registration: 0, radio_ifs: [] } });
 		eq(modem.state, 'READY', 'parked: losing registration does not re-enter the register chain');
 
+		// woken again (set_opmode 'online' from a park marks it): the next
+		// registration is reported as one — the modem never left READY, and
+		// without the event the daemon would not re-arm what it gave up
+		// while the radio was off
+		let before = length(filter(events, (e) => e.event == 'registered'));
+
+		modem._wake_pending = true;
+		modem._update_serving({ serving_system: { registration: 1, radio_ifs: [ 8 ] } });
+		eq(length(filter(events, (e) => e.event == 'registered')) - before, 1,
+		   'woken from a park: the registration that follows is reported');
+		eq(modem._wake_pending, false, 'woken from a park: ...once');
+		modem._update_serving({ serving_system: { registration: 0, radio_ifs: [] } });
+
 		// ...and unparked, the same loss DOES chase it — otherwise the guard
 		// above would be indistinguishable from never supervising at all
 		modem.lowpower_parked = false;
 		modem._update_serving({ serving_system: { registration: 0, radio_ifs: [] } });
 		eq(modem.state, 'REGISTERING', 'unparked: a real registration loss is chased');
+
+		// every write of wwand's own is queued, the recovery cycle's and the
+		// init chain's too: they go around set_opmode
+		modem._opmode_pending = [];
+		// read at once: the write is queued before it is sent
+		modem._opmode_set('low_power', () => null);
+		let queued_direct = filter(modem._opmode_pending, (e) => e.mode == 'low_power');
+
+		// the operating-mode report that follows a park or a wake is ours
+		modem._dms_opmode = 1;
+		modem._opmode_pending = [ { mode: 'online', at: time() } ];
+		eq(modem._opmode_note(0)?.[1], 'operating mode now online (as set by wwand)',
+		   'opmode: the change wwand asked for is not reported as external');
+		eq(modem._opmode_note(1)?.[1], 'operating mode changed externally: low power',
+		   'opmode: ...one it did not ask for is');
+
+		// a different change settles the request: the asked mode arriving
+		// after it is not ours any more
+		modem._dms_opmode = 0;
+		modem._opmode_pending = [ { mode: 'online', at: time() } ];
+		modem._opmode_note(1);
+		eq(modem._opmode_note(0)?.[1], 'operating mode changed externally: online',
+		   'opmode: after another change, the asked mode is external');
+
+		// two writes in flight (a modem reset: offline, then reset): both
+		// reports are ours, in order
+		modem._dms_opmode = 0;
+		modem._opmode_pending = [ { mode: 'offline', at: time() }, { mode: 'reset', at: time() } ];
+		eq([ modem._opmode_note(3)?.[0], modem._opmode_note(4)?.[0] ], [ 'info', 'info' ],
+		   'opmode: offline then reset, both reported as wwand\'s own');
+
+		// a skipped state: the reset reported without the offline before it
+		modem._dms_opmode = 0;
+		modem._opmode_pending = [ { mode: 'offline', at: time() }, { mode: 'reset', at: time() } ];
+		eq([ modem._opmode_note(4)?.[0], length(modem._opmode_pending) ], [ 'info', 0 ],
+		   'opmode: a report of a later write settles the earlier one too');
+		ok(length(queued_direct) == 1, 'opmode: the direct write had been queued');
 	});
 
 // --- 3: PIN required, verified via UIM ---------------------------------------
@@ -1395,7 +1652,7 @@ scenario('ladder', {
 		GET_CARD_STATUS: (args, meta) =>
 			(meta.count == 1) ? { __error: 3 } : { card_status: card_status() },
 	}),
-	recovery: { fx: ladder_fx, state_dir: '/state' },
+	recovery: { fx: ladder_fx, state_dir: '/state', now: () => 5000 },
 }, 'registered',
 	(modem, mock, events) => {
 		eq(modem.state, 'READY', 'ladder: recovered to READY');
@@ -1413,7 +1670,7 @@ scenario('ladder', {
 		// escalate. A modem that never answered gets 0 here and nothing physical
 		// happens — see the gate tests in test_recovery.
 		eq(ladder_fx.files['/state/ladder.json'],
-			'{ "attempts": 8, "proto_errors": 0, "rung": 1, "proto_hw": 0, "proto_hw_base": 0, "proto_ok": 1, "proto_name": "qmi", "unarmed_reset": 0 }',
+			'{ "attempts": 8, "proto_errors": 0, "rung": 1, "proto_hw": 0, "proto_hw_base": 0, "proto_ok": 1, "proto_name": "qmi", "unarmed_reset": 0, "outage_since": 5000 }',
 			'ladder: state persisted (rung 1 = opmode_cycle fired, arming recorded)');
 	});
 
@@ -2671,6 +2928,282 @@ eq(reattach_err?.error, 'cancelled',
 	ok(armed, 'teardown-throws: the hostile waiter table was installed');
 	eq(m._teardown_depth, 0,
 		'teardown-throws: the depth came back down even so, so retries still work');
+}
+
+// The blocks below end their loop from inside an event (a timer that stops
+// the modem, then one that ends the loop). An event that fires twice arms
+// that chain twice, and the second uloop.end() then fires inside the NEXT
+// block's loop and ends it before its modem has done anything — seen under
+// the parallel suite (done_once still false, no RELEASE on the wire). So each
+// such timer is recorded and cancelled once its block's loop is over.
+// ...and a uloop.end() left armed by an EARLIER part of this file (the
+// scenario harness, the teardown blocks) must not end a block early either:
+// each block runs its loop until its own finish_block, so a stray end only
+// costs one more pass.
+let block_done = false;
+let finish_block = () => { block_done = true; uloop.end(); };
+let run_block = () => { block_done = false; while (!block_done) uloop.run(); };
+let block_timers = [];
+let later = (ms, fn) => { let t = uloop.timer(ms, fn); push(block_timers, t); return t; };
+// fn once cond() holds, checked every 10 ms, or after max_ms regardless
+let when;
+when = (cond, fn, max_ms) => (cond() || max_ms <= 0) ? fn() : later(10, () => when(cond, fn, max_ms - 10));
+let drain_later = () => { for (let t in block_timers) t.cancel(); block_timers = []; };
+
+// --- a plugin's own service client (modem.extra_client) ---------------------
+//
+// A plugin brings a schema the core does not know and gets a client on the
+// modem's channel. The modem owns it: teardown must RELEASE its CID like the
+// core's own clients, because the plugin cannot see the teardown coming and a
+// CID left allocated sits in the modem's client table until the stack resets.
+{
+	uloop.init();
+
+	const XSVC = {
+		service: 0x32,
+		messages: {
+			PING:    { id: 0x0020, req: {}, resp: {} },
+			EVT_IND: { id: 0x0023, ind: { slot: { t: 0x01, f: 'u32' } } },
+		},
+	};
+	let vi = { services: [
+		{ service: 1, major: 1, minor: 60 }, { service: 2, major: 1, minor: 14 },
+		{ service: 3, major: 1, minor: 25 }, { service: 11, major: 1, minor: 22 },
+		{ service: 26, major: 1, minor: 16 },
+	] };
+	let run = (with_svc, body) => {
+		let vi2 = { services: [ ...vi.services, ...(with_svc ? [ { service: 0x32, major: 1, minor: 5 } ] : []) ] };
+		let mock = mockhub.create({ handlers: base_handlers({ GET_VERSION_INFO: vi2, PING: {} }),
+		                            schemas: [ XSVC ] });
+		let m;
+		let done_once = false;
+
+		m = modem_mod.create({
+			id: 'extra', device: '/dev/mock0', config: {},
+			recovery: { fx: fakefx.create(), state_dir: '/state' },
+			at: { fx: fakefx.create() },
+			timing: TIMING,
+			deps: {
+				transport_open: mock.transport_open,
+				log: (level, msg) => null,
+				on_event: (mm, event) => {
+					if (event != 'registered' || done_once)
+						return;
+					done_once = true;
+					body(m, mock);
+				},
+			},
+		});
+		m.start();
+		// cancelled after the run: a guard timer left armed would end the NEXT
+		// block's loop early, before its modem has registered
+		let guard = uloop.timer(15000, finish_block);
+		run_block();
+		drain_later();
+		guard.cancel();
+		m.stop();   // nor may a modem the guard cut short keep running
+		return done_once;
+	};
+
+	let got = {};
+
+	run(true, (m, mock) => {
+		m.extra_client(XSVC, (err, c) => {
+			got.err = err;
+			got.c = c;
+			if (!c)
+				return finish_block();
+			c.on('EVT_IND', (d) => { got.ind = d.slot; });
+			c.request('PING', {}, (e) => {
+				got.ping = e;
+				mock.indicate(0x32, c.cid, 'EVT_IND', { slot: 1 });
+				// until the indication is in, not a fixed 20 ms: a loaded
+				// host delivers it later
+				when(() => got.ind != null, () => {
+					m.stop();
+					later(20, finish_block);
+				}, 3000);
+			});
+		});
+	});
+
+	eq(got.err, null, 'extra client: allocated for a service the modem lists');
+	eq(got.ping, null, 'extra client: its requests reach the modem');
+	eq(got.ind, 1, 'extra client: and its indications reach the plugin');
+	eq(got.c?.destroyed, true, 'extra client: teardown destroys it, so the plugin knows to allocate again');
+
+	let got2 = {};
+
+	run(false, (m, mock) => {
+		m.extra_client(XSVC, (err, c) => {
+			got2.err = err;
+			got2.c = c;
+			m.stop();
+			later(20, finish_block);
+		});
+	});
+
+	eq(got2.err?.error, 'service_unavailable',
+		'extra client: a service missing from GET_VERSION_INFO is refused with the reason, not asked for');
+	eq(got2.c, null, 'extra client: ...and no client');
+}
+
+// the RELEASE on teardown, checked on the wire
+{
+	uloop.init();
+
+	const XSVC = { service: 0x32, messages: { PING: { id: 0x0020, req: {}, resp: {} } } };
+	let mock = mockhub.create({ handlers: base_handlers({ GET_VERSION_INFO: { services: [
+		{ service: 1, major: 1, minor: 60 }, { service: 2, major: 1, minor: 14 },
+		{ service: 3, major: 1, minor: 25 }, { service: 11, major: 1, minor: 22 },
+		{ service: 26, major: 1, minor: 16 }, { service: 0x32, major: 1, minor: 5 } ] } }),
+		schemas: [ XSVC ] });
+	let m, cid = null, released = null;
+
+	m = modem_mod.create({
+		id: 'extra-rel', device: '/dev/mock0', config: {},
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		at: { fx: fakefx.create() },
+		timing: TIMING,
+		deps: {
+			transport_open: mock.transport_open,
+			log: (level, msg) => null,
+			on_event: (mm, event) => {
+				if (event != 'registered' || cid != null)
+					return;
+				m.extra_client(XSVC, (err, c) => {
+					cid = c?.cid;
+					m.stop();
+					later(20, finish_block);
+				});
+			},
+		},
+	});
+	m.start();
+	// generous: the suite runs its files in parallel, and a block whose guard
+	// fires first leaves callbacks behind that end the NEXT block's loop
+	let guard = uloop.timer(15000, finish_block);
+	run_block();
+	drain_later();
+	guard.cancel();
+	m.stop();   // idempotent; a block ended by its guard must not leak timers
+
+	for (let c in mock.calls)
+		if (c.name == 'RELEASE_CID' && c.args?.release?.service == 0x32)
+			released = c.args.release.cid;
+
+	ok(cid != null, 'extra client release: a client was allocated');
+	eq(released, cid, 'extra client release: teardown sent RELEASE_CID for the plugin\'s CID');
+
+}
+
+// A modem with no card stops in SIM_BLOCKED; when a card arrives later (a
+// remote SIM offered after the init ran, wwand-rsim) retry_sim resumes from
+// the SIM step and the modem registers — without it, it stayed blocked until
+// a reload.
+{
+	uloop.init();
+
+	let card_in = false;
+	let events = [];
+	let mock = mockhub.create({ handlers: base_handlers({
+		GET_CARD_STATUS: () => {
+			let cs = card_status();
+
+			if (!card_in)
+				cs.cards[0].card_state = 0;   // absent
+			return { card_status: cs };
+		},
+	}) });
+	let m;
+
+	m = modem_mod.create({
+		id: 'nocard', device: '/dev/mock0', config: {},
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		at: { fx: fakefx.create() },
+		timing: TIMING,
+		deps: {
+			transport_open: mock.transport_open,
+			log: (level, msg) => null,
+			on_event: (mm, event, data) => {
+				push(events, event);
+
+				if (event == 'sim_blocked' && !card_in) {
+					m.sim_block = data;   // what the daemon records
+
+					// the card arrives
+					later(50, () => {
+						card_in = true;
+						ok(m.state == 'SIM_BLOCKED', 'no card: the modem stopped in SIM_BLOCKED');
+						eq(m.retry_sim(), true, 'card arrived: retry_sim resumes from the SIM step');
+					});
+				}
+				if (event == 'registered')
+					later(20, () => { m.stop(); later(20, finish_block); });
+			},
+		},
+	});
+	m.start();
+
+	let guard = uloop.timer(15000, finish_block);
+	run_block();
+	drain_later();
+	guard.cancel();
+	m.stop();
+
+	ok(index(events, 'registered') >= 0, 'card arrived: the modem registers on it');
+
+	// a PIN block is not what a new card cures
+	m.sim_block = { reason: 'pin_blocked' };
+	m.state = 'SIM_BLOCKED';
+	eq(m.retry_sim(), false, 'a PIN/PUK block stays terminal');
+}
+
+// a client given back twice while the modem runs is released ONCE: the
+// second number may already belong to someone else (teardown released it, or
+// the modem was replaced and numbers its CIDs afresh)
+{
+	uloop.init();
+
+	const XSVC = { service: 0x32, messages: { PING: { id: 0x0020, req: {}, resp: {} } } };
+	let mock = mockhub.create({ handlers: base_handlers({ GET_VERSION_INFO: { services: [
+		{ service: 1, major: 1, minor: 60 }, { service: 2, major: 1, minor: 14 },
+		{ service: 3, major: 1, minor: 25 }, { service: 11, major: 1, minor: 22 },
+		{ service: 26, major: 1, minor: 16 }, { service: 0x32, major: 1, minor: 5 } ] } }),
+		schemas: [ XSVC ] });
+	let m, done_once = false;
+
+	m = modem_mod.create({
+		id: 'extra-twice', device: '/dev/mock0', config: {},
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		at: { fx: fakefx.create() },
+		timing: TIMING,
+		deps: {
+			transport_open: mock.transport_open,
+			log: (level, msg) => null,
+			on_event: (mm, event) => {
+				if (event != 'registered' || done_once)
+					return;
+				done_once = true;
+				m.extra_client(XSVC, (err, c) => {
+					m.extra_release(c);
+					m.extra_release(c);
+					later(30, () => { m.stop(); later(20, finish_block); });
+				});
+			},
+		},
+	});
+	m.start();
+	// generous: the suite runs its files in parallel, and a block whose guard
+	// fires first leaves callbacks behind that end the NEXT block's loop
+	let guard = uloop.timer(15000, finish_block);
+	run_block();
+	drain_later();
+	guard.cancel();
+	m.stop();   // idempotent; a block ended by its guard must not leak timers
+
+	eq(length(filter(mock.calls, (c) => c.name == 'RELEASE_CID' && c.args?.release?.service == 0x32)), 1,
+	   'extra client: given back twice, released once');
 }
 
 done('test_modem');

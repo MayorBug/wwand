@@ -24,7 +24,7 @@ import * as config from 'wwand/config.uc';
 import * as daemon_mod from 'wwand/daemon.uc';
 
 const TIMING = { sync_retry: 1, settle: 1, sim_settle: 1, card_poll: 1,
-	reg_timeout: 500, backoff_min: 40, backoff_max: 60, hold_max_ms: 120 };
+	reg_timeout: 500, backoff_min: 40, backoff_max: 60, hold_max_ms: 120, unrecorded_confirm_ms: 0 };
 
 // one stubbed daemon: the modem stub carries the rndis_host datapath and both
 // create() calls capture their on_event bindings; ensure_wan6 is recorded
@@ -407,9 +407,13 @@ let dkick = mk('ipv4', []);
 dkick.modem()('registered');
 eq(kicks, [ 'wan' ], 'ifdown: a normally-down interface is still kicked up once registered');
 
+// The operator's ifdown ran the shim's teardown, which left its record
+// (context_down, or the shim's file with no daemon to ask): that record, not
+// the cleared autostart alone, is the intent.
 kicks = [];
 autostart = false;
 let ddown = mk('ipv4', []);
+ddown.d._admin_downs.wan = true;
 ddown.modem()('registered');
 eq(kicks, [], 'ifdown: an administratively down interface (autostart=false) is left alone');
 ok(ddown.d.contexts.wan.wanted == false,
@@ -459,8 +463,20 @@ ok(dsim.d._our_downs.wan == null,
 kicks = [];
 autostart = false;
 let dboth = mk('ipv4', []);
+dboth.d._admin_downs.wan = true;
 dboth.modem()('registered');
-eq(kicks, [], 'ifdown: without our marker, autostart=false is still operator intent');
+eq(kicks, [], 'ifdown: without our marker, a recorded ifdown is still operator intent');
+
+// ...and without the record, a cleared autostart is nobody's intent: a down
+// of ours whose marker went with a restarted daemon (HW-seen on the NR7101,
+// 2026-09-27) is brought back
+kicks = [];
+autostart = false;
+let dnorec = mk('ipv4', []);
+dnorec.d._admin_record_trusted = true;     // a start that could have recorded it
+delete dnorec.d._admin_downs.wan;          // ...and did not (the untrusted start's guess had)
+dnorec.modem()('registered');
+eq(kicks, [ 'wan' ], 'ifdown: autostart=false with no operator record is kicked up');
 
 // --- the connect-first kick must not read OUR OWN down as an ifdown ----------
 //
@@ -588,6 +604,7 @@ ok(dop.d._our_downs.wan == null, 'connect-first: no down of ours to mark');
 
 mb_kicks = [];
 mb_autostart = false;
+dop.d._admin_downs.wan = true;
 dop.ctx()('up');
 
 eq(mb_kicks, [], 'connect-first: an ifdown during the connect is still honoured');
@@ -624,6 +641,7 @@ dttl.d._our_downs.wan -= 100000;
 mb_kicks = [];
 mb_pending = false;
 mb_autostart = false;
+dttl.d._admin_downs.wan = true;
 dttl.modem()('registered');
 
 eq(mb_kicks, [], 'ttl: a stale marker no longer claims an operator ifdown as ours');

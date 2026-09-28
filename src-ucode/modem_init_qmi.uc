@@ -277,7 +277,7 @@ export function install(self, o)
 		// and then destroys the clients, which delivers `cancelled` to the AT
 		// command in flight — so this callback can arrive AFTER the modem is
 		// gone, and next() would drive the init chain over a dead instance.
-		// Same trap as modem.uc:183.
+		// Same trap as modem.uc:184.
 		let resume = (why) => {
 			if (resumed || self._gen != gen)
 				return;
@@ -293,7 +293,7 @@ export function install(self, o)
 				why, join('; ', reasons)));
 
 			// Deliberately NOT cleared on a later init pass. The object is
-			// created once per device attach (daemon.uc:1667), so a modem that
+			// created once per device attach (daemon.uc:2826), so a modem that
 			// really did reset comes back as a NEW instance with no debt — and
 			// a re-init of THIS instance means it did not, so the debt still
 			// holds. Deduplicated because a re-init re-derives the same reason
@@ -323,8 +323,8 @@ export function install(self, o)
 				{ timeout: 5000 });
 
 		if (self.dms)
-			return qmi_backend.set_opmode(self.dms, 'offline', () =>
-				qmi_backend.set_opmode(self.dms, 'reset',
+			return self._opmode_set('offline', () =>
+				self._opmode_set('reset',
 					(err) => err ? resume(sprintf('refused: %J', err)) : null));
 
 		resume('has no AT port and no DMS client to issue it');
@@ -340,10 +340,59 @@ export function install(self, o)
 		// list + SIM/network state (the actual restore runs at CONFIGURE_NET,
 		// after SIM unlock, so a per-SIM configured list can resolve).
 		sim.log_preradio(self, log, () => {
-			qmi_backend.set_opmode(self.dms, 'online', (err) => {
+			// A plugin holds the radio off (its card is lent, or it waits for
+			// a remote SIM): low power instead of online, as the plugin's park.
+			// Switched on and registered only then, the modem registered with
+			// its own card first — at boot every time, within 2 s, while the
+			// remote SIM needs 3 (HW-seen on 245, RG650E, 2026-09-28). The
+			// SIM and UIM Remote work with the radio off; the daemon's tick
+			// wakes it once the hold is gone, and REGISTERING waits for that.
+			let hold = self.radio_hold?.();
+
+			if (hold) {
+				log('notice', sprintf('radio stays off at init — %s', hold));
+				self._plugin_held = true;
+
+				// The FCC check below is skipped with the radio: an RF-locked
+				// modem shows its lock only after a set-online, so the wake
+				// runs it (modem.uc set_opmode, `_fcc_due`).
+				self._fcc_due = true;
+
+				return self.set_opmode('low_power', (err) => {
+					// A REFUSED PARK IS NOT AN INIT FAILURE. fail() here walked
+					// the recovery ladder — opmode cycles and resets that end
+					// online, the very registration the hold is there to
+					// prevent — over a modem whose only fault was declining
+					// one mode. It continues held instead: REGISTERING waits
+					// while held, the daemon's registered handler parks again
+					// if it registers after all, and its interfaces are
+					// refused (radio_held). No `offline` fallback: libqmi
+					// describes it as RF off and "partially shutdown"
+					// (qmi-enums-dms.h, QmiDmsOperatingMode, libqmi 1.38.0),
+					// and the way back from it is a reset (the tree's own
+					// modem reset is offline -> reset, modem_mbim.uc reset) —
+					// the wake would have to reset the modem.
+					if (err)
+						log('warn', sprintf('radio stays off at init: low power refused (%J) — continuing held; its interfaces are refused until the hold ends',
+							err));
+
+					tm.settle = uloop.timer(self.timing.settle, step_simslot);
+				});
+			}
+
+			self._opmode_set('online', (err) => {
 				// (set_opmode already treats "no effect / already online" as success)
 				if (err)
 					return fail('opmode', err);
+
+				// Online by the init's own hand, so no park is in force any
+				// more: this object outlives a failed init (make_fail
+				// restarts the same instance), and a flag left from a park
+				// at an earlier pass made REGISTERING wait forever and the
+				// next registration loss read as "radio parked" — swallowed.
+				self.lowpower_parked = false;
+				self._plugin_held = false;
+				self._fcc_due = false;
 
 				verify_online(0);
 			});
@@ -382,14 +431,19 @@ export function install(self, o)
 		return [ [ 'dms', null ], [ 'foxconn', 0 ] ];
 	};
 
-	verify_online = (fcc_idx) => {
+	// `then` (default: settle, then the SIM steps) runs once the modem is
+	// online or the FCC variants are used up — the wake of a radio held at
+	// init passes its own (fcc_verify below).
+	verify_online = (fcc_idx, then) => {
+		then ??= () => tm.settle = uloop.timer(self.timing.settle, step_simslot);
+
 		self.dms.request('GET_OPERATING_MODE', {}, (err, d) => {
 			let mode = err ? null : d?.mode;
 
 			// unsupported query or already online -> settle and continue
 			// (settle after mode change; old dialer: sleep 2)
 			if (mode == null || mode == dmsmod.OPMODE_ONLINE)
-				return tm.settle = uloop.timer(self.timing.settle, step_simslot);
+				return then();
 
 			let locked = (mode == dmsmod.OPMODE_LOW_POWER ||
 			              mode == dmsmod.OPMODE_PERSISTENT_LOW_POWER ||
@@ -401,7 +455,7 @@ export function install(self, o)
 				log('warn', sprintf('modem stays in %s after set-online%s — continuing',
 					dmsmod.OPMODE_NAMES[sprintf('%d', mode)] ?? sprintf('opmode %d', mode),
 					(locked && length(variants)) ? ' (FCC authentication did not release it)' : ''));
-				return tm.settle = uloop.timer(self.timing.settle, step_simslot);
+				return then();
 			}
 
 			let variant = variants[fcc_idx][0], magic = variants[fcc_idx][1];
@@ -412,11 +466,11 @@ export function install(self, o)
 			qmi_backend.fcc_auth(self.dms, variant, magic, (ferr) => {
 				if (ferr) {
 					log('info', sprintf('FCC authentication (%s) not accepted: %J', variant, ferr));
-					return verify_online(fcc_idx + 1);
+					return verify_online(fcc_idx + 1, then);
 				}
 
 				log('notice', sprintf('FCC authentication accepted (%s) — going online', variant));
-				qmi_backend.set_opmode(self.dms, 'online', () => verify_online(fcc_idx + 1));
+				self._opmode_set('online', () => verify_online(fcc_idx + 1, then));
 			});
 		}, { no_recovery: true });
 	};
@@ -482,6 +536,26 @@ export function install(self, o)
 
 			next();
 		});
+	};
+
+	// Resume the init chain at the SIM step, for a modem that stopped in
+	// SIM_BLOCKED because there was no card, or none that answered — and now
+	// there is one: a remote SIM offered after the init ran (wwand-rsim, a
+	// modem with an empty local slot), a card inserted later. The clients are
+	// still there, so this is the SIM step and what follows, not a restart.
+	// A PIN/PUK block stays terminal: a new card is not what it waits for.
+	self.retry_sim = function() {
+		let why = self.sim_block?.reason;
+
+		if (self.state != 'SIM_BLOCKED' || (why != 'no_sim' && why != 'card_error'))
+			return false;
+
+		log('notice', sprintf('a card arrived after the SIM step stopped (%s) — resuming from there', why));
+		// the "no usable card" marker suppresses EF reads (sim.uc unlock_uim);
+		// it described the card that was not there
+		self._no_card = false;
+		step_sim();
+		return true;
 	};
 
 	step_sim = () => {
@@ -685,10 +759,16 @@ export function install(self, o)
 			if (!changed)
 				return step_register();
 
+			// parked (a plugin's hold at init): the attach runs with the new
+			// profile when the radio is woken — a cycle ending online here
+			// would register behind the park's back
+			if (self.lowpower_parked || self._plugin_held)
+				return step_register();
+
 			log('notice', 'attach profile changed, cycling radio to re-attach');
-			qmi_backend.set_opmode(self.dms, 'low_power', () => {
+			self._opmode_set('low_power', () => {
 				tm.settle = uloop.timer(self.timing.settle, () => {
-					qmi_backend.set_opmode(self.dms, 'online', () => {
+					self._opmode_set('online', () => {
 						tm.settle = uloop.timer(self.timing.settle, step_register);
 					});
 				});
@@ -738,9 +818,23 @@ export function install(self, o)
 				});
 			});
 
-			tm.reg = uloop.timer(self.timing.reg_timeout, () => {
+			let reg_timeout;
+
+			reg_timeout = () => {
 				if (self.state != 'REGISTERING')
 					return;
+
+				// parked on purpose (a plugin's hold at init): not registered
+				// because the radio is off, not a fault — failing here would
+				// walk the recovery ladder over a modem doing as told. Waits
+				// on: the timer re-arms, so a woken modem still times out.
+				// Held but not parked (the modem refused low power) waits
+				// too: a registration is not wanted, and the ladder's cycles
+				// end online.
+				if (self.lowpower_parked || self._plugin_held) {
+					tm.reg = uloop.timer(self.timing.reg_timeout, reg_timeout);
+					return;
+				}
 
 				// surface WHY we're still not registered before failing — EMM
 				// reject cause / limited service (see reg #33 attach finding)
@@ -752,7 +846,9 @@ export function install(self, o)
 
 					fail('registration_timeout', { reg: self.reg, detail: d });
 				});
-			});
+			};
+
+			tm.reg = uloop.timer(self.timing.reg_timeout, reg_timeout);
 
 			self.nas.request('GET_SERVING_SYSTEM', {}, (e2, d2) => {
 				if (!e2)
@@ -763,5 +859,10 @@ export function install(self, o)
 
 	// register() is re-entered by _update_serving when registration is lost
 	// while READY (transient dereg -> back to the REGISTERING wait)
-	return { begin: () => step_sync(0), register: () => step_register() };
+	// fcc_verify(cb): the init's set-online check and FCC unlock, for a
+	// radio switched online later (the wake of a hold at init); cb() when
+	// done, whatever the outcome — the init continues on a lock it could
+	// not release as well, with a warning.
+	return { begin: () => step_sync(0), register: () => step_register(),
+	         fcc_verify: (cb) => verify_online(0, cb) };
 };

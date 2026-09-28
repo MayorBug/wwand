@@ -1389,23 +1389,29 @@ ok(index(line, 'snr 9.8') >= 0,
 let hand_fx = fakefx.create();
 let hand_self = {};
 let hand_pulses = [];
+// `unarmed_reset_after` and the clock travel the same way, and are checked the
+// same way: a configured 60 s must be what the ladder waits.
+let hand_clk = 5000;
 let hand_rec = mc.make_recovery(hand_self, {
 	id: 'handoff',
 	protocol: 'qmi',
-	config: { failreboot: 30 },
+	config: { failreboot: 30, unarmed_reset_after: 60 },
 	recovery: {
 		fx: hand_fx,
 		state_dir: '/state',
+		now: () => hand_clk,
 		repower: () => { push(hand_pulses, 'board'); return true; },
 		reset_line: () => 'gpio515',
 	},
 }, (l, m) => null, 'qmi');
 
 let hand_acts = [];
-for (let i = 1; i <= 24; i++) push(hand_acts, hand_rec.on_attempt());
+for (let i = 1; i <= 6; i++) { push(hand_acts, hand_rec.on_attempt()); hand_clk += 10; }
 
-eq(hand_acts[23], 'usb_repower',
-   'make_recovery: reset_line survives the hand-off — the unarmed pulse is offered');
+eq(hand_acts, [ 'retry', 'retry', 'retry', 'retry', 'retry', 'retry' ],
+   'make_recovery: nothing before the configured 60 s');
+eq(hand_rec.on_attempt(), 'usb_repower',
+   'make_recovery: reset_line and unarmed_reset_after survive the hand-off — the unarmed pulse is offered at 60 s');
 eq(hand_rec.usb_repower(), true, 'make_recovery: and the primitive honours it');
 eq(hand_pulses, [ 'board' ], 'make_recovery: the board action ran');
 // --- diag port resolution (resolve_diag_port) --------------------------------
@@ -1450,5 +1456,31 @@ eq(mc.resolve_diag_port({ config: {}, device: '/dev/cdc-wdm0' }, diag_fx(), { qc
 	null, 'diag: no source knows one -> null');
 eq(mc.resolve_diag_port({ config: {}, device: '/dev/cdc-wdm0' }, diag_fx(), null),
 	null, 'diag: a modem with no AT channels at all does not throw');
+
+// --- the init list: plugin steps between the configured ones and the locks ------------
+{
+	let seen = null, changed = null, nexted = 0;
+	let m = { info: { model: 'RG502Q-EA' }, config: { at_init: [ 'AT+CONF' ], lock_4g: '1300:246' },
+	          at_init_extra: (info) => { seen = info; return [ { check: 'AT+X?', want: '^1$', set: 'AT+X=1', note: 'x', reset: true } ]; },
+	          at_init_changed: (c) => { changed = c; } };
+	let cmds = mc.init_commands(m);
+
+	eq(cmds[0], 'AT+QMBNCFG="AutoSel",1', 'init list: model quirks first');
+	eq(cmds[1], 'AT+CONF', 'init list: then the configured at_init');
+	eq(cmds[2]?.set, 'AT+X=1', 'init list: then what plugins add');
+	ok(index(cmds[3] ?? '', 'QNWLOCK') >= 0, 'init list: cell locks last');
+	eq(seen?.model, 'RG502Q-EA', 'init list: plugins see the identity');
+
+	let d = mc.init_done(m, { next: () => nexted++ });
+
+	d([]);
+	eq([ changed, nexted ], [ null, 1 ], 'init done: nothing changed — no report, the bring-up goes on');
+	d([ { note: 'x', reset: true } ]);
+	eq([ changed, nexted ], [ [ { note: 'x', reset: true } ], 2 ], 'init done: a change is reported to the daemon');
+
+	let bad = { info: {}, config: {}, at_init_extra: () => die('boom') };
+
+	eq(mc.init_commands(bad), [], 'init list: a failing extra adds nothing and breaks nothing');
+}
 
 done('test_modem_common');

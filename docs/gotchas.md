@@ -729,3 +729,80 @@ That is itself a status gap by the rule in `extending.md` § 8a, and a candidate
 for a field; until then, ask for the log line explicitly rather than assuming.
 A claim about a user's numbers that skips this question is a claim about the
 wrong code.
+
+## "The QMI passthrough pushes no indications" is true of NAS, not of the passthrough
+
+The EG06 and the RM520N accept NAS `REGISTER_INDICATIONS` over the
+QMI-over-MBIM passthrough and then never push a NAS indication that way
+(HW finding 2026-08). For a year that was written down as a property of the
+passthrough — "request/response only" — and it nearly settled whether a remote
+SIM could work on an MBIM modem: UIM Remote runs entirely on indications (the
+modem announces connect, power-up, reset and every APDU as one), so on that
+belief it could not.
+
+It can. On the GL-X3000 (RM520N-GL, firmware RM520NGLAAR03A03M4G), with
+`uim_remote_service_enable` switched on, the modem pushed every UIM Remote
+indication over the passthrough: connect, power-up, and 431 APDUs of one
+session through wwand-rsim, the modem reading the remote card's identity
+(HW-observed 2026-09-27).
+
+**Which indications come over the passthrough is per service and per
+firmware.** Try the service before concluding from another one;
+`wwandctl rsim MODEM probe` says whether the modem offers UIM Remote at all,
+and a session says the rest.
+
+## A failed setup of a `no_proto_task` handler is retried by netifd
+
+**Not by itself — the interface just stays pending, with the error on it.**
+Only a link or availability change (`interface_check_state`) or an
+ifdown/ifup moves it.
+`proto_ext_task_finish` tears a failed setup down only when the handler has no
+`PROTO_FLAG_NO_TASK` (`proto-ext.c:147-152`, netifd 2026.07.08), so after the
+shim's `return 1` nothing in netifd runs setup again: every
+`proto_notify_error` branch works like a block, not only the one that sends
+`proto_block_restart`. The shim's comments said "retried every 60 s" for
+RADIO_HELD and "keep retrying" for WAITING_MODEM; neither was ever true. The
+retry is the daemon's (the reconnect engine, and the `registered` path that
+resets a stuck-pending interface and kicks it).
+
+The companion belief: **`autostart=false` means somebody ran `ifdown`.** A
+handler's `proto_block_restart` clears it too (`proto-ext.c:547-550`), and so
+does every `down` wwand issues. The in-memory marker for our own downs did not
+survive a daemon restart, so an interface the shim had blocked — sim_blocked
+while an eSIM profile switch left the modem cardless for a moment — was parked
+as "administratively down" after one (HW-seen on 245, 2026-09-27: autostart
+false, errors `[RADIO_HELD]`). `daemon.uc operator_down` now decides on
+evidence, and on that ONLY: the operator's ifdown is recorded by
+`context_down` (in a state file); a cleared autostart without that record is
+not the operator's, whatever errors the interface carries (the NR7101, 242,
+2026-09-27: no error at all after a restart, both interfaces parked by the
+former "no `wwand` error = operator" fallback). A `wwand` error on the
+interface is the shim's trace — an ifdown
+clears no errors (`interface_set_down`); an ifup clears them only on an
+interface that is down (`interface_set_up`, `interface.c:1332-1350`), and
+reaching IFEV_UP does. The operator's ifdown is therefore recorded even when
+there is no context to take down, and by the shim itself when the daemon is
+not there to hear it.
+
+And the record only helps while it is whole. **"The file is there, so it can
+be trusted"** is the next belief that looks right: an in-place write truncates
+first, so a daemon killed between the truncate and the write (or a full
+tmpfs) leaves an empty file, and an empty record read as "nothing recorded"
+revives every operator ifdown it held. The daemon replaces the file whole
+(`netlink.uc default_fx.write_atomic`: beside it, then `rename(2)`) and
+trusts it only when its own JSON array is at the head (`daemon.uc
+admin_record_complete`); anything else is read for its names and treated like
+the first start after an upgrade. Re-reading before the rewrite is not enough
+either: the shim's append can land between the daemon's read and its rename
+and go to the file the rename replaces, so both sides take a flock on
+`admin_downs.lock` (`daemon.uc admin_locked`, `files/wwand-proto.sh
+proto_wwand_teardown`).
+
+**"The radio is on again, the modem woke it."** On MBIM there are two radio
+switches, and they are independent: DMS SET_OPERATING_MODE over the QMI
+passthrough, and the Basic Connect Radio State. Undoing one leaves the other
+off. A DMS low power also outlives the modem object that set it — a daemon
+restart — so the object that wakes the radio does not necessarily know what
+parked it; `modem_mbim.uc set_opmode` wakes DMS too until this object has set
+it itself (`_dms_unknown`), and an unheld init asks DMS once and switches a
+low power left by an earlier daemon online (`step_register`).

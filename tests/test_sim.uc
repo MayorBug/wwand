@@ -1489,6 +1489,37 @@ scenario('identity: a rejecting uim falls through to the legacy DMS getters', (n
 	});
 });
 
+// right after a card change the DMS getter answers from the firmware's
+// cache — the previous card's IMSI: a fresh read leaves it out and takes AT
+scenario('identity: fresh leaves out the cached DMS IMSI', (next) => {
+	let asked = [];
+	let m = { timing: T, config: {},
+		uim: { request: (name, args, cb) => uloop.timer(1, () => cb({ error: 'qmi', code: 48 }, null)) },
+		dms: { request: (name, args, cb) => {
+			push(asked, name);
+			uloop.timer(1, () => cb(null, { imsi: '262014943410220', iccid: '89490200001113571379', msisdn: null }));
+		} },
+		at: { send: (cmd, cb) => cb(null, { lines: [ (cmd == 'AT+CIMI') ? '262011203308161' : 'ERROR' ] }) } };
+
+	sim.read_identity(m, (id) => {
+		eq(id.imsi, '262011203308161', 'identity-fresh: the IMSI from the card (AT), not the cached one');
+		eq(index(asked, 'GET_IMSI'), -1, 'identity-fresh: GET_IMSI not asked');
+		next();
+	}, { fresh: true });
+});
+
+// ...but a modem with no AT channel has no other way to the IMSI: DMS then
+scenario('identity: fresh without an AT channel still asks DMS', (next) => {
+	let m = { timing: T, config: {},
+		uim: { request: (name, args, cb) => uloop.timer(1, () => cb({ error: 'qmi', code: 48 }, null)) },
+		dms: { request: (name, args, cb) => uloop.timer(1, () => cb(null, { imsi: '262031234567890', iccid: '89490260007654321' })) } };
+
+	sim.read_identity(m, (id) => {
+		eq(id.imsi, '262031234567890', 'identity-fresh-noat: DMS is the only source left, so it is asked');
+		next();
+	}, { fresh: true });
+});
+
 // --- PUK unblock chain (sim.unblock_puk) --------------------------------------
 
 // UIM UNBLOCK_PIN succeeds -> done, no fallback
@@ -1675,6 +1706,55 @@ sw_self.modem_sim_switch_slot('m0', 1, (err) => {
 	sw_deferred();
 	eq(sw_reapplied, 1, 'slot-clear: an untouched modem reads the new card');
 
+	// TWO card changes inside the two seconds (a remote SIM that comes and
+	// goes, via the plugin dep sim_changed): no teardown in between, so only
+	// the card-change generation tells the first re-read it is stale
+	sw_self.card_changed('m0', 'first');
+	let first = sw_deferred;
+	sw_self.card_changed('m0', 'second');
+	let second = sw_deferred;
+	first();
+	eq(sw_reapplied, 1, 'card change: the re-read for a card that has already left again is dropped');
+	second();
+	eq(sw_reapplied, 2, 'card change: ...and the one for the card now in place runs');
+
+	// a modem that stopped for lack of a card resumes its init instead of
+	// only re-reading an identity it never got (wwand-rsim on an empty slot)
+	let resumed = 0;
+
+	sw_modem.retry_sim = () => { resumed++; return true; };
+	sw_self.card_changed('m0', 'remote SIM in use');
+	sw_deferred();
+	eq([ resumed, sw_reapplied ], [ 1, 2 ], 'card change: a blocked modem resumes from the SIM step, no bare re-read');
+	delete sw_modem.retry_sim;
+
+	// a modem still in its init chain reads the card there: no second
+	// unlock and re-read beside it
+	sw_modem.state = 'SIM_UNLOCK';
+	sw_self.card_changed('m0', 'remote SIM off');
+	sw_deferred();
+	eq(sw_reapplied, 2, 'card change: a modem in its SIM step is left to it — no parallel re-read');
+	delete sw_modem.state;
+
+	// a card that is slow to come up (a remote SIM): read FRESH — not the
+	// firmware's cached IMSI, which is the old card's — and again while the
+	// IMSI is not there yet
+	{
+		let seen = [];
+		let plain = sw_modem.reapply_sim;
+
+		sw_modem.reapply_sim = (cb, opts) => { push(seen, opts); cb(true); };
+		sw_self.card_changed('m0', 'remote SIM in use');
+		sw_deferred();
+		eq(seen, [ { fresh: true } ], 'card change: the new card is read fresh (no cached IMSI)');
+		sw_deferred();
+		eq(length(seen), 2, 'card change: no IMSI yet — read again later');
+		sw_modem.info.imsi = '262011203308161';
+		sw_deferred();
+		eq(length(seen), 3, 'card change: ...until there is one');
+		sw_modem.reapply_sim = plain;
+	}
+
 	// idempotent switch keeps the caches
 	sw_modem._esim_refreshed = true;
 	sw_modem.sim_note = 'session closed: card removed';
@@ -1754,6 +1834,45 @@ eq(ms_part.mode, null, 'multisim: executors without concurrency is not classifie
 eq(ms_part.mode_min, 'dsds', 'multisim: two executors still floor at dual standby');
 
 eq(sim.multisim([], null), null, 'multisim: no slots, nothing to say');
+
+// --- the eSIM profile list re-read after a change (esim_bridge `changed`) ------
+// A change reported while a re-read is armed is not dropped: that read may
+// already have the old list, so one more follows it.
+{
+	let defers = [];
+	let lists = [ [ { iccid: '1' } ], [ { iccid: '1' }, { iccid: '2' } ] ];
+	let reads = 0;
+	let em = { id: 'e0', _esim_op: 0 };
+	let es = {
+		backend: (m, sl, cb) => cb('qmi'),
+		get_eid: (m, sl, cb) => cb(null, { eid: 'E' }),
+		profiles: (m, sl, cb) => cb(null, { profiles: lists[reads++ > 0 ? 1 : 0] }),
+		enable: (m, sl, i, cb) => cb(null, { ok: true }),
+		disable: (m, sl, i, cb) => cb(null, { ok: true }),
+		del: (m, sl, i, cb) => cb(null, { ok: true }),
+	};
+	let es_self = { modems: { e0: { modem: em } } };
+
+	simops.install(es_self, {
+		log: () => null,
+		check_modem: (ref, cb) => es_self.modems[ref] ?? null,
+		load_esim: () => es,
+		defer: (ms, fn) => push(defers, fn),
+	});
+
+	// no lpac on the host: the bridge falls back to the esim module
+	es_self.modem_esim('e0', 'delete', { iccid: '89000000000000000001', slot: 1 }, () => null);
+	es_self.modem_esim('e0', 'delete', { iccid: '89000000000000000002', slot: 1 }, () => null);
+	eq(length(defers), 1, 'eSIM re-read: two quick changes arm one read, not two');
+
+	shift(defers)();
+	eq(length(em.esim_info?.profiles ?? []), 1, 'eSIM re-read: the first read ran');
+	eq(length(defers), 1, 'eSIM re-read: ...and the change that came in meanwhile armed one more');
+
+	shift(defers)();
+	eq(length(em.esim_info.profiles), 2, 'eSIM re-read: the second read has the list after both changes');
+	eq(length(defers), 0, 'eSIM re-read: then nothing more is pending');
+}
 
 done('test_sim');
 	});

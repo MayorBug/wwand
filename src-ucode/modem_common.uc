@@ -650,6 +650,8 @@ export function make_recovery(self, opts, log, proto)
 		protocol: opts.protocol,
 		failreboot: (opts.config ?? {}).failreboot,
 		proto_error_limit: (opts.config ?? {}).proto_error_limit,
+		unarmed_reset_after: (opts.config ?? {}).unarmed_reset_after,
+		now: opts.recovery?.now,
 		fx: opts.recovery?.fx ?? netlink.default_fx((l, m) => log(l, m)),
 		state_dir: opts.recovery?.state_dir,
 		reboot_delay: opts.recovery?.reboot_delay,
@@ -1261,6 +1263,38 @@ export function close_at(self)
 	self._at_errors = null;
 };
 
+// The init commands every AT channel runs once it answers: model quirks,
+// the configured `at_init` list, the steps optional packages add
+// (`self.at_init_extra`, set by the daemon from plugins.uc at_init — e.g.
+// wwand-rsim allowing a modem to lend its card), then cell locks.
+export function init_commands(self)
+{
+	let extra = [];
+
+	try { extra = self.at_init_extra?.(self.info) ?? []; }
+	catch (e) { extra = []; }
+
+	return [
+		...atcmd.model_init_commands(self.info?.model),
+		...(self.config.at_init ?? []),
+		...extra,
+		...atcmd.cell_lock_commands(self.config),
+	];
+};
+
+// ...and after them: a setting that was changed and only takes effect on a
+// modem reset (atcmd run_sequence) is reported to the daemon, which decides
+// on that reset (at_init_changed), then the bring-up goes on.
+export function init_done(self, o)
+{
+	return (changed) => {
+		if (length(changed ?? []))
+			self.at_init_changed?.(changed);
+
+		o.next();
+	};
+};
+
 // best-effort AT side-channel bring-up: discover + open the AT tty, run
 // model-init + configured at_init + cell-lock commands, then o.next(). Always
 // non-fatal (no usable AT port -> next() with self.at unset).
@@ -1332,16 +1366,12 @@ function finish_mbim_at(self, o, tr, path, log)
 		self.at_over_mbim = true;
 		log('notice', sprintf('AT over MBIM ready on %s', path));
 
-		let cmds = [
-			...atcmd.model_init_commands(self.info?.model),
-			...(self.config.at_init ?? []),
-			...atcmd.cell_lock_commands(self.config),
-		];
+		let cmds = init_commands(self);
 
 		if (!length(cmds))
 			return o.next();
 
-		engine.run_sequence(cmds, () => o.next());
+		engine.run_sequence(cmds, init_done(self, o));
 	}, { timeout: 5000 });
 }
 
@@ -1460,16 +1490,12 @@ function open_at_over_wdm(self, o, fxi, log, next)
 		if (perr?.error != 'timeout' && perr?.error != 'closed') {
 			log('notice', sprintf('AT channel: %s (cdc-wdm)', dev));
 
-			let cmds = [
-				...atcmd.model_init_commands(self.info?.model),
-				...(self.config.at_init ?? []),
-				...atcmd.cell_lock_commands(self.config),
-			];
+			let cmds = init_commands(self);
 
 			if (!length(cmds))
 				return o.next();
 
-			self.at.run_sequence(cmds, o.next);
+			self.at.run_sequence(cmds, init_done(self, o));
 			return;
 		}
 
@@ -1678,11 +1704,7 @@ open_at_tty = function(self, o, fxi, log, ch, tried)
 		}
 
 		// model quirks + configured at_init list, then cell locks
-		let cmds = [
-			...atcmd.model_init_commands(self.info?.model),
-			...(self.config.at_init ?? []),
-			...atcmd.cell_lock_commands(self.config),
-		];
+		let cmds = init_commands(self);
 
 		// M9200B: periodically drain stale serial output (empty_serial_buffers quirk)
 		if (index(self.info?.revision ?? '', 'M9200B') >= 0) {
@@ -1701,7 +1723,7 @@ open_at_tty = function(self, o, fxi, log, ch, tried)
 		if (!length(cmds))
 			return o.next();
 
-		self.at.run_sequence(cmds, o.next);
+		self.at.run_sequence(cmds, init_done(self, o));
 	};
 
 	self.at.send('AT', (perr) => {

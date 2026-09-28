@@ -19,7 +19,7 @@ row. That is the whole maintenance rule.
 
 | Question | Answer |
 |---|---|
-| Which value wins for this connection — the card's, the interface's? | `context_common.uc conn_cfg` — per-ICCID `wwand_sim` first, interface second. The overridable set is one shared list, `context_common.uc SIM_OVERRIDABLE`. |
+| Which value wins for this connection — the card's, the interface's? | `context_common.uc conn_cfg` — per-ICCID `wwand_sim` first, interface second — except the login, which follows the APN: a `wwand_sim` with its own APN never takes the interface's credentials. The overridable set is one shared list, `context_common.uc SIM_OVERRIDABLE`. |
 | Which IP family is the PDP actually using? | `context_common.uc effective_pdp` — reads the CONFIG, never the modem's read-back. |
 | Which mux channel is really used (`auto` resolved)? | `config.uc effective_mux_id` |
 | Which `wwand_sim` section matches the card in the slot? | `modem_common.uc match_sim_override` |
@@ -30,6 +30,8 @@ row. That is the whole maintenance rule.
 | Question | Answer |
 |---|---|
 | Who decides to reconnect, and how long it holds the interface up? | `reconnect.uc enter_reconnecting`, `reconnect.uc retry_activate` — `daemon.uc` binds local aliases to them (`self._enter_reconnecting`), so grepping daemon.uc finds the call sites and not the logic. |
+| Why was my interface left down as "administratively down" — or brought back although it was down? | `daemon.uc operator_down` — a cleared autostart is the operator's only when context_down (or the shim, with no daemon to reach) recorded their ifdown; only on a start whose record is not trusted (`daemon.uc admin_record_complete`: first start since boot or an upgrade, or a damaged file) does "no `wwand` error" count, and that guess is recorded (`daemon.uc seed_admin_record`). `daemon.uc our_down` covers the downs wwand issues itself; an unrecorded down is looked at once more before it is undone (`daemon.uc confirm_then`). |
+| How are `/tmp/wwand/state/admin_downs.json` and `giveups.json` written, and when is one not believed? | `daemon.uc write_state` (replaced whole through `netlink.uc default_fx`'s `write_atomic`); `daemon.uc merge_admin_record` folds in the names the shim appended (`files/wwand-proto.sh proto_wwand_teardown`); `daemon.uc admin_record_complete` decides trust; `daemon.uc admin_locked` holds the flock the shim's append takes too. |
 | What exactly is netifd told — addresses, routes, DNS, MTU? | `files/wwand-proto.sh _wwand_apply_settings` |
 | Why does my interface have a default route with no gateway? | `files/wwand-proto.sh _wwand_apply_settings` — it branches on `IFF_NOARP`: a point-to-point link gets a device route, an ARP-resolving one a host route plus a via-default. Setup and renew both go through it. |
 | Where does the dhcpv6 `<parent>_6` subinterface come from, and who switches it off? | `deps.uc ensure_wan6` / `deps.uc retire_wan6` — both dispatched from the connected handler in `daemon.uc`, on complementary `effective_pdp` conditions. |
@@ -61,8 +63,12 @@ row. That is the whole maintenance rule.
 | How many slots are there, and is that the modem's answer or ours? | `sim.uc slot_status` builds the rows; `sim.uc enumerated` says whether any row is a placeholder. A caller that ACTS on slot topology must ask the second. |
 | Which transport carries APDUs on this modem? | `sim.uc apdu_backend` — MBIM UICC, then QMI UIM, then AT. `sim.power_cycle` deliberately uses the opposite order; the comments at both sites say why. |
 | Who runs lpac, and who runs another host session on the card (a plugin's)? | Both through `esim_bridge.uc stdio_run`, which relays their stdio APDU protocol to the modem. lpac comes in through `lpac_run`, a plugin's process (e.g. an SGP.32 assistant) through `session_run`. Both hold the same claim, so the card only ever sees one host session. |
+| Who sends the Profile Installation Result of an SGP.32 assistant's direct download to the SM-DP+? | lpac, through `esim_bridge.uc session_notify` (`notification process -r <seq>`), asked for by the assistant's `notify` event while its session waits; the download itself ran through `esim_bridge.uc session_download` without the notification step. |
 | Why was a manual eSIM change refused (`esim_managed`)? | A plugin manages the card: `plugins.uc install` (its `esim_guard`), checked in `simops.uc ESIM_CHANGING`. `force` overrides. |
 | How does an optional package hook into the daemon, the config and wwandctl? | `plugins.uc list` / `install` (tick, eSIM guard, ubus `modem_plugin`); its options arrive as `entry.ext` (`config.uc parse_network_sections`), outside the reload signature; its CLI command is `wwandctl.uc ctl_plugin`. |
+| Which card is where, and why is one listed as not present? | `siminventory.uc from_modem` turns a modem's state into sources, `siminventory.uc create` derives each card from them; the daemon feeds it in `daemon.uc inventory_refresh`. A remote card is filed under its reader via `plugins.uc install` (`card_source`). |
+| Why does this modem's radio stay off, and why is its ifup refused (`radio_held`)? | A plugin lent its card or waits for a remote SIM: `plugins.uc install` (`radio_hold`), consulted in the init chains before the radio can register (`modem_init_qmi.uc install`, step_opmode; `modem_mbim.uc create`, hold_at_open and step_register), in `daemon.uc context_up`, on `registered`, and before a dial (`reconnect.uc retry_activate`); the park itself is `daemon.uc plugin_radio` over each backend's `set_opmode` (`modem_mbim.uc create`: passthrough DMS, else Radio State), released on the tick when nothing holds it. A modem that cannot be held: `daemon.uc note_unholdable`, `status()` `radio_hold_error`. |
+| Why was the eSIM profile list in status re-read? | `simops.uc profiles_changed`, fired by `esim_bridge.uc create` (`changed`) after a download or a profile change. |
 
 ## Status and ubus
 

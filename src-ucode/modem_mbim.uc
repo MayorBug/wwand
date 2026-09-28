@@ -53,6 +53,11 @@ const TIMING_DEFAULTS = {
 const SIM_POLL_TRIES = 10;
 const SIM_POLL_MS = 1000;
 
+// tries to wake a radio an earlier init pass parked before this pass fails
+// (step_register): a refusal is retried, and bounded, so a modem that keeps
+// refusing reaches the recovery ladder instead of retrying forever
+const WAKE_TRIES = 3;
+
 
 export function create(opts)
 {
@@ -72,7 +77,8 @@ export function create(opts)
 		_gen: 0,
 		hub: null,
 		mbim: null,
-		pt: null,          // lazy QMI-over-MBIM passthrough stack { shim, ctl, nas, dsd }
+		pt: null,          // lazy QMI-over-MBIM passthrough stack { shim, ctl, nas, dsd, services }
+		extra_clients: [], // plugins' clients over the passthrough (extra_client)
 		info: {},
 		reg: {},
 		reg_detail: null,  // why (not) registered (reject cause / limited service)
@@ -85,6 +91,12 @@ export function create(opts)
 		datapath: null,
 		counters: null,
 		contexts: [],
+		// the radio switched off on purpose (set_opmode low_power: a plugin's
+		// hold, `option lowpower`) — the registration it costs is no fault
+		lowpower_parked: false,
+		// what an earlier modem object (an earlier daemon) did to the DMS
+		// operating mode is not known here; set_opmode wakes it too
+		_dms_unknown: true,
 	};
 
 	let deps = opts.deps ?? {};
@@ -155,7 +167,7 @@ export function create(opts)
 
 	// --- step chain --------------------------------------------------------
 
-	let step_open, step_fcc, step_caps, step_at, step_at_ident, step_datapath, step_simslot, step_sim, step_attach_profile, step_register, do_register, step_attach;
+	let hold_at_open, fcc_unlock, step_open, step_fcc, step_caps, step_at, step_at_ident, step_datapath, step_simslot, step_sim, step_attach_profile, step_register, do_register, step_attach;
 
 	// MBIM reports the operator as one concatenated MCC+MNC string
 	// (MbimRegisterState ProviderId, "26006"), while QMI reports the pair
@@ -247,6 +259,12 @@ export function create(opts)
 			self.mbim.command(bc, 'RADIO_STATE', 'set',
 				{ radio_state: bc.RADIO_STATE_OFF }, () => {
 					settle_timer = uloop.timer(self.timing.settle, () => {
+						// a parked radio stays off: a cycle ending online
+						// un-parks it behind the park's back (modem.uc
+						// online_unless_parked)
+						if (self.lowpower_parked || !self.mbim)
+							return done();
+
 						self.mbim.command(bc, 'RADIO_STATE', 'set',
 							{ radio_state: bc.RADIO_STATE_ON }, (e2, d2) => {
 								note_radio(d2);
@@ -332,7 +350,48 @@ export function create(opts)
 			if (err)
 				return fail('open', err);
 
-			step_fcc();
+			hold_at_open(step_fcc);
+		});
+	};
+
+	// A PLUGIN HOLDS THE RADIO OFF (its card is lent, or it waits for a
+	// remote SIM): off right after OPEN, before anything else. An MBIM modem
+	// registers on its own whenever its software radio is on: that state
+	// persists across boots, wwand sends no REGISTER_STATE set at init, and
+	// the only thing step_register ever had to do for it was switch an off
+	// radio on (ddimension/wwand#3, EG18). So the QMI chain's point of asking
+	// (step_opmode) comes too late here: on LTE a registration is an attach,
+	// and the network has seen the local IMSI. The native switch, because
+	// the passthrough cannot be probed this early (extra_client). A refused
+	// switch does not fail the init: it continues held, REGISTERING waits,
+	// and its interfaces are refused (radio_held).
+	//
+	// THE VENDOR FCC UNLOCK WAITS FOR THE WAKE. It is a radio-on of its own
+	// (quectel Radio State), and sent before the park it could let an
+	// RF-locked modem register on its local card first; the wake sends it
+	// before it switches the parked radio back on (set_opmode, `_fcc_due`).
+	// Held, `next` (the FCC step) is skipped for the capabilities.
+	hold_at_open = (next) => {
+		let hold = self.radio_hold?.();
+
+		if (!hold)
+			return next();
+
+		log('notice', sprintf('radio stays off at init — %s', hold));
+		self._plugin_held = true;
+
+		if (self.config.fcc_auth == 'quectel')
+			self._fcc_due = true;
+
+		self.set_opmode('low_power', (err) => {
+			if (err?.error == 'cancelled')
+				return;
+
+			if (err)
+				log('warn', sprintf('radio stays off at init: switching it off failed (%J) — continuing held; its interfaces are refused until the hold ends',
+					err));
+
+			step_caps();
 		});
 	};
 
@@ -341,11 +400,8 @@ export function create(opts)
 	// vendor Radio State = on right after MBIM OPEN — the MBIM mirror of
 	// ModemManager's `mbimcli --quectel-set-radio-state=on` unlock helper.
 	// Best-effort: an error is logged and bring-up continues (an unlocked
-	// modem simply ignores/rejects the vendor CID).
-	step_fcc = () => {
-		if (self.config.fcc_auth != 'quectel')
-			return step_caps();
-
+	// modem simply ignores/rejects the vendor CID). cb() either way.
+	fcc_unlock = (cb) => {
 		self.mbim.command(quectel_svc, 'RADIO_STATE', 'set',
 			{ radio_state: quectel_svc.RADIO_ON }, (err, data) => {
 			if (err)
@@ -353,8 +409,15 @@ export function create(opts)
 			else
 				log('notice', sprintf('FCC unlock: quectel radio state now %d', data?.radio_state));
 
-			step_caps();
+			cb();
 		});
+	};
+
+	step_fcc = () => {
+		if (self.config.fcc_auth != 'quectel')
+			return step_caps();
+
+		fcc_unlock(step_caps);
 	};
 
 	step_caps = () => {
@@ -1113,13 +1176,39 @@ export function create(opts)
 
 		if (registered && self.state == 'REGISTERING') {
 			if (reg_timer) { reg_timer.cancel(); reg_timer = null; }
+			// woken from a park at init: this READY entry emits `registered`
+			// itself, the READY wake below must not add a second
+			self._wake_pending = false;
 			// ATTACHING guards against REGISTER_STATE indications piling up
 			// while the attach is in flight — without it each one would re-run
 			// step_attach and re-emit 'registered' (kick spam in the daemon)
 			self.set_state('ATTACHING');
 			step_attach();
 		}
+		else if (registered && self.state == 'READY' && self._wake_pending) {
+			// Woken from a park while READY: registered again with no
+			// REGISTERING step, so no `registered` event, and the daemon never
+			// re-arms the interfaces it gave up while the radio was off
+			// (modem.uc set_opmode has the QMI twin). Through the attach, as
+			// a registration regained after a loss goes, which ends in READY
+			// and `registered`.
+			self._wake_pending = false;
+			log('notice', 'registered again after the radio was parked');
+			self.set_state('ATTACHING');
+			step_attach();
+		}
 		else if (!registered && (self.state == 'READY' || self.state == 'ATTACHING')) {
+			// PARKED: we switched the radio off ourselves, so losing
+			// registration is the consequence, not a fault — step_register
+			// would fight the park (it switches the software radio on) and
+			// its timeout walk the recovery ladder. Same as modem.uc.
+			if (self.lowpower_parked) {
+				log('info', 'registration released (radio parked)');
+				emit('deregistered', self.reg);
+				notify_contexts('suspend', self.reg);
+				return;
+			}
+
 			log('warn', 'registration lost');
 			emit('deregistered', self.reg);
 			notify_contexts('suspend', self.reg);
@@ -1215,6 +1304,12 @@ export function create(opts)
 
 				self.effective_apn = apn;
 
+				// parked or held: the attach runs with the new profile when
+				// the radio is woken — a cycle ending online here would
+				// register behind the park's back
+				if (self.lowpower_parked || self._plugin_held)
+					return step_register();
+
 				// force the (possibly already-completed) autonomous attach to
 				// re-run with the new profile: radio off -> settle -> on -> settle
 				log('notice', 'attach profile changed, cycling radio to re-attach');
@@ -1233,6 +1328,109 @@ export function create(opts)
 	};
 
 	step_register = () => {
+		// HELD: the radio stays off (hold_at_open has the reason), and this is
+		// the second place to ask — a hold that began after OPEN, or a
+		// registration lost while held but not parked. REGISTERING waits.
+		let hold = self.radio_hold?.();
+
+		if (hold) {
+			self._plugin_held = true;
+
+			if (self.lowpower_parked)
+				return do_register();
+
+			log('notice', sprintf('radio stays off — %s', hold));
+
+			return self.set_opmode('low_power', (err) => {
+				if (err?.error == 'cancelled')
+					return;
+
+				if (err)
+					log('warn', sprintf('switching the radio off failed (%J) — continuing held', err));
+
+				do_register();
+			});
+		}
+
+		// Not held, and a park from an earlier pass still recorded: this
+		// object outlives a failed init (make_fail restarts the same
+		// instance), so it is woken the way it was parked — a DMS low power
+		// is not undone by the Radio State query below — and the flags go
+		// with it. Left, REGISTERING waited forever and the next
+		// registration loss read as "radio parked".
+		//
+		// A FAILED WAKE KEEPS THE PARK: the radio is still off, and flags
+		// saying otherwise sent the init into a registration that cannot
+		// come, with the knowledge of how it was parked gone. Tried again
+		// after a settle, and after WAKE_TRIES the init fails — the ladder,
+		// whose retry lands here again with the flags intact.
+		if (self.lowpower_parked)
+			return self.set_opmode('online', (err) => {
+				if (err?.error == 'cancelled')
+					return;
+
+				if (err) {
+					self._wake_tries = (self._wake_tries ?? 0) + 1;
+
+					if (self._wake_tries >= WAKE_TRIES) {
+						self._wake_tries = 0;
+						return fail('radio_wake', err);
+					}
+
+					log('warn', sprintf('waking the parked radio failed (%J) — trying again', err));
+					settle_timer = uloop.timer(self.timing.settle, step_register);
+					return;
+				}
+
+				self._wake_tries = 0;
+				self._plugin_held = false;
+				step_register();
+			});
+
+		self._plugin_held = false;
+
+		// A DMS LOW POWER LEFT BY AN EARLIER DAEMON. A park over the
+		// passthrough's DMS outlives the modem object that made it (a daemon
+		// restart), and the Radio State query below cannot see it — the two
+		// are independent switches — so the modem sat in REGISTERING until
+		// the recovery ladder's reset. Asked once per modem object, and only
+		// here, not held. Low power is switched online; OFFLINE is left to
+		// that reset — libqmi calls it RF off and "partially shutdown"
+		// (qmi-enums-dms.h, 1.38.0), and it is left only by a reset. No
+		// passthrough: nothing to ask, the Radio State path as before.
+		if (self._dms_unknown && !self._dms_checked) {
+			self._dms_checked = true;
+
+			return self._pt_get_opmode((err, mode) => {
+				if (err?.error == 'cancelled')
+					return;
+
+				if (err || mode != dmsmod.OPMODE_LOW_POWER) {
+					if (!err)
+						self._dms_unknown = false;
+
+					if (!err && mode == dmsmod.OPMODE_OFFLINE)
+						log('warn', 'the modem reports DMS offline — only a reset leaves that');
+
+					return step_register();
+				}
+
+				log('notice', 'the modem was left in low power by an earlier park, switching it online');
+
+				self._pt_opmode('online', (e2) => {
+					if (e2?.error == 'cancelled')
+						return;
+
+					if (e2)
+						log('warn', sprintf('switching it online failed: %J', e2));
+					else
+						self._dms_unknown = false;
+
+					step_register();
+				});
+			});
+		}
+
 		// The SOFTWARE radio can be off, and stay off across reboots: some modems
 		// ship that way. Nothing else in this backend ever turns it on — the two
 		// existing RADIO_STATE writers both cycle off->on inside a flow that only
@@ -1294,9 +1492,20 @@ export function create(opts)
 			// no worse off than before.
 			self.mbim.subscribe_events();
 
-			reg_timer = uloop.timer(self.timing.reg_timeout, () => {
+			let reg_timeout;
+
+			reg_timeout = () => {
 				if (self.state != 'REGISTERING')
 					return;
+
+				// parked or held on purpose: not registered because the radio
+				// is off, not a fault — failing would walk the recovery ladder
+				// (radio cycles, resets that end online) over a modem doing
+				// as told. The timer re-arms, so a woken modem still times out.
+				if (self.lowpower_parked || self._plugin_held) {
+					reg_timer = uloop.timer(self.timing.reg_timeout, reg_timeout);
+					return;
+				}
 
 				// ASK WHY BEFORE GIVING UP. A registration that never completes
 				// is the case LTE Attach Info exists for: under MBIMEx v3 it
@@ -1332,7 +1541,9 @@ export function create(opts)
 						attach: info,
 					});
 				});
-			});
+			};
+
+			reg_timer = uloop.timer(self.timing.reg_timeout, reg_timeout);
 
 			self.mbim.command(bc, 'REGISTER_STATE', 'query', {}, (err, data) => {
 				if (!err)
@@ -1560,6 +1771,33 @@ export function create(opts)
 	// via backend.choose in the order native-MBIM -> QMI-passthrough -> AT, the
 	// choice cached per modem (_sig_be/_cells_be/_ca_be/_dsd_be/_regd_be).
 
+	let drop_pt;   // defined beside teardown; forward-declared for _ensure_pt
+	let flush_releases;   // defined beside pt_release; forward-declared for _ensure_pt
+
+	// ONE BRING-UP AT A TIME. GET_VERSION_INFO and the CID allocations are
+	// asynchronous, and until they finish self.pt is still null: every probe
+	// arriving meanwhile would start a bring-up of its own, each allocating
+	// modem-side CIDs, and only the last to finish would stay reachable in
+	// self.pt — the others' CIDs could never be released. Callers arriving
+	// while one runs wait for it (pt_waiters).
+	let pt_opening = false, pt_waiters = [];
+
+	// A passthrough whose requests have failed this many times IN A ROW is
+	// rebuilt rather than trusted. The count (qmi_over_mbim.uc `failures`) is of
+	// MBIM-level failures only — a status or a timeout, the channel not carrying
+	// the request. A QMI error reply (a message the firmware lacks, a value it
+	// cannot give) is an answer and resets it, so the per-tick probes of
+	// optional messages can never drive a rebuild.
+	//
+	// What notices: every _ensure_pt caller, which includes the telemetry
+	// dispatch (telemetry_mbim.uc with_pt) and _ensure_uim/_ensure_wms. Code that
+	// holds self.uim / self.wms directly (sim.uc, sms.uc) keeps failing on a dead
+	// stack until one of those runs; with telemetry off that is the next SIM/SMS
+	// op through the ensure functions or a reset.
+	const PT_STALE_AFTER = 5;
+
+	let pt_stale = () => ((self.pt?.shim?.failures ?? 0) >= PT_STALE_AFTER);
+
 	// Lazy, idempotent bring-up of the QMI-over-MBIM passthrough service stack.
 	// The whole QMI client stack runs over the open MBIM channel (qom shim), so
 	// qmi_backend.* works unchanged. Non-fatal: cb(false) simply drops the
@@ -1569,18 +1807,72 @@ export function create(opts)
 	// and tears down the live MBIM data session. GET_VERSION_INFO is issued
 	// directly, then a CID is allocated per needed service.
 	self._ensure_pt = function(cb) {
-		if (self.pt)
+		// A STACK THAT STOPPED ANSWERING IS REBUILT, NOT KEPT. The modem can drop
+		// the QMI clients it handed out over the passthrough while the MBIM
+		// session stays up — an RM520N answered every passthrough request with
+		// MBIM_STATUS_FAILURE after the network ended its session and it
+		// re-applied its carrier configuration (evidence: ddimension/wwand#30).
+		// A cached stack that is never re-validated keeps QMI away until the
+		// modem restarts. A rebuild is GET_VERSION_INFO and fresh ALLOCATE_CIDs
+		// over the same channel, exactly the first bring-up; never a SYNC (see
+		// below).
+		if (self.pt && pt_stale()) {
+			log('notice', sprintf('qmi-over-mbim: %d passthrough requests failed in a row over %d s — rebuilding its QMI clients',
+				self.pt.shim.failures, time() - (self.pt.shim.failing_since || time())));
+			drop_pt();
+		}
+
+		if (self.pt) {
+			// owed releases go out while the stack they belong to answers
+			flush_releases();
 			return cb(true);
+		}
 
 		// remembered "no passthrough on this modem" so we don't rebuild a shim +
 		// re-probe on every capability (reset on teardown/protocol change)
 		if (self._pt_failed || !self.mbim)
 			return cb(false);
 
+		push(pt_waiters, cb);
+
+		if (pt_opening)
+			return;
+
+		pt_opening = true;
+
+		let gen = self._gen;
+
 		let shim = qom.create(self.mbim, { log: log });
 		let ctl = client_mod.create(shim, ctlmod.default, 0, hooks);
 
-		let bail = () => { self._pt_failed = true; shim.close(); return cb(false); };
+		let complete = (up) => {
+			let waiters = pt_waiters;
+
+			pt_waiters = [];
+			pt_opening = false;
+
+			for (let w in waiters)
+				w(up);
+		};
+
+		// A bring-up that fails on a modem whose passthrough never worked this
+		// session means it has none, and that is remembered. Once one has worked
+		// (_pt_built), a failure is a stack caught mid-reset: remembering it
+		// would turn one bad moment into no QMI until the next teardown, so it is
+		// simply tried again at the next re-probe — however many times it fails.
+		// A failure caused by a teardown (its destroy() pays the pending request
+		// with an error) says nothing about the modem and remembers nothing.
+		let bail = () => {
+			// ...and never from a probe made while the modem was still coming
+			// up: that says nothing about the modem either
+			if (self._gen == gen && index([ 'ABSENT', 'INIT_TRANSPORT', 'INIT_SERVICES' ], self.state) < 0)
+				self._pt_failed = !self._pt_built;
+			if (self._pt_built && self._gen == gen)
+				log('notice', 'qmi-over-mbim: rebuilding the passthrough failed — trying again at the next re-probe');
+			ctl.destroy();
+			shim.close();
+			complete(false);
+		};
 
 		ctl.request('GET_VERSION_INFO', {}, (verr, vdata) => {
 			if (verr)
@@ -1606,8 +1898,30 @@ export function create(opts)
 					return bail();
 
 				let finish = (dsd) => {
-					self.pt = { shim: shim, ctl: ctl, nas: nas, dsd: dsd };
-					cb(true);
+					// a teardown that ran meanwhile ended the session this stack
+					// was built for; publishing it would hand the next session a
+					// stack on a channel that is gone
+					if (self._gen != gen) {
+						for (let c in [ ctl, nas, dsd ])
+							if (c)
+								c.destroy();
+
+						shim.close();
+						return complete(false);
+					}
+
+					// the services the modem lists over the passthrough: what a
+					// plugin's client can be asked for (extra_client)
+					self.pt = { shim: shim, ctl: ctl, nas: nas, dsd: dsd, services: have };
+
+					// the counterpart of the "rebuilding" line: without it a
+					// log shows the attempt and never whether it took
+					if (self._pt_built)
+						log('notice', sprintf('qmi-over-mbim: passthrough rebuilt — QMI answering again (NAS cid %d%s)',
+							nas.cid, dsd ? sprintf(', DSD cid %d', dsd.cid) : ''));
+
+					self._pt_built = true;
+					complete(true);
 				};
 
 				if (have[sprintf('%d', dsdmod.default.service)])
@@ -1628,6 +1942,13 @@ export function create(opts)
 	// corrected override up on their next (re)dial via conn_cfg. (The LTE attach
 	// APN is programmed separately in step_attach_profile before registration.)
 	self.reapply_sim = function(cb) {
+		let done = () => {
+			scaffold.resolve_active_sim(self.info.iccid, self.info.imsi);
+
+			if (cb)
+				cb(null);
+		};
+
 		self.mbim.command(bc, 'SUBSCRIBER_READY_STATUS', 'query', {}, (err, d) => {
 			if (!err) {
 				if (d.subscriber_id != null && d.subscriber_id != '')
@@ -1636,10 +1957,19 @@ export function create(opts)
 					self.info.iccid = d.sim_iccid;
 			}
 
-			scaffold.resolve_active_sim(self.info.iccid, self.info.imsi);
+			// MBIM says nothing of a card that is not in the modem's own
+			// slot (QMI UIM Remote, wwand-rsim): the card's own files — over
+			// the passthrough's UIM or AT, fresh — name it instead. Without
+			// it the card's wwand_sim did not match and the interface's APN
+			// was dialled (HW-seen on an RM520N lent a card, 2026-09-27).
+			if (self.info.iccid != null && self.info.imsi != null)
+				return done();
 
-			if (cb)
-				cb(null);
+			sim.read_identity(self, (id) => {
+				self.info.imsi = self.info.imsi ?? id.imsi;
+				self.info.iccid = self.info.iccid ?? id.iccid;
+				done();
+			}, { fresh: true });
 		});
 	};
 
@@ -1647,7 +1977,9 @@ export function create(opts)
 	// one factory for the identical _ensure_uim/_ensure_wms bodies. cb() either
 	// way — the caller's probe verifies the service actually answers.
 	let ensure_pt_client = (field, schema) => (cb) => {
-		if (self[field])
+		// a client on a stack that stopped answering goes with the rebuild in
+		// _ensure_pt (drop_pt clears it), so do not hand it out meanwhile
+		if (self[field] && !pt_stale())
 			return cb(self[field]);
 
 		self._ensure_pt((up) => {
@@ -1678,11 +2010,53 @@ export function create(opts)
 	// GIVE THE CID BACK. Every passthrough client is allocated out of the
 	// MODEM's client table, and a destroyed-but-not-released one stays in it
 	// until the modem's stack resets — the same finite resource modem.uc's
-	// teardown release burst exists to protect (modem.uc:304,:1416). The
+	// teardown release burst exists to protect (modem.uc:333,:1416). The
 	// session-long clients (pt.nas/dsd, uim, wms) are allocated once and go
 	// with the session; these two allocate PER CALL, so a scripted reattach
 	// loop walked the table down on its own. An E182E-class stack has room for
 	// a handful. Nothing in the passthrough released anything before this.
+	// A RELEASE THAT WAS NOT ACKNOWLEDGED IS STILL OWED. destroy() forgets
+	// the client on our side, the modem's table keeps the CID until a
+	// RELEASE_CID succeeds — one that timed out or failed left a CID nobody
+	// tracked, and every hold/wake (a DMS client each) took another out of a
+	// table the E182E class has room for a handful in (drop_pt). Entries
+	// { service, cid, pt, tries, busy } stay here until acknowledged, are
+	// tried again at the next use of the same stack (flush_releases), go
+	// with drop_pt's release burst when the stack is dropped, and are given
+	// up after PT_RELEASE_TRIES — said, so a leak is at least visible.
+	const PT_RELEASE_TRIES = 3;
+
+	self._pt_unreleased = [];
+
+	let send_release = (e) => {
+		if (e.busy || self.pt !== e.pt || !e.pt?.ctl)
+			return;
+
+		e.busy = true;
+
+		e.pt.ctl.request('RELEASE_CID', { release: { service: e.service, cid: e.cid } }, (err) => {
+			e.busy = false;
+
+			// acknowledged; or cancelled — the stack went, and drop_pt's
+			// burst carried this entry
+			if (!err || err.error == 'cancelled') {
+				self._pt_unreleased = filter(self._pt_unreleased, (x) => x !== e);
+				return;
+			}
+
+			if (++e.tries >= PT_RELEASE_TRIES) {
+				log('warn', sprintf('qmi-over-mbim: releasing CID %d (service %d) failed %d times (%J) — giving it up; the modem may keep it until it resets',
+					e.cid, e.service, e.tries, err));
+				self._pt_unreleased = filter(self._pt_unreleased, (x) => x !== e);
+			}
+		}, { timeout: self.timing.pt_release_ms ?? 3000, no_recovery: true });
+	};
+
+	flush_releases = () => {
+		for (let e in self._pt_unreleased)
+			send_release(e);
+	};
+
 	let pt_release = (client) => {
 		if (!client)
 			return;
@@ -1694,9 +2068,90 @@ export function create(opts)
 		if (self._gen != client._pt_gen || !self.pt?.ctl)
 			return;
 
-		self.pt.ctl.request('RELEASE_CID',
-			{ release: { service: client.service, cid: client.cid } },
-			() => null, { timeout: 3000, no_recovery: true });
+		let e = { service: client.service, cid: client.cid, pt: client._pt ?? self.pt, tries: 0 };
+
+		push(self._pt_unreleased, e);
+		send_release(e);
+	};
+
+	// A plugin's client of a QMI service the core does not know, over the
+	// QMI-over-MBIM passthrough — the QMI modem's extra_client, same contract
+	// (modem.uc): the modem owns it, releases its CID on teardown and when the
+	// passthrough is rebuilt, and `destroyed` tells the plugin to ask again.
+	// Which indications the passthrough carries depends on the service
+	// (qmi_over_mbim.uc:143-151): NAS pushes none on the EG06 and the RM520N,
+	// UIM Remote pushes all of its own on the RM520N — a remote SIM works over
+	// MBIM there (HW-observed 2026-09-27). A plugin whose service stays silent
+	// finds that out from its own protocol.
+	self.extra_client = function(schema, cb) {
+		let gen = self._gen;
+
+		// the MBIM session not open yet (init, a restart): a moment away,
+		// not "this modem cannot" — the plugin tries again without a backoff.
+		// Still in its init chain counts too: a passthrough probe there fails
+		// (function_error before MBIM is through its own bring-up) and, the
+		// flag of a working one reset by the restart, was remembered as "no
+		// passthrough on this modem" until the next teardown (HW-seen on an
+		// RM520N, 2026-09-27)
+		if (!self.mbim || index([ 'ABSENT', 'INIT_TRANSPORT', 'INIT_SERVICES' ], self.state) >= 0)
+			return cb({ error: 'not_ready' }, null);
+
+		self._ensure_pt((up) => {
+			if (self._gen != gen)
+				return cb({ error: 'cancelled' }, null);
+
+			if (!up)
+				return cb({ error: 'unsupported', detail: 'no QMI passthrough on this modem' }, null);
+
+			if (self.pt.services && !self.pt.services[sprintf('%d', schema.service)])
+				return cb({ error: 'service_unavailable' }, null);
+
+			let pt = self.pt;
+
+			pt.ctl.request('ALLOCATE_CID', { service: schema.service }, (aerr, adata) => {
+				if (aerr || !adata?.allocation)
+					return cb(aerr ?? { error: 'no_allocation' }, null);
+
+				let c = client_mod.create(pt.shim, schema, adata.allocation.cid, hooks);
+
+				c._pt_gen = gen;
+
+				// the stack went while the allocation was on its way: a
+				// client on it would never answer, and nothing would free it
+				if (self._gen != gen || self.pt !== pt) {
+					// its CID is on a stack that is gone: releasing it through
+					// the new one would free somebody else's number there
+					c.destroy();
+					return cb({ error: 'cancelled' }, null);
+				}
+
+				push(self.extra_clients, c);
+				cb(null, c);
+			}, { no_recovery: true });
+		});
+	};
+
+	// a plugin giving its client back; only one this modem still owns is
+	// released on the wire (a rebuilt passthrough numbers its CIDs afresh)
+	self.extra_release = function(client, cb) {
+		let owned = false;
+
+		self.extra_clients = filter(self.extra_clients ?? [], (c) => {
+			if (c === client) {
+				owned = true;
+				return false;
+			}
+
+			return true;
+		});
+
+		if (owned)
+			pt_release(client);
+		else
+			client?.destroy();
+
+		if (cb)
+			cb(null);
 	};
 
 	self.reset = function(cb) {
@@ -1849,6 +2304,174 @@ export function create(opts)
 		});
 	};
 
+	// One DMS request over the QMI passthrough, on a CID held for that
+	// request only (the reattach's pattern): fn(dms, done) runs it, and
+	// done(err, data) gives the CID back and answers cb(err, data). err
+	// { error: 'no_passthrough' } when there is no QMI to ask, `cancelled`
+	// when the session ended meanwhile. Never a CTL SYNC: over the
+	// passthrough it resets the modem's embedded QMI state and ends the MBIM
+	// data session (qmi_over_mbim.uc blocks it).
+	let pt_dms = (fn, cb) => {
+		let gen = self._gen;
+
+		self._ensure_pt((up) => {
+			if (self._gen != gen)
+				return cb({ error: 'cancelled' });
+
+			if (!up)
+				return cb({ error: 'no_passthrough' });
+
+			// the owed releases first: a table with a leaked CID in it is
+			// the one that refuses this allocation
+			flush_releases();
+
+			self.pt.ctl.request('ALLOCATE_CID', { service: dmsmod.default.service }, (aerr, adata) => {
+				if (self._gen != gen || aerr?.error == 'cancelled')
+					return cb({ error: 'cancelled' });
+
+				if (aerr || !adata?.allocation)
+					return cb({ error: 'no_passthrough' });
+
+				let dms = client_mod.create(self.pt.shim, dmsmod.default, adata.allocation.cid, hooks);
+
+				dms._pt_gen = self._gen;
+				dms._pt = self.pt;
+
+				fn(dms, (err, data) => {
+					pt_release(dms);
+					cb(err, data);
+				});
+			}, { no_recovery: true });
+		});
+	};
+
+	// SET_OPERATING_MODE over the passthrough; cb(err). Methods, both, so a
+	// test can stand in for a passthrough the MBIM mock does not have.
+	self._pt_opmode = function(mode, cb) {
+		pt_dms((dms, done) => qmi_backend.set_opmode(dms, mode, (err) => done(err)), (err) => cb(err));
+	};
+
+	// GET_OPERATING_MODE over the passthrough (libqmi 1.38.0
+	// qmi-service-dms.json "Get Operating Mode", 0x002D, output Mode 0x01);
+	// cb(err, mode).
+	self._pt_get_opmode = function(cb) {
+		pt_dms((dms, done) => dms.request('GET_OPERATING_MODE', {}, (err, d) => done(err, d?.mode),
+			{ no_recovery: true }), cb);
+	};
+
+	// Backend operation `set_opmode` (docs/backend-interface.md): online /
+	// low_power / offline — the radio park of a plugin's hold
+	// (`modem_radio`) and of `option lowpower`. `lowpower_parked` records a
+	// successful low_power, as on QMI, and the supervisors read it.
+	//
+	// A PARK GOES OVER THE PASSTHROUGH'S DMS FIRST: LOW_POWER is the mode QMI
+	// modems are parked in, RF off with the SIM kept up ("temporarily
+	// disabled RF", qmi-enums-dms.h, libqmi 1.38.0) — a remote SIM served
+	// through UIM Remote over this same passthrough keeps running. MBIM's own
+	// software radio switch (Basic Connect Radio State) where there is no
+	// passthrough, where DMS refuses, and during the init chain, where a
+	// passthrough probe fails and would be remembered as "none on this
+	// modem" (extra_client). `offline` maps to that switch too: MBIM has
+	// only the one.
+	//
+	// A WAKE UNDOES WHAT MAY BE OFF, and the two switches are independent:
+	// undoing one leaves the other off. Parked over DMS by this object: DMS
+	// online, and no switch fallback (the switch does not undo a DMS low
+	// power, and "woken" would then be a lie). Parked over the switch: the
+	// switch on — and DMS online as well while this object has not set DMS
+	// itself (`_dms_unknown`): a daemon that parked it over DMS and then
+	// restarted left it in low power, and the modem object that knew is
+	// gone. The vendor FCC unlock a held init deferred (`_fcc_due`,
+	// hold_at_open) goes first.
+	self.set_opmode = function(mode, cb) {
+		cb = cb ?? (() => null);
+
+		if (!self.mbim)
+			return cb({ error: 'unsupported', detail: 'no mbim channel' });
+
+		if (mode != 'online' && mode != 'low_power' && mode != 'offline')
+			return cb({ error: 'unsupported', mode: mode });
+
+		let gen = self._gen;
+		let was_parked = self.lowpower_parked;
+		let early = index([ 'ABSENT', 'INIT_TRANSPORT', 'INIT_SERVICES' ], self.state) >= 0;
+		let gone = () => self._gen != gen || !self.mbim;
+
+		let done = (err, via) => {
+			if (self._gen != gen)
+				return cb({ error: 'cancelled' });
+
+			if (!err) {
+				self.lowpower_parked = (mode == 'low_power');
+				self._park_via = self.lowpower_parked ? via : null;
+			}
+
+			// woken from a park: the next registration is reported as one
+			// (_update_register)
+			if (!err && was_parked && mode == 'online')
+				self._wake_pending = true;
+
+			cb(err ?? null);
+		};
+
+		// k(err)
+		let radio = (k) => self.mbim.command(bc, 'RADIO_STATE', 'set',
+			{ radio_state: (mode == 'online') ? bc.RADIO_STATE_ON : bc.RADIO_STATE_OFF },
+			(err, data) => {
+				if (gone())
+					return cb({ error: 'cancelled' });
+
+				note_radio(data);
+				k(err ? { error: 'mbim', detail: err } : null);
+			});
+
+		// k(err): no_passthrough when there is no QMI to ask
+		let dms = (k) => self._pt_opmode(mode, (err) => {
+			if (gone() || err?.error == 'cancelled')
+				return cb({ error: 'cancelled' });
+
+			if (!err)
+				self._dms_unknown = false;
+
+			k(err);
+		});
+
+		if (mode != 'online') {
+			if (early)
+				return radio((err) => done(err, 'radio'));
+
+			return dms((err) => {
+				if (!err)
+					return done(null, 'dms');
+
+				if (err.error != 'no_passthrough')
+					log('info', sprintf('radio %s over the QMI passthrough refused (%J) — using the MBIM radio switch',
+						mode, err));
+
+				radio((rerr) => done(rerr, 'radio'));
+			});
+		}
+
+		let via = self._park_via;
+
+		// DMS best-effort: no passthrough, or a refusal, is said and passed
+		let dms_too = (k) => (early || !(via == null || self._dms_unknown)) ? k() : dms((err) => {
+			if (err && err.error != 'no_passthrough')
+				log('info', sprintf('radio online over the QMI passthrough refused (%J)', err));
+			k();
+		});
+
+		let wake = () => (via == 'dms')
+			? dms((err) => done(err))
+			: dms_too(() => radio((err) => done(err)));
+
+		if (!self._fcc_due)
+			return wake();
+
+		self._fcc_due = false;
+		fcc_unlock(() => gone() ? cb({ error: 'cancelled' }) : wake());
+	};
+
 	// telemetry (signal/cells/CA/data-mode/reg-detail + slow log loop + fast
 	// watch loop) — lives in telemetry_mbim.uc; attaches the _refresh_*
 	// methods, watch and _start_telemetry, returns { stop } for teardown.
@@ -1877,13 +2500,91 @@ export function create(opts)
 		step_open();
 	};
 
+	// Drop the whole passthrough stack: give its session-long CIDs back, destroy
+	// its clients and close the shim. Called by teardown, and by _ensure_pt when
+	// the passthrough has stopped answering and is rebuilt.
+	drop_pt = () => {
+		// DETACH FIRST, clean up after. destroy() pays a client's pending
+		// callbacks synchronously (client.uc:217), and one of those may be a
+		// probe that calls _ensure_pt or _ensure_uim again. Still seeing the
+		// stack being dropped, it would drop it a second time and start a
+		// bring-up in the middle of this one.
+		//
+		// uim and wms go with it: they rode on the same shim, and
+		// ensure_pt_client caches into self[field] and short-circuits when it is
+		// set — a wms left behind survived a teardown+retry on the same object,
+		// and every later SMS op used a client bound to a shim that is gone,
+		// failing forever and feeding the proto-error counter, which eventually
+		// power-cycles a healthy modem.
+		let pt = self.pt, uim = self.uim, wms = self.wms, extra = self.extra_clients ?? [];
+		// ...and the releases still owed on this stack (pt_release): the
+		// burst below is their last chance
+		let owed = filter(self._pt_unreleased, (e) => e.pt === pt);
+
+		self._pt_unreleased = filter(self._pt_unreleased, (e) => e.pt !== pt);
+
+		self.pt = null;
+		self.uim = null;
+		self.wms = null;
+		// plugins' clients rode on the same shim: released and destroyed with
+		// it, and `destroyed` tells their owners to ask again
+		self.extra_clients = [];
+
+		// EACH CLEANUP GUARDED ON ITS OWN, not the sequence. One catch around the
+		// whole block means the first throwing destroy skips the clients after it
+		// AND the shim close — and with the stack already detached above, that
+		// strands a shim that is still open with clients registered on it
+		// (qmi_over_mbim.uc:135).
+		if (pt) {
+			// GIVE THE SESSION-LONG CIDs BACK FIRST, while ctl and the shim are
+			// still up. These were allocated out of the MODEM's client table
+			// and destroy() deliberately does not release them (client.uc:201)
+			// — closing the HOST's MBIM session is not shown to reset the
+			// modem's embedded QMI client table, so every daemon reload leaked
+			// a NAS, a DSD and (once used) a UIM and a WMS. The E182E-class
+			// table has room for a handful. Same burst modem.uc:1632 does for
+			// the native side, which the passthrough never had. ctl is NOT in this list: it is the
+			// implicit client (cid 0) and it is what carries RELEASE_CID for
+			// all the others, so it has to outlive them.
+			for (let c in [ pt.nas, pt.dsd, uim, wms, ...extra, ...owed ]) {
+				if (!c || !pt.ctl)
+					continue;
+
+				try {
+					pt.ctl.request('RELEASE_CID',
+						{ release: { service: c.service, cid: c.cid } },
+						() => null, { timeout: 3000, no_recovery: true });
+				} catch (e) {
+					log('err', sprintf('passthrough drop: releasing a CID threw: %s', e));
+				}
+			}
+
+			for (let c in [ pt.ctl, pt.nas, pt.dsd, uim, wms, ...extra ]) {
+				if (!c)
+					continue;
+
+				try {
+					c.destroy();
+				} catch (e) {
+					log('err', sprintf('passthrough drop: a client callback threw: %s', e));
+				}
+			}
+
+			try {
+				pt.shim.close();
+			} catch (e) {
+				log('err', sprintf('passthrough drop: closing the shim threw: %s', e));
+			}
+		}
+	};
+
 	self.teardown = function() {
 		// see modem.uc: make_fail refuses to arm a retry while this is raised,
 		// because a failure reported from INSIDE a teardown would arm it after
 		// the cancel pass below and restart a modem that is being stopped. The
 		// QMI backend grew this first; MBIM reaches the same re-arm by its own
 		// route (a synchronous cancellation from the recovery cycle re-arming
-		// settle_timer at :188/:191). Review follow-up, 2026-09-19.
+		// settle_timer at :249/:253). Review follow-up, 2026-09-19.
 		self._teardown_depth = (self._teardown_depth ?? 0) + 1;
 
 		// first, so anything the destroys below call back into can tell that its
@@ -1907,64 +2608,9 @@ export function create(opts)
 		// was complaining about. The QMI teardown wraps its equivalent call for
 		// the same reason; NCM needs none, close_at() discards its queue without
 		// paying it (atcmd.uc:1017). Review follow-up, 2026-09-19.
-		// EACH CLEANUP GUARDED ON ITS OWN, not the sequence. One catch around the
-		// whole block means the first throwing destroy skips the clients after it
-		// AND the shim close — and `self.pt = null` below then drops the only
-		// handle to a shim that is still open with clients registered on it
-		// (qmi_over_mbim.uc:110).
-		if (self.pt) {
-			// GIVE THE SESSION-LONG CIDs BACK FIRST, while ctl and the shim are
-			// still up. These were allocated out of the MODEM's client table
-			// and destroy() deliberately does not release them (client.uc:201)
-			// — closing the HOST's MBIM session is not shown to reset the
-			// modem's embedded QMI client table, so every daemon reload leaked
-			// a NAS, a DSD and (once used) a UIM and a WMS. The E182E-class
-			// table has room for a handful. Same burst modem.uc:1409 does for
-			// the native side, which the passthrough never had. ctl is NOT in this list: it is the
-			// implicit client (cid 0) and it is what carries RELEASE_CID for
-			// all the others, so it has to outlive them.
-			for (let c in [ self.pt.nas, self.pt.dsd, self.uim, self.wms ]) {
-				if (!c || !self.pt.ctl)
-					continue;
-
-				try {
-					self.pt.ctl.request('RELEASE_CID',
-						{ release: { service: c.service, cid: c.cid } },
-						() => null, { timeout: 3000, no_recovery: true });
-				} catch (e) {
-					log('err', sprintf('teardown: releasing a passthrough CID threw: %s', e));
-				}
-			}
-
-			for (let c in [ self.pt.ctl, self.pt.nas, self.pt.dsd, self.uim, self.wms ]) {
-				if (!c)
-					continue;
-
-				try {
-					c.destroy();
-				} catch (e) {
-					log('err', sprintf('teardown: a passthrough client callback threw: %s', e));
-				}
-			}
-
-			try {
-				self.pt.shim.close();
-			} catch (e) {
-				log('err', sprintf('teardown: closing the passthrough shim threw: %s', e));
-			}
-
-			self.pt = null;
-		}
-
-		// the passthrough-allocated clients (if any) rode on the shim just closed.
-		// BOTH of them: ensure_pt_client caches into self[field] and short-
-		// circuits when it is set, so a wms left behind here survived a
-		// teardown+retry on the same object and every later SMS op used a
-		// client bound to a shim that is gone — failing forever and feeding the
-		// proto-error counter, which eventually power-cycles a healthy modem.
-		self.uim = null;
-		self.wms = null;
+		drop_pt();
 		self._pt_failed = false;
+		self._pt_built = false;
 
 		// WHAT THE OLD MODEM SAID IS NOT WHAT THE NEW ONE SAYS. Both of these
 		// are published in `status`, and both are filled by indications that

@@ -9,7 +9,7 @@
 'use strict';
 
 import { fmt_plmn, fmt_sig, fmt_locks, reg_text, packet_service_text,
-	collectd_lines, collectd_interval, recovery_text } from 'wwand.wwandctl_fmt';
+	collectd_lines, collectd_interval, recovery_text, radio_text } from 'wwand.wwandctl_fmt';
 
 import * as libubus from 'ubus';
 import * as fs from 'fs';
@@ -114,6 +114,16 @@ function cmd_status(args)
 		printf('  state       %s%s\n', m.state,
 			m.control_note ? sprintf('  [%s]', m.control_note) : '');
 		printf('  SIM         imsi %s  iccid %s\n', m.imsi ?? '-', m.iccid ?? '-');
+
+		let radio = radio_text(m);
+
+		if (radio)
+			printf('  radio       %s\n', radio);
+
+		// what optional packages report about this modem (a remote SIM, say)
+		for (let r in (m.plugins ?? []))
+			printf('  %-11s %s%s\n', r.label, r.text,
+				(r.level == 'error') ? '  [error]' : (r.level == 'warn') ? '  [!]' : '');
 		printf('  network     %s\n', reg_text(m));
 
 		let rec = recovery_text(m.recovery);
@@ -435,6 +445,7 @@ eSIM (needs the wwand-esim package)
   esim [modem] notifications | notify   pending eUICC notifications (ES9+)
 
 Maintenance
+  sims                   every SIM card seen: ICCID, where it is (modem/slot, eUICC profile, reader)
   reset [modem]          modem reset (GPIO if configured, else backend soft reset)
   repower [modem]        hardware repower (reset-GPIO pulse / board power-cycle)
   protocol [modem] qmi|mbim   switch the control protocol (the modem resets)
@@ -514,7 +525,7 @@ if (json_mode) {
 //
 // WHY THE FLOOR. `modem_signal` keeps wwand's adaptive fast-telemetry loop warm
 // (daemon.uc calls modem.watch()); that loop polls the modem at 1 Hz and decays
-// 6 s after the last request (modem_common.uc:702-703). One sample therefore
+// 6 s after the last request (modem_common.uc:704-705). One sample therefore
 // costs ~6 s of 1 Hz modem traffic, so the duty cycle is 6/interval: 10 % at
 // 60 s, 20 % at 30 s, 60 % at 10 s — and at 6 s or below the loop NEVER decays
 // and the modem is polled around the clock. A global `Interval 10` in
@@ -931,6 +942,26 @@ case 'sms-delete': {
 
 	call_ok('modem_sms_delete', { modem: r.modem, index: +rest[0] });
 	printf('message %d deleted\n', +rest[0]);
+	break;
+}
+
+// every SIM card wwand has seen, by ICCID, and where it is (siminventory.uc)
+case 'sims': {
+	let inv = call_ok('sim_inventory', {});
+
+	if (!length(inv?.cards ?? []))
+		printf('no SIM card seen yet\n');
+
+	for (let c in (inv?.cards ?? [])) {
+		let where = c.reader ? sprintf('reader %s', c.reader)
+			: c.modem ? sprintf('%s%s', c.modem, (c.slot != null) ? sprintf(' slot %d', c.slot) : '') : '?';
+		let esim = c.eid ? sprintf(' · eUICC %s%s', c.eid,
+			c.profile ? sprintf(' profile %s%s', c.profile.state ?? '?', c.profile.name ? sprintf(' "%s"', c.profile.name) : '') : '') : '';
+
+		printf('%-21s %-22s %s%s%s\n', c.iccid, where,
+			!c.present ? 'not present' : c.active ? 'active' : 'present',
+			c.imsi ? sprintf(' · imsi %s', c.imsi) : '', esim);
+	}
 	break;
 }
 

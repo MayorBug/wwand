@@ -283,7 +283,60 @@ export function default_fx(log)
 		return ok;
 	};
 
-	self.exists = (path) => fs.access(path) == true;
+	// Replace a file whole: written beside it, then renamed over it. For
+	// state a later start trusts (the daemon's admin_downs and giveups):
+	// write() truncates first, so a daemon killed between the truncate and
+	// the write — or a full tmpfs — left an empty or half-written record,
+	// and an empty admin_downs reads as "nothing recorded" (daemon.uc,
+	// admin_record_complete). rename(2) replaces the name atomically within
+	// one filesystem, and the temporary lives in the same directory for
+	// that reason. false with last_error set; the old file is then intact,
+	// and no temporary is left behind either way (a half-written one on a
+	// full tmpfs is exactly what must not pile up there). Its name is this
+	// write's own: two writers of one path sharing `<path>.tmp` would
+	// rename each other's half-written data into place.
+	let atomic_seq = 0;
+
+	self.write_atomic = (path, data) => {
+		let tmp = sprintf('%s.tmp.%d.%d', path, time(), ++atomic_seq);
+
+		if (!self.write(tmp, data)) {
+			fs.unlink(tmp);
+			return false;
+		}
+
+		if (!fs.rename(tmp, path)) {
+			self.last_error = fs.error();
+			fs.unlink(tmp);
+			return false;
+		}
+
+		return true;
+	};
+
+	// An exclusive flock(2) on `path` (created if missing), for a
+	// read-merge-write that another process appends to: the shim takes the
+	// same lock around its append (files/wwand-proto.sh, busybox `flock`).
+	// Returns the release function, or null when the lock cannot be had —
+	// the caller then goes on unlocked, which is what it did before there
+	// was one. Blocking: the other side holds it for one `echo`.
+	// file.lock() is ucode's flock (fs.c:888-912, ucode 2026.07.09~b885dd0f);
+	// an interpreter without it gets null.
+	self.lock = (path) => {
+		let f = fs.open(path, 'a');
+
+		if (!f)
+			return null;
+
+		if (type(f.lock) != 'function' || !f.lock('x')) {
+			f.close();
+			return null;
+		}
+
+		return () => { f.lock('u'); f.close(); };
+	};
+
+	self.exists =(path) => fs.access(path) == true;
 	self.realpath = (path) => fs.realpath(path);
 	self.glob = (...patterns) => fs.glob(...patterns);
 	self.run = (argv) => system(argv);

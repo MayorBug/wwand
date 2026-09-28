@@ -157,13 +157,95 @@ function parse_lpac_line(s)
 	return { kind: 'log', text: s };
 }
 
+// ES10 functions by their command tag (SGP.22 v2.7 5.7 / SGP.32 v1.3 5.9)
+const ES10_NAMES = {
+	BF20: 'GetEUICCInfo1', BF22: 'GetEUICCInfo2', BF2E: 'GetEUICCChallenge',
+	BF38: 'AuthenticateServer', BF21: 'PrepareDownload', BF36: 'LoadBoundProfilePackage',
+	BF41: 'CancelSession', BF2D: 'GetProfilesInfo', BF31: 'EnableProfile',
+	BF32: 'DisableProfile', BF33: 'DeleteProfile', BF3E: 'GetEID',
+	BF28: 'ListNotification', BF2B: 'RetrieveNotificationsList', BF30: 'RemoveNotificationFromList',
+	BF3C: 'GetEuiccConfiguredAddresses', BF3F: 'SetDefaultDpAddress', BF43: 'GetRAT',
+	BF51: 'LoadEuiccPackage', BF52: 'GetEimConfigurationData', BF55: 'GetEimConfigurationData',
+	BF57: 'AddInitialEim', BF58: 'ProfileRollback', BF4F: 'IpaEuiccData',
+};
+
+// the tag a BER object starts with, as hex ('BF38', '30'), or null
+function first_tag(h)
+{
+	if (length(h) < 2)
+		return null;
+
+	let b = hex(substr(h, 0, 2));
+
+	return ((b & 0x1F) == 0x1F && length(h) >= 4) ? uc(substr(h, 0, 4)) : uc(substr(h, 0, 2));
+}
+
+// One command and its answer for the debug log: what an ES10 exchange WAS,
+// never what it carried. The command's own data — a Bound Profile Package,
+// signatures, an activation code — stays out; only its ES10 tag and length.
+// An answer is shown in full only while it is short (<= 32 bytes): that is
+// where the error codes are (an AuthenticateServerResponse error is
+// BF38 xx A1 xx 02 01 <code>), and nothing that short is a profile.
+// `cont`: this answer continues one the card is still handing out (a GET
+// RESPONSE after a GET RESPONSE that ended 61xx) — its first bytes are the
+// middle of a data object, not a tag, and are not shown as one.
+function apdu_summary(cmd, resp, cont)
+{
+	cmd = uc(cmd ?? '');
+	resp = uc(resp ?? '');
+
+	let ins = substr(cmd, 2, 2), p1 = substr(cmd, 4, 2), p2 = substr(cmd, 6, 2);
+	let data = substr(cmd, 10);
+	let what = sprintf('INS %s', ins);
+
+	// STORE DATA (SGP.22 5.7.2): the ES10 command begins in block 0
+	if (ins == 'E2') {
+		let tag = (p2 == '00') ? first_tag(data) : null;
+
+		what = sprintf('STORE DATA %s blk %d', (p1 == '91') ? 'last' : 'more', hex(p2 || '0'));
+		if (tag)
+			what += sprintf(' %s%s', tag, ES10_NAMES[tag] ? ' ' + ES10_NAMES[tag] : '');
+		what += sprintf(' (%d B)', length(data) / 2);
+	}
+
+	let sw = (length(resp) >= 4) ? substr(resp, length(resp) - 4) : '?';
+	let rdata = (length(resp) >= 4) ? substr(resp, 0, length(resp) - 4) : '';
+	let ans = sprintf('SW %s', sw);
+
+	if (length(rdata)) {
+		let rtag = first_tag(rdata);
+
+		if (cont)
+			ans += sprintf(' (%d B more)', length(rdata) / 2);
+		else
+			ans += (length(rdata) <= 64)
+				? sprintf(' %s', rdata)
+				: sprintf(' %s (%d B)', rtag ?? '?', length(rdata) / 2);
+	}
+
+	return what + ' -> ' + ans;
+}
+
 return {
 	// exposed for tests (test_esim_bridge): the pure lpac line classifier
 	parse_lpac_line: parse_lpac_line,
+	// ...and the debug line one card command becomes
+	apdu_summary: apdu_summary,
 
-	// deps: { esim (the wwand.esim module), log(level,msg), modem_of(ref) }
+	// deps: { esim (the wwand.esim module), log(level,msg), modem_of(ref),
+	//         changed?(ref, slot) }
+	// `changed` fires after anything that may have altered the card's profile
+	// list (a finished download, an enable/disable/delete that succeeded): the
+	// host's copy of that list — status `esim`, the SIM inventory — is read
+	// only at bring-up and goes stale otherwise.
 	create: function(deps) {
 		let esim = deps.esim, log = deps.log, modem_of = deps.modem_of;
+		// the host's refresh must not take the operation that triggered it
+		// down with it — but a failure is said, not swallowed
+		let changed = (ref, slot) => {
+			try { deps.changed?.(ref, slot); }
+			catch (e) { log('warn', sprintf('modem %s: eSIM profile list refresh failed (%s)', ref, e)); }
+		};
 		let lpac = deps.lpac_path ?? ESIM_LPAC;   // test seam for the lpac binary
 		let idle_ms = deps.idle_ms ?? ESIM_IDLE_MS;   // test seam for the watchdog
 		let dl = { state: 'idle' };   // one host download at a time
@@ -241,7 +323,7 @@ return {
 
 			log('notice', sprintf('modem %s: esim[%s]: stdio bridge', ref, op));
 
-			let chan = 0, uh = null, buf = '';
+			let chan = 0, uh = null, buf = '', c0_more = false;
 
 			// protocol-level lines (results, progress, bridge errors) always
 			// reach the syslog; the process's own chatter at opts.log_level
@@ -391,8 +473,20 @@ return {
 				case 'transmit':
 					// apdu_send yields the response hex directly (modem_apdu is
 					// what wraps it as {response}); use it as-is
-					sim.apdu_send(entry.modem, slot, chan, rec.param, (err, res) =>
-						send(err ? -1 : 0, err ? '' : (res ?? ''))); break;
+					// a GET RESPONSE after a GET RESPONSE that ended 61xx
+					// hands out the middle of the same answer
+					let cont = (uc(substr(rec.param ?? '', 2, 2)) == 'C0') && c0_more;
+
+					sim.apdu_send(entry.modem, slot, chan, rec.param, (err, res) => {
+						c0_more = !err && uc(substr(rec.param ?? '', 2, 2)) == 'C0' &&
+						          uc(substr(res ?? '', length(res ?? '') - 4, 2)) == '61';
+						// the ES10 sequence of a run, for whoever debugs a
+						// download or an eIM package: tags and status words
+						// only (apdu_summary)
+						logline(err ? sprintf('%s -> error %J', apdu_summary(rec.param, ''), err)
+						            : apdu_summary(rec.param, res, cont), 'debug');
+						send(err ? -1 : 0, err ? '' : (res ?? ''));
+					}); break;
 				case 'logic_channel_close':
 					sim.apdu_close(entry.modem, slot, chan, () => send(0, '')); break;
 				default:
@@ -459,6 +553,9 @@ return {
 			                                    length(conf ?? '') ? sprintf(" -c '%s'", conf) : ''); break;
 			case 'notif-list':    cmd = 'notification list'; break;
 			case 'notif-process': cmd = 'notification process -a'; break;
+			// one notification by seqNumber (digits only, checked by the
+			// caller), removed from the card once the SM-DP+ acknowledged it
+			case 'notif-send':    cmd = sprintf("notification process -r '%s'", code); break;
 			// management writes: the ICCID rides in the code arg (validated
 			// digits-only by the caller, so the quoting is shell-safe)
 			case 'enable':        cmd = sprintf("profile enable '%s'",  code); break;
@@ -483,6 +580,9 @@ return {
 			let finish = (state, extra) => {
 				dl = { state, via: 'lpac', ...extra };
 				release?.();   // run finished — this op's quiet claim is dropped
+				// a failed run can have installed the profile before failing
+				// (the ack is a separate step) — re-read either way
+				changed(ref, slot);
 				log('notice', sprintf('modem %s: eSIM download %s%s', ref, state,
 					extra?.notified != null ? sprintf(' (ack %s)', extra.notified ? 'sent' : 'skipped') : ''));
 			};
@@ -652,9 +752,12 @@ return {
 		// (mgmt_busy) and is parked with its own channel closed, so the
 		// download runs under its claim instead of being refused as busy —
 		// and only then: outside such a wait it is refused. The install
-		// notification stays on the card (no auto notify), because the
-		// assistant reports the PIR to its eIM itself. cb(err, dl) when the
-		// run has ENDED, not when it starts.
+		// notification stays on the card (no auto notify): the assistant
+		// reads it into its trigger result for the eIM (SGP.32 v1.3 3.2.3.1
+		// step 13) and then has it sent to the SM-DP+ with session_notify
+		// (step 14). `notification process -a` here would also send every
+		// other pending notification, which the assistant delivers through
+		// its eIM. cb(err, dl) when the run has ENDED, not when it starts.
 		let session_download = (ref, code, conf, cb) => {
 			if (parked?.ref != ref)
 				return cb({ error: 'no_session' });
@@ -684,9 +787,53 @@ return {
 				});
 		};
 
+		// The Profile Installation Result of such a direct download, to the
+		// SM-DP+ through the same ES9+ client: SGP.32 v1.3 3.2.3.1 step 14
+		// (and 3.7 [2a]) puts that delivery on the device, and an eIM
+		// forwards only the PIRs of indirect sessions it ran itself (5.7.4).
+		// `notification process -r <seq>` sends that one notification and
+		// removes it from the card only after the SM-DP+ acknowledged it
+		// (lpac 2.3.0 src/applet/notification/process.c, _process_single; SGP.22
+		// v2.7 3.1.3.3 steps 7 and 11). Only the assistant knows which
+		// notification is the PIR: every other one stays on the card for it
+		// to deliver through its eIM. cb(err) when the run has ENDED.
+		let session_notify = (ref, seq, cb) => {
+			if (parked?.ref != ref)
+				return cb({ error: 'no_session' });
+
+			if (dl?.state == 'running')
+				return cb({ error: 'busy' });
+
+			if (type(seq) != 'int' || seq < 0)
+				return cb({ error: 'invalid_argument' });
+
+			let q = quiet_claim(modem_of(ref)?.modem);
+			let p = lpac_run(ref, parked.slot, 'notif-send', sprintf('%d', seq), '', (err, out) => {
+				q();
+
+				// lpac exits 0 when the SM-DP+ refuses too; its result line decides
+				let ok = !err && match(out ?? '', /result:[^\n]*code=0/);
+
+				log(ok ? 'notice' : 'warn', sprintf('modem %s: eSIM notification %d %s', ref, seq,
+					ok ? 'delivered to the SM-DP+' : 'NOT delivered to the SM-DP+'));
+				cb(ok ? null : { error: 'notify_failed', code: err?.code ?? -1 });
+			});
+
+			if (!p) {
+				q();
+				cb({ error: (p === false) ? 'esim_not_installed' : 'spawn' });
+			}
+		};
+
 		return {
 			session_run: session_run,
 			session_download: session_download,
+			session_notify: session_notify,
+
+			// a host session is on the card (a download, a profile change,
+			// a plugin's run, one parked in an event): another one beside it
+			// would corrupt it — a caller that can wait, waits
+			busy: () => (dl?.state == 'running' || mgmt_busy || parked != null),
 
 			// after a profile change the modem has to re-read the card; the
 			// same apply as an lpac enable (see apply_sim_reset above)
@@ -769,6 +916,7 @@ return {
 									: { state: 'done', via: 'modem', ret: res?.ret };
 								at_quiet();   // run finished — URCs may resume
 								log('notice', sprintf('modem %s: eSIM AT download %s', ref, dl.state));
+								changed(ref, slot);
 							});
 
 							done(null, { started: true, via: 'modem' });
@@ -874,6 +1022,9 @@ return {
 					if (!length(iccid)) return done({ error: 'missing_argument' });
 					if (!match(iccid, /^[0-9]+$/)) return done({ error: 'invalid_argument' });
 					return profile_op_lpac(ref, slot, op, iccid, (err, res) => {
+						if (!err)
+							changed(ref, slot);
+
 						// enable/disable change the active profile — the modem
 						// must re-read the card; delete only removes a disabled
 						// profile, nothing to apply
@@ -881,15 +1032,21 @@ return {
 							return done(err, res);
 						apply_sim_reset(ref, entry, slot, res, done);
 					}, () => {
+						let after = (err, res) => {
+							if (!err)
+								changed(ref, slot);
+							done(err, res);
+						};
+
 						if (op == 'enable')
 							return esim.enable(entry.modem, slot, iccid, (err, res) => {
 								if (!err)
 									log('notice', sprintf('modem %s: eSIM profile %s enabled', ref, iccid));
-								done(err, res);
+								after(err, res);
 							});
 						if (op == 'disable')
-							return esim.disable(entry.modem, slot, iccid, done);
-						return esim.del(entry.modem, slot, iccid, done);
+							return esim.disable(entry.modem, slot, iccid, after);
+						return esim.del(entry.modem, slot, iccid, after);
 					});
 				}
 				default:

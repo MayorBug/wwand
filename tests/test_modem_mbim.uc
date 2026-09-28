@@ -29,6 +29,7 @@ import * as uimmod from 'wwand/codec/schema/uim.uc';
 import * as wmsmod from 'wwand/codec/schema/wms.uc';
 import * as bc from 'wwand/codec/mbim_schema/basic_connect.uc';
 import * as ext from 'wwand/codec/mbim_schema/ms_basic_connect_ext.uc';
+import * as quectel from 'wwand/codec/mbim_schema/quectel.uc';
 
 uloop.init();
 
@@ -883,7 +884,12 @@ modem = modem_mbim.create({
 		on_event: (m, event, data) => {
 			if (event == 'sim_refresh')
 				push(ready_events, { event: event, data: data });
-			if (event == 'registered') {
+			// ONCE: assert_inline_reject drives a registration loss and a
+			// re-registration on this modem, and a second assert_telemetry
+			// armed by it fires in whichever later scenario runs the loop
+			// long enough — against a modem that is stopped by then
+			if (event == 'registered' && !m._telemetry_armed) {
+				m._telemetry_armed = true;
 				ok(true, 'modem reached READY (OPEN->CAPS->SUBSCRIBER->REGISTER->PACKET_SERVICE)');
 
 				// warm the fast loop (as daemon.modem_signal does), then read back
@@ -1029,6 +1035,61 @@ assert_sim_poll_teardown();
 
 	eq(m7.uim, null, 'teardown: the passthrough UIM client is dropped');
 	eq(m7.wms, null, 'teardown: ...and so is the WMS one');
+
+	// A plugin's client over the passthrough (extra_client): allocated from the
+	// passthrough's own service list, owned by the modem, released with it.
+	let m8 = modem_mbim.create({
+		id: 'extra-pt', device: '/dev/mock7', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: () => null, on_event: () => null },
+	});
+	let released = [];
+	let shim = { register: () => null, unregister: () => null, send: () => null, close: () => null, failures: 0 };
+
+	m8.pt = {
+		shim: shim, services: { '11': true, '50': true },
+		ctl: {
+			request: (name, args, cb) => (name == 'ALLOCATE_CID')
+				? cb(null, { allocation: { service: args.service, cid: 7 } })
+				: (name == 'RELEASE_CID') ? (push(released, args.release), cb(null, {})) : cb(null, {}),
+			destroy: () => null,
+		},
+		nas: { destroy: () => null }, dsd: null,
+	};
+
+	let xc = null, err = null;
+
+	// before the MBIM session is open: not yet, rather than "cannot"
+	m8.extra_client({ service: 0x32, messages: {} }, (e, c) => { err = e; });
+	eq(err?.error, 'not_ready', 'extra client (MBIM): before the session is open, not_ready');
+
+	m8.mbim = { destroy: () => null, command: () => null };
+
+	// ...nor while the modem is still in its init chain: a passthrough probe
+	// there fails and was remembered as "no passthrough on this modem"
+	m8.state = 'INIT_TRANSPORT';
+	m8.extra_client({ service: 0x32, messages: {} }, (e, c) => { err = e; });
+	eq(err?.error, 'not_ready', 'extra client (MBIM): during its init chain, not_ready');
+
+	m8.state = 'READY';
+	m8.extra_client({ service: 0x32, messages: {} }, (e, c) => { err = e; xc = c; });
+	eq([ err, xc?.cid, length(m8.extra_clients) ], [ null, 7, 1 ],
+	   'extra client (MBIM): a client over the passthrough, owned by the modem');
+
+	m8.extra_client({ service: 0x99, messages: {} }, (e, c) => { err = e; });
+	eq(err?.error, 'service_unavailable', 'extra client (MBIM): a service the passthrough does not list is refused');
+
+	m8.extra_release(xc);
+	eq([ length(m8.extra_clients), released[0]?.cid ], [ 0, 7 ],
+	   'extra client (MBIM): given back, its CID released on the wire');
+
+	m8.extra_client({ service: 0x32, messages: {} }, (e, c) => { xc = c; });
+	released = [];
+	m8.teardown();
+	eq([ xc?.destroyed, length(filter(released, (r) => r.service == 0x32)) ], [ true, 1 ],
+	   'extra client (MBIM): teardown destroys it and releases its CID with the passthrough');
 })();
 
 // --- the slow tick must read the serving cell BEFORE choosing a data mode ----
@@ -1134,6 +1195,371 @@ function assert_teardown_releases_pt_cids() {
 }
 
 assert_teardown_releases_pt_cids();
+
+// --- a passthrough that stopped answering is rebuilt, not trusted -----------
+//
+// The modem can drop the QMI clients it handed out over the passthrough while
+// the MBIM session stays up: an RM520N answered every passthrough request with
+// MBIM_STATUS_FAILURE (2) for ten hours after the network ended its session and
+// it re-applied its carrier configuration, and _ensure_pt kept handing the
+// ladder the same dead stack (evidence: ddimension/wwand#30). A fake modem side
+// that knows which CIDs it has handed out, and can forget them all.
+import * as qmux_c from 'wwand/codec/qmux.uc';
+import * as tlv_c from 'wwand/codec/tlv.uc';
+
+function passthrough_modem() {
+	let pm = { valid: {}, next: 20, sync: 0, calls: [] };
+	let ok_result = struct.pack('<BHHH', 0x02, 4, 0, 0);
+
+	pm.command_raw = function(su, cid, frame, cb, opts) {
+		let d = qmux_c.decode(frame);
+
+		push(pm.calls, [ d.service, d.msg_id, d.cid ]);
+
+		let answer = (msg, obj) => uloop.timer(0, () => cb(null,
+			qmux_c.encode(d.service, d.cid, d.txn, msg.id, ok_result + tlv_c.pack(msg.resp ?? {}, obj ?? {}), 'response')));
+
+		if (d.service == 0) {
+			let ctl = ctlmod.default.messages;
+
+			if (d.msg_id == 0x0027) { pm.sync++; return; }
+			if (d.msg_id == ctl.GET_VERSION_INFO.id && pm.hold) {
+				push(pm.held, () => pm.refuse
+					? cb({ error: 'mbim', status: 2 })
+					: answer(ctl.GET_VERSION_INFO, { services: [ { service: 3, major: 1, minor: 25 } ] }));
+				return;
+			}
+			if (d.msg_id == ctl.GET_VERSION_INFO.id && pm.refuse)
+				return uloop.timer(0, () => cb({ error: 'mbim', status: 2 }));
+			if (d.msg_id == ctl.GET_VERSION_INFO.id)
+				return answer(ctl.GET_VERSION_INFO, { services: [ { service: 3, major: 1, minor: 25 } ] });
+			if (d.msg_id == ctl.ALLOCATE_CID.id) {
+				let a = tlv_c.unpack(ctl.ALLOCATE_CID.req, d.tlvs);
+				let c = pm.next++;
+
+				pm.valid[sprintf('%d:%d', a.service, c)] = true;
+				return answer(ctl.ALLOCATE_CID, { allocation: { service: a.service, cid: c } });
+			}
+			if (d.msg_id == ctl.RELEASE_CID.id)
+				return uloop.timer(0, () => cb({ error: 'mbim', status: 2 }));
+		}
+
+		// a client the modem does not know: MBIM_STATUS_FAILURE, as on the RM520N
+		if (!pm.valid[sprintf('%d:%d', d.service, d.cid)])
+			return uloop.timer(0, () => cb({ error: 'mbim', status: 2 }));
+
+		if (pm.swallow)
+			return;   // a request the modem never answers: it stays pending
+
+		answer(nasmod.default.messages.GET_SIGNAL_INFO,
+			{ lte_signal: { rssi: -60, rsrq: -10, rsrp: -90, snr: 100 } });
+	};
+	pm.ons = 0;
+	pm.on = function() { pm.ons++; };
+	pm.destroy = function() {};
+	pm.forget = () => { pm.valid = {}; };
+	pm.refuse = false;   // GET_VERSION_INFO refused: a stack caught mid-reset
+	pm.hold = false;     // GET_VERSION_INFO answered only when released
+	pm.held = [];
+	pm.swallow = false;  // NAS requests never answered
+	pm.count = (svc, id) => length(filter(pm.calls, (c) => c[0] == svc && c[1] == id));
+
+	return pm;
+}
+
+function assert_stale_passthrough_is_rebuilt() {
+	let logs = [];
+	let m = modem_mbim.create({
+		id: 'pt-stale', device: '/dev/mock-pt', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: (lvl, msg) => push(logs, msg), on_event: () => null },
+	});
+	let pm = passthrough_modem();
+
+	m.mbim = pm;
+
+	let first_cid = null, sig = [];
+	let step;
+
+	let ask;
+	ask = (n, done) => {
+		if (n == 0)
+			return done();
+
+		m.pt.nas.request('GET_SIGNAL_INFO', {}, (e) => { push(sig, e == null); ask(n - 1, done); },
+			{ no_recovery: true });
+	};
+
+	step = [
+		// the first bring-up
+		(next) => m._ensure_pt((up) => {
+			eq(up, true, 'pt-stale: the passthrough comes up');
+			first_cid = m.pt?.nas?.cid;
+			next();
+		}),
+		// the modem forgets its clients; one failure alone changes nothing
+		(next) => {
+			pm.forget();
+			ask(1, () => m._ensure_pt((up) => {
+				eq(m.pt?.nas?.cid, first_cid, 'pt-stale: a single failure keeps the stack');
+				next();
+			}));
+		},
+		// failures that an answer interrupts are not a dead stack: an answered
+		// request resets the count, and four failures after it keep the stack
+		(next) => {
+
+			pm.valid[sprintf('%d:%d', 3, first_cid)] = true;
+			sig = [];
+			ask(1, () => {
+				pm.forget();
+				ask(4, () => m._ensure_pt(() => {
+					eq(m.pt?.nas?.cid, first_cid, 'pt-stale: an answer in between resets the count');
+					sig = [];
+					next();
+				}));
+			});
+		},
+		// nothing gets through any more: the next ensure rebuilds
+		(next) => ask(4, () => {
+			eq(sig, [ false, false, false, false ], 'pt-stale: every request fails against forgotten clients');
+			m.uim = { cid: 99, service: 11, destroy: () => null };
+			// a rebuild caught mid-reset fails, and must not write the
+			// passthrough off for good
+			pm.refuse = true;
+			m._ensure_pt((up0) => {
+			eq(up0, false, 'pt-stale: a rebuild the modem refuses fails');
+			ok(!m._pt_failed, 'pt-stale: ...without writing the passthrough off');
+			pm.refuse = false;
+			m._ensure_pt((up) => {
+				eq(up, true, 'pt-stale: the rebuilt passthrough is up');
+				ok(m.pt?.nas?.cid != null && m.pt.nas.cid != first_cid, 'pt-stale: with a freshly allocated NAS client');
+				eq(m.uim, null, 'pt-stale: a client of the dead stack goes with it');
+				ok(!m._pt_failed, 'pt-stale: and the passthrough is not written off');
+				ok(length(filter(logs, (l) => index(l, 'rebuilding its QMI clients') >= 0)) == 1,
+					'pt-stale: the rebuild is logged');
+				// the default log keeps notices: when QMI went away and what the
+				// modem answered, once per run rather than per request
+				let runs = length(filter(logs, (l) => index(l, 'passthrough request failed (svc 3 msg 0x004f') >= 0));
+				let errs = length(filter(logs, (l) => index(l, 'passthrough error ') >= 0));
+				ok(runs >= 1 && runs * 4 < errs,
+					'pt-stale: the first failure of a run is a notice naming the request — once per run, not per request');
+				eq(length(filter(logs, (l) => index(l, 'passthrough rebuilt — QMI answering again') >= 0)), 1,
+					'pt-stale: ...and the rebuild that took is logged, not only the attempt');
+				ok(length(filter(logs, (l) => index(l, 'rebuilding the passthrough failed') >= 0)) == 1,
+					'pt-stale: as is the one that did not');
+				next();
+			});
+			});
+		}),
+		// a cached client on a stack that stopped answering is not handed out:
+		// _ensure_uim goes through the rebuild and allocates a new one
+		(next) => {
+			let cid_before = m.pt.nas.cid;
+
+			pm.forget();
+			ask(5, () => {
+				m.uim = { cid: 98, service: 11, destroy: () => null };
+				m._ensure_uim((u) => {
+					ok(u != null && u.cid != 98, 'pt-stale: _ensure_uim does not hand out the dead stack\'s client');
+					ok(m.pt?.nas?.cid != cid_before, 'pt-stale: ...it went through the rebuild');
+					next();
+				});
+			});
+		},
+		(next) => {
+			sig = [];
+			ask(1, () => {
+				eq(sig, [ true ], 'pt-stale: requests are answered again');
+				eq(pm.sync, 0, 'pt-stale: no CTL SYNC ever reached the modem');
+				next();
+			});
+		},
+	];
+
+	let run_step;
+	run_step = (i) => (i < length(step)) ? step[i](() => run_step(i + 1)) : uloop.end();
+	run_step(0);
+	uloop.run();
+}
+
+assert_stale_passthrough_is_rebuilt();
+
+// ...and the bring-up is one, however many callers arrive while it runs: every
+// probe of a telemetry tick can reach _ensure_pt before the first finishes, and
+// each running its own would allocate CIDs of which only the last stay
+// reachable. A callback of the stack being dropped that asks again (destroy()
+// pays pending callbacks synchronously) must not start a second one either.
+function assert_passthrough_bringup_is_single() {
+	let plogs = [];
+	let m = modem_mbim.create({
+		id: 'pt-single', device: '/dev/mock-pt2', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: (lvl, msg) => push(plogs, msg), on_event: () => null },
+	});
+	let pm = passthrough_modem();
+	let ctl = ctlmod.default.messages;
+	let answers = [];
+
+	m.mbim = pm;
+	pm.hold = true;
+	m._ensure_pt((up) => push(answers, up));
+	m._ensure_pt((up) => push(answers, up));
+	pm.hold = false;
+
+	uloop.timer(5, () => {
+		eq(pm.count(0, ctl.GET_VERSION_INFO.id), 1, 'pt-single: two callers, one GET_VERSION_INFO');
+		for (let f in pm.held) f();
+
+		uloop.timer(20, () => {
+			eq(answers, [ true, true ], 'pt-single: both callers get the one stack');
+			eq(pm.count(0, ctl.ALLOCATE_CID.id), 1, 'pt-single: one NAS client allocated, not two');
+
+			// a pending request of the stack being dropped asks again from its
+			// cancellation callback
+			let reentered = null;
+
+			pm.swallow = true;
+			m.pt.nas.request('GET_SIGNAL_INFO', {}, () => {
+				m._ensure_pt((up) => { reentered = up; });
+			}, { no_recovery: true, timeout: 60000 });
+			pm.swallow = false;
+			m.pt.shim.failures = 5;
+
+			let versions = pm.count(0, ctl.GET_VERSION_INFO.id);
+			let releases = pm.count(0, ctl.RELEASE_CID.id);
+			let rebuilt = null;
+
+			m._ensure_pt((up) => { rebuilt = up; });
+
+			uloop.timer(20, () => {
+				eq(rebuilt, true, 'pt-single: the rebuild succeeds');
+				eq(reentered, true, 'pt-single: the re-entering callback waits for it instead of dropping again');
+				eq(pm.count(0, ctl.GET_VERSION_INFO.id) - versions, 1, 'pt-single: one rebuild, not two');
+				eq(pm.count(0, ctl.RELEASE_CID.id) - releases, 1,
+					'pt-single: the dropped NAS client is released once, not again from the re-entering callback');
+				eq(length(filter(plogs, (l) => index(l, 'rebuilding its QMI clients') >= 0)), 1,
+					'pt-single: the re-entering callback does not drop the stack a second time');
+				uloop.end();
+			});
+		});
+	});
+	uloop.run();
+}
+
+assert_passthrough_bringup_is_single();
+
+// A modem whose passthrough worked once keeps trying: however many rebuilds a
+// stack caught mid-reset refuses, none of them writes the passthrough off
+// (a second refusal used to latch it for the session). A teardown during a
+// bring-up remembers nothing about the modem either. And a rebuild must not
+// leave an indication handler behind: mc.on has no off.
+function assert_passthrough_rebuild_edges() {
+	let mk = (id) => {
+		let m = modem_mbim.create({
+			id: id, device: '/dev/' + id, config: {},
+			timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+			at: { fx: { read: () => null, glob: () => [] } },
+			recovery: { fx: fakefx.create(), state_dir: '/state' },
+			deps: { log: () => null, on_event: () => null },
+		});
+		let pm = passthrough_modem();
+
+		m.mbim = pm;
+		return [ m, pm ];
+	};
+	let seq = [];
+
+	// two refused rebuilds in a row
+	let m1_p1 = mk('pt-edge1'), m1 = m1_p1[0], p1 = m1_p1[1];
+
+	push(seq, (next) => m1._ensure_pt(() => {
+		p1.forget();
+		p1.refuse = true;
+		m1.pt.shim.failures = 5;
+		m1._ensure_pt((a) => m1._ensure_pt((b) => {
+			eq([ a, b ], [ false, false ], 'pt-edge: two rebuilds refused in a row fail');
+			ok(!m1._pt_failed, 'pt-edge: ...and the second does not write the passthrough off either');
+			p1.refuse = false;
+			m1._ensure_pt((c) => {
+				eq(c, true, 'pt-edge: the next one, once the modem answers, succeeds');
+				eq(p1.ons, 1, 'pt-edge: three bring-ups, one indication handler');
+				next();
+			});
+		}));
+	}));
+
+	// a first bring-up that a teardown overtakes: answered after it, and refused after it
+	let m2_p2 = mk('pt-edge2'), m2 = m2_p2[0], p2 = m2_p2[1];
+
+	push(seq, (next) => {
+		let got = null;
+
+		p2.hold = true;
+		m2._ensure_pt((up) => { got = up; });
+		p2.hold = false;
+		m2.teardown();
+		for (let f in p2.held) f();
+		p2.held = [];
+
+		uloop.timer(20, () => {
+			eq(got, false, 'pt-edge: a bring-up finished after a teardown reports no stack');
+			eq(m2.pt, null, 'pt-edge: ...and publishes none into the new session');
+
+			let m3_p3 = mk('pt-edge3'), m3 = m3_p3[0], p3 = m3_p3[1];
+
+			p3.hold = true;
+			m3._ensure_pt(() => null);
+			p3.hold = false;
+			m3.teardown();
+			p3.refuse = true;
+			for (let f in p3.held) f();
+
+			uloop.timer(20, () => {
+				ok(!m3._pt_failed, 'pt-edge: a failure caused by a teardown does not write the passthrough off');
+				next();
+			});
+		});
+	});
+
+	// telemetry on a cached 'qmi' rung across a dropped stack: no throw
+	let m4_p4 = mk('pt-edge4'), m4 = m4_p4[0], p4 = m4_p4[1];
+
+	push(seq, (next) => m4._ensure_pt(() => {
+		m4._dsd_be = 'qmi';
+		m4._sig_be = 'qmi';
+		p4.forget();
+		p4.refuse = true;
+		m4.pt.shim.failures = 5;
+
+		let threw = null;
+
+		try {
+			m4._refresh_signal(() => {
+				ok(true, 'pt-edge: signal on a cached qmi rung completes while the stack is being rebuilt');
+				try {
+					m4._refresh_data_mode(() => {
+						ok(true, 'pt-edge: data mode likewise');
+						next();
+					});
+				} catch (e) { threw = e; next(); }
+			});
+		} catch (e) { threw = e; next(); }
+
+		uloop.timer(30, () => eq(threw, null, 'pt-edge: telemetry never dereferences a dropped stack'));
+	}));
+
+	let run;
+	run = (i) => (i < length(seq)) ? seq[i](() => run(i + 1)) : uloop.timer(50, () => uloop.end());
+	run(0);
+	uloop.run();
+}
+
+assert_passthrough_rebuild_edges();
 
 // --- the failure line a human actually reads ---------------------------------
 //
@@ -1271,6 +1697,576 @@ function assert_late_registration_survives_the_diagnostic() {
 
 assert_late_registration_survives_the_diagnostic();
 
+// --- the radio hold on MBIM ---------------------------------------------------
+//
+// A modem with a remote SIM assigned (wwand-rsim) must not register on its own
+// card even once. MBIM had no set_opmode, so a held MBIM modem was never
+// parked at all: it registered at init and stayed registered, and a daemon
+// restart adopted its interfaces into a dial on the local card.
+
+// A modem whose radio state behaves like the real one: the software switch
+// persists, the modem registers whenever it is on.
+function radio_modem_handlers(st) {
+	let h = handlers();
+
+	h.RADIO_STATE = (args, meta) => {
+		if (meta.kind == 'set')
+			st.on = (args.radio_state == bc.RADIO_STATE_ON);
+
+		return { hw_radio_state: bc.RADIO_STATE_ON,
+		         sw_radio_state: st.on ? bc.RADIO_STATE_ON : bc.RADIO_STATE_OFF };
+	};
+	h.REGISTER_STATE = () => ({ nw_error: 0,
+		register_state: st.on ? bc.REGISTER_STATE_HOME : bc.REGISTER_STATE_SEARCHING,
+		register_mode: 1, available_data_classes: ext.DATA_CLASS_LTE, current_cellular_class: 1,
+		provider_id: st.on ? '26201' : '', provider_name: st.on ? 'Telekom.de' : '',
+		roaming_text: '', registration_flag: 0 });
+	// asked by a registration timeout (the reject detail) — which is what a
+	// held modem must not run into
+	h.LTE_ATTACH_INFO = { __error: 9 };
+
+	return h;
+}
+
+let reg_ind = (mock, on) => mock.indicate('REGISTER_STATE', { nw_error: 0,
+	register_state: on ? bc.REGISTER_STATE_HOME : bc.REGISTER_STATE_SEARCHING,
+	register_mode: 1, available_data_classes: on ? ext.DATA_CLASS_LTE : 0, current_cellular_class: 1,
+	provider_id: on ? '26201' : '', provider_name: on ? 'Telekom.de' : '',
+	roaming_text: '', registration_flag: 0 });
+
+let mk_radio_modem = (id, mock, events) => modem_mbim.create({
+	id: id, device: '/dev/' + id,
+	config: { apn: 'internet' },
+	timing: { settle: 1, reg_timeout: 40, backoff_min: 1000, backoff_max: 1000, at_drain: 1 },
+	at: { fx: { read: () => null, glob: () => [] } },
+	recovery: { fx: fakefx.create(), state_dir: '/state' },
+	datapath: { netdev: 'wwan0', fx: fakefx.create(), mux: 'auto' },
+	deps: {
+		transport_open: mock.transport_open,
+		log: () => null,
+		on_event: (mm, event, data) => push(events, event),
+	},
+});
+
+let radio_sets = (mock) => map(filter(mock.calls, (c) => c.name == 'RADIO_STATE' && c.kind == 'set'),
+	(c) => c.args?.radio_state);
+
+// held at init: off right after OPEN, waits, registers once woken
+function assert_mbim_hold_at_init() {
+	uloop.init();
+
+	let st = { on: true };        // booted with its radio on, as it was left
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers(st) });
+	let events = [], seen = {};
+	let hold = 'rsim: its remote SIM x is not connected yet';
+	let m = mk_radio_modem('m_hold', mock, events);
+
+	m.radio_hold = () => hold;
+	m.start();
+
+	// several registration timeouts later
+	uloop.timer(250, () => {
+		let names = map(mock.calls, (c) => c.name);
+
+		seen.state = m.state;
+		seen.sets = radio_sets(mock);
+		seen.off_first = index(names, 'RADIO_STATE') >= 0 &&
+			index(names, 'RADIO_STATE') < index(names, 'DEVICE_CAPS');
+		seen.parked = [ m.lowpower_parked, m._plugin_held, m._park_via ];
+
+		hold = null;
+		m.set_opmode('online', (e) => {
+			seen.wake_err = e;
+			reg_ind(mock, true);
+		});
+	});
+
+	uloop.timer(450, () => { m.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(seen.off_first, true, 'mbim hold at init: the radio goes off right after OPEN, before the capabilities');
+	eq(seen.sets, [ bc.RADIO_STATE_OFF ], 'mbim hold at init: off, and never on behind the hold');
+	eq(seen.parked, [ true, true, 'radio' ], 'mbim hold at init: parked over the native switch (no passthrough this early)');
+	eq(seen.state, 'REGISTERING', 'mbim hold at init: waits in REGISTERING...');
+	eq(length(filter(events, (e) => e == 'error')), 0, '...through several registration timeouts, without a failure');
+	eq(seen.wake_err, null, 'mbim hold at init: woken');
+	eq(radio_sets(mock), [ bc.RADIO_STATE_OFF, bc.RADIO_STATE_ON ], 'mbim hold at init: ...the way it was parked');
+	eq(length(filter(events, (e) => e == 'registered')), 1, 'mbim hold at init: registered once, after the wake');
+}
+
+assert_mbim_hold_at_init();
+
+// the park of a running modem: a lost registration is its consequence, the
+// wake's registration is reported
+function assert_mbim_park_while_ready() {
+	uloop.init();
+
+	let st = { on: true };
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers(st) });
+	let events = [], seen = {};
+	let m = mk_radio_modem('m_park', mock, events);
+
+	m.start();
+
+	uloop.timer(150, () => {
+		seen.ready = m.state;
+		m._pt_opmode = (mode, cb) => cb({ error: 'no_passthrough' });
+		m.set_opmode('low_power', (e) => {
+			seen.park_err = e;
+			reg_ind(mock, false);
+		});
+	});
+
+	uloop.timer(300, () => {
+		seen.parked_state = m.state;
+		seen.sets = radio_sets(mock);
+		seen.regs = length(filter(events, (e) => e == 'registered'));
+		m.set_opmode('online', () => reg_ind(mock, true));
+	});
+
+	uloop.timer(450, () => { seen.final = m.state; m.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq([ seen.ready, seen.park_err ], [ 'READY', null ], 'mbim park: a READY modem is parked');
+	eq(seen.parked_state, 'READY', 'mbim park: the lost registration is the park\'s consequence, not re-registered');
+	eq(seen.sets, [ bc.RADIO_STATE_OFF ], 'mbim park: ...and the radio is not switched back on behind it');
+	ok(index(events, 'deregistered') >= 0, 'mbim park: the loss is still reported');
+	eq(length(filter(events, (e) => e == 'registered')) - seen.regs, 1,
+	   'mbim park: the wake\'s registration is reported as one');
+	eq(seen.final, 'READY', 'mbim park: READY again after the wake');
+	eq([ m.lowpower_parked, m._wake_pending ], [ false, false ], 'mbim park: nothing pending afterwards');
+}
+
+assert_mbim_park_while_ready();
+
+// the transport: the passthrough's DMS first, the native switch without one
+// or when DMS refuses, and the wake the way the park went
+(() => {
+	let m = modem_mbim.create({
+		id: 'm_opmode', device: '/dev/mockop', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: () => null, on_event: () => null },
+	});
+	let radio = [], pt = [], err = 'unset';
+	let pt_ok = (mode, cb) => { push(pt, mode); cb(null); };
+
+	m.set_opmode('low_power', (e) => { err = e?.error; });
+	eq(err, 'unsupported', 'mbim set_opmode: no session, unsupported');
+
+	m.mbim = { destroy: () => null, command: (svc, name, kind, args, cb) => {
+		push(radio, args.radio_state);
+		cb(null, { hw_radio_state: bc.RADIO_STATE_ON, sw_radio_state: args.radio_state });
+	} };
+	m.state = 'READY';
+	m._pt_opmode = pt_ok;
+
+	m.set_opmode('low_power', () => null);
+	eq([ pt, radio, m.lowpower_parked, m._park_via ], [ [ 'low_power' ], [], true, 'dms' ],
+	   'mbim set_opmode: parked over the passthrough\'s DMS');
+	m.set_opmode('online', () => null);
+	eq([ pt, radio, m.lowpower_parked, m._wake_pending ], [ [ 'low_power', 'online' ], [], false, true ],
+	   'mbim set_opmode: ...and woken there');
+
+	m._pt_opmode = (mode, cb) => cb({ error: 'no_passthrough' });
+	m.set_opmode('low_power', () => null);
+	eq([ radio, m._park_via ], [ [ bc.RADIO_STATE_OFF ], 'radio' ], 'mbim set_opmode: no passthrough — the MBIM radio switch');
+
+	pt = [];
+	m._pt_opmode = pt_ok;
+	m.set_opmode('online', () => null);
+	eq([ pt, radio ], [ [], [ bc.RADIO_STATE_OFF, bc.RADIO_STATE_ON ] ],
+	   'mbim set_opmode: a radio parked over the switch is woken over the switch');
+
+	radio = [];
+	m._pt_opmode = (mode, cb) => cb({ error: 'qmi', code: 1 });
+	m.set_opmode('low_power', () => null);
+	eq(radio, [ bc.RADIO_STATE_OFF ], 'mbim set_opmode: refused over DMS — the MBIM radio switch');
+
+	radio = [];
+	m.lowpower_parked = false;
+	m._pt_opmode = (mode, cb) => cb({ error: 'cancelled' });
+	m.set_opmode('low_power', (e) => { err = e?.error; });
+	eq([ err, radio, m.lowpower_parked ], [ 'cancelled', [], false ],
+	   'mbim set_opmode: a session ending meanwhile changes nothing and sends nothing native');
+})();
+
+// the recovery ladder's radio cycle leaves a parked radio off: a cycle that
+// ends online un-parks it behind the park's back
+(() => {
+	uloop.init();
+
+	let m = modem_mbim.create({
+		id: 'm_cycle', device: '/dev/mockcy', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: () => null, on_event: () => null },
+	});
+	let radio = [], done_action = null;
+
+	m.mbim = { destroy: () => null, command: (svc, name, kind, args, cb) => {
+		push(radio, args.radio_state);
+		cb(null, { hw_radio_state: bc.RADIO_STATE_ON, sw_radio_state: args.radio_state });
+	} };
+	m.state = 'READY';
+	m.lowpower_parked = true;
+	m.counters.proto_ok = 1;          // armed: the modem has answered
+	m.counters.attempts = 7;          // the next failure is the opmode-cycle rung
+	m.note_connect_failure((a) => { done_action = a; });
+
+	uloop.timer(30, () => uloop.end());
+	uloop.run();
+
+	eq([ radio, done_action ], [ [ bc.RADIO_STATE_OFF ], 'opmode_cycle' ],
+	   'mbim recovery: the radio cycle of a parked modem does not end online');
+})();
+
+// a park left from an earlier init pass (make_fail restarts the same object):
+// woken on the way to REGISTERING, the flags go with it
+function assert_mbim_reinit_clears_park() {
+	uloop.init();
+
+	let st = { on: false };       // parked over the native switch by the earlier pass
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers(st) });
+	let events = [];
+	let m = mk_radio_modem('m_reinit', mock, events);
+
+	m.lowpower_parked = true;
+	m._plugin_held = true;
+	m._park_via = 'radio';
+	m.start();
+
+	uloop.timer(200, () => { m.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	ok(index(events, 'registered') >= 0, 'mbim re-init: registers once the hold is gone');
+	eq([ m.lowpower_parked, m._plugin_held ], [ false, false ], 'mbim re-init: no park left recorded');
+}
+
+assert_mbim_reinit_clears_park();
+
+// A held RF-locked modem (fcc_auth quectel): the vendor Radio State = on is a
+// radio-on of its own, and sent before the park the modem could register on
+// its local card. Held, it waits for the wake, which sends it first and then
+// switches the parked radio back on.
+function assert_mbim_hold_defers_fcc() {
+	uloop.init();
+
+	let st = { on: true, order: [], on_while_held: false };
+	let hold = 'rsim: its remote SIM x is not connected yet';
+	let h = radio_modem_handlers(st);
+	let bc_radio = h.RADIO_STATE;
+
+	h.RADIO_STATE = (args, meta) => {
+		if (meta.cid == quectel.commands.RADIO_STATE.cid) {
+			push(st.order, 'fcc');
+			// the vendor switch turns the radio on — the risk
+			st.on = true;
+			if (hold)
+				st.on_while_held = true;
+			return { radio_state: quectel.RADIO_ON };
+		}
+
+		if (meta.kind == 'set')
+			push(st.order, (args.radio_state == bc.RADIO_STATE_ON) ? 'on' : 'off');
+
+		return bc_radio(args, meta);
+	};
+
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext, quectel ], handlers: h });
+	let events = [], seen = {};
+	let m = mk_radio_modem('m_fcchold', mock, events);
+
+	m.config.fcc_auth = 'quectel';
+	m.radio_hold = () => hold;
+	m.start();
+
+	uloop.timer(200, () => {
+		seen.held_order = [ ...st.order ];
+		seen.state = m.state;
+		hold = null;
+		m.set_opmode('online', () => reg_ind(mock, true));
+	});
+
+	uloop.timer(400, () => { m.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(seen.held_order, [ 'off' ], 'mbim hold + fcc: parked, and no vendor radio-on while held');
+	eq(st.on_while_held, false, 'mbim hold + fcc: the radio was never on while held');
+	eq(seen.state, 'REGISTERING', 'mbim hold + fcc: the init went on to wait in REGISTERING');
+	eq(st.order, [ 'off', 'fcc', 'on' ], 'mbim hold + fcc: the wake unlocks first, then switches the radio on');
+	eq(length(filter(events, (e) => e == 'registered')), 1, 'mbim hold + fcc: registered after the wake');
+}
+
+assert_mbim_hold_defers_fcc();
+
+// A DMS PARK OUTLIVES THE MODEM OBJECT: a daemon parks over DMS and restarts;
+// the new object, held at init, parks over the radio switch and knows nothing
+// of the DMS low power — a wake of the switch alone left the modem off.
+function assert_mbim_wake_after_restart() {
+	uloop.init();
+
+	let st = { on: true, dms: 'online' };
+	let h = radio_modem_handlers(st);
+	let bc_reg = h.REGISTER_STATE;
+
+	// registers only with both switches on
+	h.REGISTER_STATE = (args, meta) => {
+		let r = bc_reg(args, meta);
+
+		if (st.dms != 'online') {
+			r.register_state = bc.REGISTER_STATE_SEARCHING;
+			r.provider_id = '';
+		}
+
+		return r;
+	};
+
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: h });
+	let dms = (mode, cb) => { st.dms = mode; cb(null); };
+	let events1 = [], events2 = [], seen = {};
+	let m1 = mk_radio_modem('m_restart1', mock, events1);
+	let m2 = null, hold = 'rsim: its remote SIM x is not connected yet';
+
+	m1._pt_opmode = dms;
+	m1.start();
+
+	uloop.timer(120, () => {
+		m1.set_opmode('low_power', () => {
+			seen.first = [ m1._park_via, st.dms ];
+			m1.stop();               // the daemon restarts
+
+			m2 = mk_radio_modem('m_restart2', mock, events2);
+			m2._pt_opmode = dms;
+			m2.radio_hold = () => hold;
+			m2.start();
+		});
+	});
+
+	uloop.timer(300, () => {
+		seen.second = [ m2.lowpower_parked, m2._park_via, st.on ];
+		hold = null;
+		m2.set_opmode('online', (e) => {
+			seen.wake_err = e;
+			reg_ind(mock, st.on && st.dms == 'online');
+		});
+	});
+
+	uloop.timer(450, () => { m2.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(seen.first, [ 'dms', 'low_power' ], 'restart: the first object parked over DMS');
+	eq(seen.second, [ true, 'radio', false ], 'restart: the second, held at init, over the radio switch');
+	eq([ seen.wake_err, st.dms, st.on ], [ null, 'online', true ],
+	   'restart: the wake switches BOTH back on — the DMS park of the earlier object too');
+	ok(index(events2, 'registered') >= 0, 'restart: ...and the modem registers');
+}
+
+assert_mbim_wake_after_restart();
+
+// ...and with NO hold at the new start: the init asks DMS once, and a low
+// power an earlier daemon left is switched online — without it the Radio
+// State path saw a radio that was on and the modem never registered
+function assert_mbim_unheld_start_after_dms_park() {
+	uloop.init();
+
+	let st = { on: true, dms: 'online' };
+	let h = radio_modem_handlers(st);
+	let bc_reg = h.REGISTER_STATE;
+
+	h.REGISTER_STATE = (args, meta) => {
+		let r = bc_reg(args, meta);
+
+		if (st.dms != 'online') {
+			r.register_state = bc.REGISTER_STATE_SEARCHING;
+			r.provider_id = '';
+		}
+
+		return r;
+	};
+
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: h });
+	let set = (mode, cb) => { st.dms = mode; cb(null); };
+	let get = (cb) => { push(st.asked, st.dms); cb(null, (st.dms == 'online') ? 0 : 1); };
+	let events1 = [], events2 = [], seen = {};
+	let m1 = mk_radio_modem('m_unheld1', mock, events1);
+	let m2 = null;
+
+	st.asked = [];
+	m1._pt_opmode = set;
+	m1._pt_get_opmode = get;
+	m1.start();
+
+	uloop.timer(120, () => {
+		seen.m1_asked = length(st.asked);
+		m1.set_opmode('low_power', () => {
+			m1.stop();               // the daemon restarts, nothing holds the modem
+
+			m2 = mk_radio_modem('m_unheld2', mock, events2);
+			m2._pt_opmode = set;
+			m2._pt_get_opmode = get;
+			m2.start();
+		});
+	});
+
+	uloop.timer(300, () => { seen.state = m2.state; m2.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(seen.m1_asked, 1, 'unheld restart: an unheld init asks DMS once');
+	eq(st.dms, 'online', 'unheld restart: the low power the earlier daemon left is switched online');
+	eq([ seen.state, index(events2, 'registered') >= 0, index(events2, 'error') ], [ 'READY', true, -1 ],
+	   'unheld restart: the modem registers, no failure, no reset needed');
+
+	// a held start does not ask: its radio stays off, the wake does the rest
+	uloop.init();
+
+	let asked = 0;
+	let mock3 = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers({ on: true }) });
+	let m3 = mk_radio_modem('m_heldnoask', mock3, []);
+
+	m3.radio_hold = () => 'rsim: its remote SIM x is not connected yet';
+	m3._pt_get_opmode = (cb) => { asked++; cb(null, 0); };
+	m3.start();
+	uloop.timer(150, () => { m3.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(asked, 0, 'held start: DMS is not asked (nothing is switched online while held)');
+}
+
+assert_mbim_unheld_start_after_dms_park();
+
+// A FAILED WAKE OF AN EARLIER PARK KEEPS THE PARK, and is tried again
+function assert_mbim_reinit_wake_fails_once() {
+	uloop.init();
+
+	let st = { on: true, dms: 'low_power' };
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers(st) });
+	let events = [], calls = [], seen = {};
+	let m = mk_radio_modem('m_wakefail', mock, events);
+
+	m.lowpower_parked = true;
+	m._plugin_held = true;
+	m._park_via = 'dms';
+	m._pt_opmode = (mode, cb) => {
+		push(calls, mode);
+
+		if (length(calls) == 1)
+			return cb({ error: 'qmi', code: 1 });
+
+		seen.at_retry = [ m.lowpower_parked, m._park_via ];
+		st.dms = mode;
+		cb(null);
+	};
+	m.start();
+
+	uloop.timer(250, () => { seen.final = m.state; m.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(calls, [ 'online', 'online' ], 'wake fails once: tried again');
+	eq(seen.at_retry, [ true, 'dms' ], 'wake fails once: the park and how it was made are kept meanwhile');
+	eq([ seen.final, m.lowpower_parked ], [ 'READY', false ], 'wake fails once: woken and registered on the retry');
+	eq(length(filter(events, (e) => e == 'error')), 0, 'wake fails once: no failure for one refusal');
+
+	// ...and one that keeps refusing fails the init, bounded
+	uloop.init();
+
+	let st2 = { on: true };
+	let mock2 = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers(st2) });
+	let ev2 = [], n = 0;
+	let m2 = mk_radio_modem('m_wakefail2', mock2, ev2);
+
+	m2.lowpower_parked = true;
+	m2._park_via = 'dms';
+	m2._pt_opmode = (mode, cb) => { n++; cb({ error: 'qmi', code: 1 }); };
+	m2.start();
+
+	uloop.timer(200, () => { m2.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq([ n >= 3, index(ev2, 'error') >= 0 ], [ true, true ], 'wake keeps failing: the init fails after its tries');
+}
+
+assert_mbim_reinit_wake_fails_once();
+
+// AN UNACKNOWLEDGED RELEASE IS STILL OWED. The real _pt_opmode over a mock QMI
+// passthrough: a RELEASE_CID that times out or fails is kept, retried at the
+// next use of the stack, given up after its tries, and carried by the release
+// burst when the stack is dropped.
+function assert_pt_release_owed() {
+	uloop.init();
+
+	let rel_mode = 'ok', rel_count = 0;
+	let qmock = qmi_mockhub.create({ handlers: {
+		SET_OPERATING_MODE: {},
+		RELEASE_CID: (a) => {
+			rel_count++;
+			return (rel_mode == 'timeout') ? null
+			     : (rel_mode == 'fail') ? { __error: 1 }
+			     : { release: a.release };
+		},
+	} });
+	let pthub = qmock.transport_open('/dev/ptmock_rel', {});
+	let ctl = client_mod.create(pthub, ctlmod.default, 0);
+	let logs = [];
+	let m = modem_mbim.create({
+		id: 'm_rel', device: '/dev/mockrel', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1, pt_release_ms: 20 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: (l, msg) => push(logs, msg), on_event: () => null },
+	});
+
+	m.mbim = { destroy: () => null, command: () => null };
+	m.state = 'READY';
+	m.pt = { shim: pthub, ctl: ctl };
+	m._ensure_pt = (cb) => cb(true);
+
+	let spin = (ms) => { uloop.timer(ms, () => uloop.end()); uloop.run(); };
+	let opmode = (mode) => { let r = 'unset'; m._pt_opmode(mode, (e) => { r = e; }); spin(60); return r; };
+
+	eq(opmode('low_power'), null, 'pt release: the set went over the passthrough');
+	eq(length(m._pt_unreleased), 0, 'pt release: acknowledged — nothing owed');
+
+	rel_mode = 'timeout';
+	opmode('online');
+	eq(length(m._pt_unreleased), 1, 'pt release: a release that timed out is still owed');
+
+	rel_mode = 'fail';
+	rel_count = 0;
+	opmode('low_power');
+	// the owed one retried (fails) and the new one (fails)
+	eq([ rel_count, length(m._pt_unreleased) ], [ 2, 2 ], 'pt release: retried at the next use; a failed one is owed too');
+
+	rel_mode = 'ok';
+	rel_count = 0;
+	opmode('online');
+	eq([ rel_count, length(m._pt_unreleased) ], [ 3, 0 ], 'pt release: ...and settled once the modem acknowledges');
+
+	// given up after its tries, and said
+	rel_mode = 'fail';
+	opmode('low_power');
+	opmode('online');
+	opmode('low_power');
+	ok(length(filter(logs, (l) => index(l, 'giving it up') >= 0)) >= 1, 'pt release: given up after its tries, and logged');
+
+	// the burst of a dropped stack carries what is still owed
+	rel_mode = 'timeout';
+	m._pt_unreleased = [];
+	opmode('online');
+
+	let owed = m._pt_unreleased[0]?.cid;
+
+	rel_count = 0;
+	m.teardown();
+	ok(owed != null && length(filter(qmock.calls, (c) => c.name == 'RELEASE_CID' && c.args?.release?.cid == owed)) >= 2,
+	   'pt release: the teardown\'s release burst includes the owed CID');
+	eq(length(m._pt_unreleased), 0, 'pt release: ...and nothing is owed on a stack that is gone');
+}
+
+assert_pt_release_owed();
+
 // --- the attach cause comes from AT+CEER when MBIM has none ------------------
 //
 // And that is the normal case, not the exception: MBIM reports the attach
@@ -1351,5 +2347,32 @@ assert_attach_cause_from_ceer('+CEER: EMM cause 33', 'EMM cause 33', 33, 'ceer/c
 
 // ...and a modem with nothing to say leaves both null rather than inventing
 assert_attach_cause_from_ceer(null, null, null, 'ceer/silent');
+
+// A CARD NOT IN THE MODEM'S OWN SLOT (QMI UIM Remote): MBIM's subscriber
+// status names none, and the card's wwand_sim did not match — the interface's
+// APN was dialled. The card's own files name it (here over AT), fresh.
+{
+	let m9 = modem_mbim.create({
+		id: 'remote-card', device: '/dev/mock9', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: () => null, on_event: () => null },
+	});
+	let done_ = false;
+
+	m9.mbim = { destroy: () => null, command: (svc, name, op, args, cb) => cb(null, { subscriber_id: '', sim_iccid: '' }) };
+	m9.at = { send: (cmd, cb) => cb(null, { lines: [ (cmd == 'AT+CIMI') ? '901280001430235'
+		: (cmd == 'AT+QCCID') ? '+QCCID: 89882390000064624748' : 'ERROR' ] }) };
+	m9.info = { iccid: null, imsi: null };
+	m9.reapply_sim(() => { done_ = true; });
+
+	let t0 = time();
+	while (!done_ && time() - t0 < 3)
+		uloop.run(50);
+
+	eq([ m9.info.imsi, m9.info.iccid ], [ '901280001430235', '89882390000064624748' ],
+	   'remote card on MBIM: its identity read from the card when MBIM names none');
+}
 
 done('test_modem_mbim');

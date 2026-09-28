@@ -150,6 +150,7 @@ export function create(opts)
 		// we asked for low power (option lowpower) and the radio is off. The
 		// deregistration that follows is expected, and an ifup wakes it.
 		lowpower_parked: false,
+		_opmode_pending: [],   // our own operating-mode writes still to be reported (opmode_ours)
 		active_slot: null,  // which physical slot holds the card in use (slot status)
 		cat: null,          // toolkit client, alive only while cat_mode is applied
 		pdc: null,          // carrier-config client, when the modem has PDC
@@ -187,9 +188,9 @@ export function create(opts)
 	// clients, which delivers a synchronous `cancelled` to everything in flight —
 	// so an outer set_opmode callback that ignores its error re-arms tm.settle
 	// AFTER the cancel pass. The new timer fires with self.dms already null
-	// (modem.uc:1331) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
+	// (modem.uc:1656) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
 	// which in ucode is a throw inside a uloop callback: the daemon dies and procd
-	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1161), and
+	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1249), and
 	// every QMI site that re-arms tm.settle needs it too.
 	//
 	// `gen` is captured where the OPERATION begins, not read here — by the time a
@@ -247,6 +248,34 @@ export function create(opts)
 
 		push(settles, rec);
 	};
+
+	// EVERY operating-mode write of wwand's own goes through here: the DMS
+	// report that follows is then logged as ours (_opmode_note), not as a
+	// change somebody else made — which sends whoever reads the log looking
+	// for a tool that is not there. A write that fails produces no report.
+	// Pending writes are a QUEUE, in the order they were sent: a sequence
+	// (offline, then reset) has two in flight, and one slot let the second
+	// overwrite the first, whose report then counted as external.
+	let opmode_ours = (mode, cb) => {
+		let e = { mode: mode, at: time() };
+
+		push(self._opmode_pending, e);
+		qmi_backend.set_opmode(self.dms, mode, (err) => {
+			if (err)
+				self._opmode_pending = filter(self._opmode_pending, (x) => x !== e);
+			cb?.(err);
+		});
+	};
+	self._opmode_set = opmode_ours;   // for the init chain (modem_init_qmi.uc)
+
+	// The end of a radio cycle (recovery, reattach, an attach-profile
+	// change): back online — unless the radio is parked (`option lowpower`,
+	// or a plugin lent the modem's card). A cycle that ends online un-parks
+	// it behind the park's back, and lowpower_parked then claims a state the
+	// radio is no longer in.
+	let online_unless_parked = (cb) => self.lowpower_parked
+		? cb(null)
+		: opmode_ours('online', cb);
 
 	// protocol-neutral scaffolding (sets set_state/attach_context/… on self)
 	let scaffold = modem_common.scaffolding(self, { deps: deps, log: log, rec: rec });
@@ -313,6 +342,70 @@ export function create(opts)
 		self.ctl.request('RELEASE_CID',
 			{ release: { service: client.service, cid: client.cid } },
 			(err) => cb ? cb(err) : null, { timeout: 3000 });
+	};
+
+	// A client of a service the core does not know, for a plugin (daemon dep
+	// `qmi_client`). cb(err, client). The MODEM owns it: teardown releases it
+	// with its own clients, because a CID left allocated on the modem stays in
+	// its client table until the stack resets, and a plugin cannot see the
+	// teardown coming. After that `client.destroyed` is true and the plugin
+	// allocates again on the next modem. A service the modem did not list in
+	// GET_VERSION_INFO is refused before asking, so a plugin can say WHY
+	// (UIM Remote is compiled in but switched off on most Quectel firmware).
+	self.extra_clients = [];
+
+	self.extra_client = function(schema, cb) {
+		if (!self.ctl || !self.hub || self.hub.closed)
+			return cb({ error: 'not_ready' }, null);
+
+		if (!self.services[sprintf('%d', schema.service)])
+			return cb({ error: 'service_unavailable' }, null);
+
+		let gen = self._gen;
+
+		self.alloc(schema, (err, c) => {
+			if (err)
+				return cb(err, null);
+
+			// torn down while the allocation was in flight: the CID belongs to
+			// a stack that is gone, and handing it out would give the plugin a
+			// client nothing releases
+			if (self._gen != gen) {
+				// released, not only destroyed: the transport may still be
+				// up, and a CID left on the modem stays in its table
+				self.release(c);
+				return cb({ error: 'cancelled' }, null);
+			}
+
+			push(self.extra_clients, c);
+			cb(null, c);
+		});
+	};
+
+	// a plugin giving its client back before teardown
+	// Only a client this modem still owns is released on the wire: teardown
+	// may have released it already, and after a restart `ref` names a NEW
+	// modem, whose CIDs are numbered afresh — releasing the old client's
+	// number there would take away an unrelated client of its own.
+	self.extra_release = function(client, cb) {
+		// ownership and removal in one pass, by identity
+		let owned = false;
+
+		self.extra_clients = filter(self.extra_clients, (c) => {
+			if (c === client) {
+				owned = true;
+				return false;
+			}
+
+			return true;
+		});
+
+		if (!owned) {
+			client?.destroy();
+			return cb ? cb(null) : null;
+		}
+
+		self.release(client, cb);
 	};
 
 	// backend-neutral NAS accessor. cb(nas|null).
@@ -406,16 +499,16 @@ export function create(opts)
 			let cyc_gen = self._gen;
 
 			log('warn', 'recovery: cycling operating mode');
-			qmi_backend.set_opmode(self.dms, 'low_power', () => {
+			opmode_ours('low_power', () => {
 				// done() IS answered on the cancelled path. It is not only
 				// make_fail's internal continuation: the daemon passes a real
 				// caller's callback through note_connect_failure
-				// (daemon.uc:2192), and dropping it strands a ubus request.
+				// (daemon.uc:3736), and dropping it strands a ubus request.
 				// Restarting a torn-down modem is prevented where it belongs
 				// instead — make_fail now refuses a `cancelled` outright
 				// (modem_common.uc).
 				settle_after(cyc_gen, () => {
-					qmi_backend.set_opmode(self.dms, 'online', () => {
+					online_unless_parked(() => {
 						settle_after(cyc_gen, () => done(action), () => done(action));
 					});
 				}, () => done(action));
@@ -427,8 +520,8 @@ export function create(opts)
 				return done(action);
 
 			log('warn', 'recovery: resetting modem');
-			qmi_backend.set_opmode(self.dms, 'offline', () => {
-				qmi_backend.set_opmode(self.dms, 'reset', () => done(action));
+			opmode_ours('offline', () => {
+				opmode_ours('reset', () => done(action));
 			});
 			return;
 
@@ -446,8 +539,8 @@ export function create(opts)
 			return cb({ error: 'unsupported_on_backend' });
 
 		log('warn', 'admin modem reset (DMS offline -> reset)');
-		qmi_backend.set_opmode(self.dms, 'offline', () => {
-			qmi_backend.set_opmode(self.dms, 'reset', (err) => {
+		opmode_ours('offline', () => {
+			opmode_ours('reset', (err) => {
 				// A REFUSED RESET IS NOT A RESET. Dropping the error here would
 				// report `resetting: true` either way, and LuCI and the ubus
 				// caller would wait for a modem that is not going anywhere.
@@ -480,9 +573,9 @@ export function create(opts)
 		let cancelled = () => cb({ error: 'cancelled' });
 
 		log('notice', 'network reattach (DMS low_power -> online)');
-		qmi_backend.set_opmode(self.dms, 'low_power', () => {
+		opmode_ours('low_power', () => {
 			settle_after(gen, () => {
-				qmi_backend.set_opmode(self.dms, 'online', (err) => {
+				online_unless_parked((err) => {
 					cb(err ? { error: 'qmi', detail: err } : null,
 						{ ok: true, action: 'reattach', via: 'qmi' });
 				});
@@ -580,7 +673,12 @@ export function create(opts)
 	// REFRESH): re-read identity, RE-RESOLVE the per-SIM override (the old card's
 	// wwand_sim must not stick) and re-program the LTE attach profile — without
 	// tearing the modem down. cb(changed) optional.
-	self.reapply_sim = function(cb) {
+	// ALWAYS FRESH (sim.read_identity opts.fresh): every caller is a card
+	// event — a remote SIM, a slot switch, a refresh, a card the modem
+	// recovered internally — and DMS answers GET_IMSI from its cache, the
+	// previous card's IMSI, which then matched THAT card's wwand_sim (PIN,
+	// APN) — HW-seen on an RG650E lent an E392's card, 2026-09-27.
+	self.reapply_sim = function(cb, opts) {
 		sim.read_identity(self, (id) => {
 			let changed = (id.iccid != self.info.iccid || id.imsi != self.info.imsi);
 
@@ -603,13 +701,13 @@ export function create(opts)
 				let finish = () => cb ? cb(changed) : null;
 
 				log('notice', 'attach profile changed after sim reapply, cycling radio to re-attach');
-				qmi_backend.set_opmode(self.dms, 'low_power', () => {
+				opmode_ours('low_power', () => {
 					settle_after(sim_gen, () => {
-						qmi_backend.set_opmode(self.dms, 'online', finish);
+						online_unless_parked(finish);
 					}, finish);
 				});
 			});
-		});
+		}, { ...(opts ?? {}), fresh: true });
 	};
 
 	// register for SIM/eUICC refresh notifications so a network-/LPA-initiated
@@ -784,16 +882,52 @@ export function create(opts)
 	// DMS event report: observe + log an EXTERNAL operating-mode / PIN change
 	// (airplane toggled via AT / another tool / a hardware switch) wwand did not
 	// initiate. The state machine still reacts via its own serving-system path.
+	// The log line for an operating-mode report, or null for the baseline.
+	// A change set_opmode asked for within the last 30 s is ours (a park, a
+	// wake); only anything else is external — calling our own wake external
+	// sends whoever reads the log looking for a tool that is not there.
+	// QmiDmsOperatingMode (qmi-enums-dms.h:201-205, libqmi 1.38.0): online
+	// 0, low_power 1, offline 3, reset 4
+	const OPMODE_CODE = { online: 0, low_power: 1, offline: 3, reset: 4 };
+
+	self._opmode_note = function(code) {
+		let prev = self._dms_opmode;
+		let name = dmsmod.OPMODE_NAMES[sprintf('%d', code)] ?? sprintf('mode %d', code);
+		let now = time();
+
+		self._dms_opmode = code;
+
+		// older than 30 s: whatever happened to it, not this report
+		self._opmode_pending = filter(self._opmode_pending, (e) => now - e.at <= 30);
+
+		if (prev == null)
+			return null;
+
+		// The modem applies writes in the order sent: a report of a pending
+		// mode settles that one and every one before it (a state it skipped
+		// without reporting). A report of none of them is somebody else's,
+		// and settles all — a later report of an asked mode is not ours then.
+		let q = self._opmode_pending, hit = -1;
+
+		for (let i = 0; i < length(q) && hit < 0; i++)
+			if (OPMODE_CODE[q[i].mode] == code)
+				hit = i;
+
+		self._opmode_pending = (hit >= 0) ? slice(q, hit + 1) : [];
+
+		if (hit >= 0)
+			return [ 'info', sprintf('operating mode now %s (as set by wwand)', name) ];
+
+		return [ 'notice', sprintf('operating mode changed externally: %s', name) ];
+	};
+
 	self._install_dms_handlers = function() {
 		self.dms.on('EVENT_REPORT_IND', (data) => {
 			if (data?.operating_mode != null && data.operating_mode != self._dms_opmode) {
-				let prev = self._dms_opmode;
-				self._dms_opmode = data.operating_mode;
-				// skip the very first report (baseline, not a change)
-				if (prev != null)
-					log('notice', sprintf('operating mode changed externally: %s',
-						dmsmod.OPMODE_NAMES[sprintf('%d', data.operating_mode)] ??
-						sprintf('mode %d', data.operating_mode)));
+				let n = self._opmode_note(data.operating_mode);
+
+				if (n)
+					log(n[0], n[1]);
 			}
 			if (data?.pin1_status?.current_status != null)
 				self._dms_pin1 = data.pin1_status;
@@ -1206,11 +1340,30 @@ export function create(opts)
 		if (!self.dms)
 			return cb({ error: 'unsupported', detail: 'no dms client' });
 
-		qmi_backend.set_opmode(self.dms, mode, (err) => {
+		let was_parked = self.lowpower_parked;
+
+		opmode_ours(mode, (err) => {
 			// remember that WE parked it: the registration that follows is a
 			// consequence, and the supervisor above must not treat it as a fault
 			if (!err)
 				self.lowpower_parked = (mode == 'low_power');
+
+			// Woken from a park, the modem registers again while it stays
+			// READY — no REGISTERING -> READY step, so no `registered` event,
+			// and the daemon never re-arms the interfaces it gave up while the
+			// radio was off. The next registration reports it (_update_serving).
+			if (!err && was_parked && mode == 'online')
+				self._wake_pending = true;
+
+			// The first set-online of a radio held at init: the init skipped
+			// its FCC check with the radio (modem_init_qmi.uc step_opmode), and
+			// an RF-locked laptop SKU accepts set-online and stays in low
+			// power until it is authenticated — woken without it, it never
+			// registers. Answered once the check is done.
+			if (!err && mode == 'online' && self._fcc_due && self.dms) {
+				self._fcc_due = false;
+				return chain.fcc_verify(() => cb(null));
+			}
 
 			cb(err ?? null);
 		});
@@ -1279,6 +1432,12 @@ export function create(opts)
 		if (ss.registration == nasmod.REG_REGISTERED && self.state == 'READY')
 			notify_contexts('serving_change');
 
+		if (ss.registration == nasmod.REG_REGISTERED && self.state == 'READY' && self._wake_pending) {
+			self._wake_pending = false;
+			log('notice', 'registered again after the radio was parked');
+			emit('registered', self.reg);
+		}
+
 		if (ss.registration == nasmod.REG_REGISTERED) {
 			if (self.state == 'REGISTERING') {
 				if (tm.reg) {
@@ -1288,6 +1447,10 @@ export function create(opts)
 
 				self.counters.attempts = 0;
 				self.reg_detail = null;   // registered: clear any stale reject info
+				// woken from a park at init (a plugin's hold): this READY
+				// entry emits `registered` itself — the parked-while-READY
+				// re-emit below must not add a second one later
+				self._wake_pending = false;
 				log('notice', sprintf('registered: plmn %J, roaming %J, radio [%s]',
 					self.reg.plmn ? sprintf('%d/%02d (%s)', self.reg.plmn.mcc, self.reg.plmn.mnc,
 						trim(self.reg.plmn.description ?? '')) : null,
@@ -1487,7 +1650,8 @@ export function create(opts)
 		// not need. ctl goes LAST, and is only destroyed — it is the implicit
 		// client (cid 0) and it is what carries RELEASE_CID for all the others.
 		for (let c in [ self.dms, self.nas, self.uim, self.wda, self.loc, self.wds_cfg,
-		               self.dsd, self.tmd, self.cat, self.wms, self.pdc ]) {
+		               self.dsd, self.tmd, self.cat, self.wms, self.pdc,
+		               ...(self.extra_clients ?? []) ]) {
 			if (!c)
 				continue;
 
@@ -1502,6 +1666,7 @@ export function create(opts)
 		self.ctl = self.dms = self.nas = self.uim = self.wda = self.loc = self.wds_cfg = null;
 
 		self.dsd = self.tmd = self.cat = self.wms = self.pdc = null;
+		self.extra_clients = [];
 
 		// fail any PDC operation still waiting on an indication that will now
 		// never come, and clear the table so a rebuild can install again

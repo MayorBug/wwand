@@ -20,6 +20,7 @@ whether you are a user, a developer, or an AI assistant working on the tree.
 | See the current state, test counts, open items | [STATUS.md](STATUS.md) — what is true NOW |
 | See how it got here (dated log) | [status-archive.md](status-archive.md) — history, not present tense |
 | Avoid a trap that already cost someone a day | [gotchas.md](gotchas.md) — beliefs that look right and are wrong |
+| See which standard a component follows, and when it was last checked against it | [standards.md](standards.md) — generated from [standards.toml](standards.toml) |
 
 ### Contributor notes
 

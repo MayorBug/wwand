@@ -230,6 +230,16 @@ be decided by load order; `_wwand_apply_settings` builds the netifd update).
   wrong reason is worse than none — it defends the code against the right fix.
   `src-ucode/qmi_backend.uc` is the reference file for this style.
 
+- **Every check of a component against its standard is recorded** in
+  `docs/standards.toml` (generated page `docs/standards.md` via
+  `python3 tools/standards.py`; `run_tests.sh` fails when the page is stale).
+  A check means the standard's text — or, where there is none, the reference
+  implementation named as its basis (libqmi, libmbim, the kernel, netifd) —
+  was read next to the code. Add a `[[reviews]]` entry (date, kind, who,
+  commit checked, commit fixed) and point every row it covered at it; a new
+  component or a newly followed standard gets its row in the same commit,
+  with `review = "tbd"` until someone checks it.
+
 - **Before grepping for where something lives, read `docs/map.md`.** It is a
   REVERSE index — keyed by the question ("which module prints this log line",
   "which config value wins", "which source produced that telemetry number"), not

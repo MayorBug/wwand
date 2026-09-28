@@ -25,7 +25,7 @@ is always user-triggered.
 
 | | |
 |---|---|
-| Packages | `wwand` (base, no backend) + `wwand-qmi` / `-mbim` / `-ncm` / `-mhi` / `-esim`, plus two optional datapath add-ons in the feed. Plugins in their own repositories: `wwand-ipa` (SGP.32 eIM), `wwand-qlog` (Quectel QLog diag capture) |
+| Packages | `wwand` (base, no backend) + `wwand-qmi` / `-mbim` / `-ncm` / `-mhi` / `-esim`, plus two optional datapath add-ons in the feed. Plugins in their own repositories: `wwand-ipa` (SGP.32 eIM), `wwand-qlog` (Quectel QLog diag capture), `wwand-rsim` (remote SIM: readers, phones over Bluetooth SAP, other modems' cards) |
 | Datapath | one plug-in interface (`docs/datapath-interface.md`): built-ins `rmnet`, `qmimux`, `vlan` (MBIM), pseudo-modes `raw_ip` and `ethernet` (802.3, WDA-less QMI stacks); add-ons `rmnet_nss`, `rmnet_nss_mhi` |
 | QMAP | negotiated down a ladder v5 → v4 → v1, capped by `option qmap_version` |
 | Feed | ddimension/openwrt-repo — stable (releases): `wwand`, `luci-app-wwand`, `luci-proto-wwand` 1.6.8; main: development pins as `1.6.8_pN` |
@@ -80,6 +80,14 @@ ids — so an upstream submission would have to rest on observed behaviour we
 cannot produce. Reported rather than implemented, which is why the summary exists
 at all: someone holding a dual-executor modem can answer in one command what we
 cannot answer for ourselves.
+
+**The inactive slot is not reachable** on either QMI box (HW-read on 242 and
+245, 2026-09-26): both physical slots map to logical slot 1, and the one not in
+use is switched off. SEND_APDU on logical slot 2 is refused NOT_SUPPORTED (94),
+and a logical channel opened "on slot 2" lands on the active card (both read
+the same EF_ICCID). `AT+QUIMSLOT` only switches between the slots, and
+`AT+QCFG` offers no dual-standby option. So a modem cannot use one card and
+lend the other (wwand-rsim refuses that with this reason).
 
 Two things worth knowing if that ever changes. The subscription encoding is **not
 uniform**: NAS and WMS use one byte, 0-based; WDS, DMS, QOS and DSD four bytes,
@@ -707,6 +715,257 @@ resolved and never opened, like `gps_port`. This covers:
 **Into github.com/ddimension/wwand-qlog, as a wwandctl command plugin:**
 the QLog logic (`qlog.uc`) and `wwandctl qlog`. It is still not verified on
 hardware.
+
+## SIM inventory, a card lent to another modem, the radio hold (2026-09-26)
+
+**SIM inventory** (`siminventory.uc`, ubus `sim_inventory`, `wwandctl sims`,
+LuCI Status → SIM cards): every card seen, by ICCID, and where it is — modem
+and slot, eUICC and profile, or a reader (wwand-rsim). It is derived from the
+modems' state on every tick and every call, so identity re-reads, slot
+switches, remote cards and eSIM changes show up without hooks of their own. An
+eSIM download, enable, disable or delete through wwand-esim re-reads the
+profile list (`esim_bridge` `changed` → `simops` `profiles_changed`; coalesced
+per modem, waits while another host session is on the card). A card a modem
+reports missing (`no_sim` / `sim_absent`) is marked not present.
+
+**Plugin interface, grown for wwand-rsim:** `qmi_client` / `qmi_release`,
+`modem_at`, `modem_radio`, `sim_slots`, `sim_changed`; hooks `card_source`,
+`status` rows, `radio_hold`, `stop` / `busy`. A plugin whose tick throws is
+logged and skipped. On exit the daemon stops the plugins and runs its loop
+until they are done, at most 8 s (procd `term_timeout` 10). A modem that
+stopped for lack of a card resumes its init when a card arrives
+(`retry_sim`, via `sim_changed`).
+
+**The radio hold is the daemon's.** A plugin parks a modem's radio through
+`modem_radio`; the daemon records it, wakes it on the hand-back only as
+`option lowpower` allows, and releases a park no plugin holds any more.
+While a plugin's `radio_hold` answers, `context_up` fails with `radio_held`
+(shim: RADIO_HELD; the interface waits in setup — netifd does not retry it —
+until the wake's registration brings it up) and a registration parks the radio
+again. A parked radio is not dialled by the reconnect path, and recovery
+cycles, reattach and attach-profile changes leave it off. Woken, a modem
+reports `registered` again, which re-arms the interfaces given up while it
+was parked. Host-tested; the HW round on 245/242 follows the push.
+
+## Remote SIM (wwand-rsim, 2026-09-27)
+
+What the plugin does now, and what the core offers it — the details, the
+tested hardware and the workarounds are in the wwand-rsim README:
+
+- **Card sources:** a reader on the router or on another machine over SSH
+  (Smartmouse USB with clock and mode set by software, Phoenix, PC/SC), a
+  phone's SIM over Bluetooth SAP, a modem wwand does not manage over its AT
+  port (`AT+CSIM`), a modem on this router lending its card (*sponsor*: SIM
+  Access or APDU), a modem on another wwand router (`wwandctl rsim proxy`
+  there). `wwandctl rsim scan [user@host]` lists what a machine offers; the
+  SSH key can be restricted to `rsim-card --serve`.
+- **Clients:** QMI modems with UIM Remote switched on (RG650E), and MBIM
+  modems through the QMI passthrough: the plugin dep `qmi_client` works there
+  now (modem_mbim.uc extra_client). On the GL-X3000 (RM520N-GL, MBIM) a card
+  from the lab PC's Smartmouse ran — the modem connected, 431 APDUs, the
+  remote card's identity read, back on its own card afterwards. The
+  indications UIM Remote needs DO come over the passthrough there, unlike
+  NAS's (gotchas.md).
+- **In the core for it:** the radio hold (a sponsor's radio stays off, its
+  ifups are refused with `radio_held`, a registration of it is parked again),
+  the card-change process on both sides (`sim_changed`), the SIM inventory
+  filing a remote card under its reader (`card_source`), `sim_upsert` for the
+  settings a lending router dials a card with (`origin 'rsim'`).
+- **Packages:** `wwand-rsim` (plugin, `wwandctl rsim`), `luci-app-wwand-rsim`
+  (Network → Remote SIM: status, find SIM sources, SSH setup), `rsim-card`
+  and `rsim-card-pcsc` (the helper alone, for a SIM host).
+- **Not possible:** one modem using one slot and lending the other — a
+  single-standby modem switches its inactive slot off (above, Multi-SIM).
+
+## A block after a card change comes back by itself (2026-09-27)
+
+An interface stayed down after an eSIM profile switch: the modem was cardless
+for a moment, the setup that landed then was answered `sim_blocked`, and the
+shim's `proto_block_restart` cleared autostart for good. Two changes:
+
+- `context_up` notes that answer as the daemon's own give-up (`set_giveup`),
+  so the next `registered` re-arms and kicks it — as the daemon's own
+  SIM-block down already was. Not as "our down": wwand issued none, and the
+  marker would make an operator's ifdown right after it look like ours.
+- **Who cleared autostart is decided on evidence** (`daemon.uc operator_down`,
+  used by all three kick sites): an operator ifdown is recorded where it
+  happens (`context_down`, also when there is no context to take down, and by
+  the shim itself when the daemon is not running; persisted in
+  `/tmp/wwand/state/admin_downs.json`, cleared by the next up, whatever it is
+  answered with). **Only that record** makes a cleared autostart the
+  operator's: without it the interface is brought back, error or not. The
+  in-memory marker for our own downs is lost on a daemon restart — the case
+  HW-seen on 245 (autostart false, errors `[RADIO_HELD]`, "administratively
+  down"), and again on the NR7101 (242, 2026-09-27: both interfaces parked
+  after a `wwand restart` whose old daemon crashed on the way out, no error
+  on either — the former fallback "no `wwand` error = the operator's" read
+  that as an ifdown nobody had run). The price: an ifdown of an interface
+  that was already down (no teardown, no record) is undone at the next
+  registration.
+  Two guards around that: the record is trusted only once its file can
+  exist (written at every start; the first start since boot or since an
+  upgrade from a version that recorded nothing keeps the former guess), and
+  a cleared autostart with no record is looked at a second time, 5 s later,
+  before wwand undoes it (`confirm_then`): netifd clears autostart the
+  moment an ifdown starts, the record arrives with the shim's teardown —
+  up to a second later still when the ifdown has to kill a running setup
+  first (SIGTERM, 1 s, SIGKILL: `proto-ext.c:780-788`, netifd
+  2026.07.08~6088f7b3).
+  `auto 0` interfaces that are down are no longer wanted (a SIM change's
+  reconnect and the low-power decision read `wanted`) — unless the down is
+  wwand's own give-up of one the operator had brought up.
+- **Audit follow-up (2026-09-28):**
+  - what the first start's guess reads as the operator's is **recorded**
+    (`operator_down`), and that start asks netifd about every interface at
+    its first `apply_config` (`seed_admin_record`), writing the trusted file
+    only when all have answered — before, the second start after an upgrade
+    trusted a record the first had written empty and undid the ifdown the
+    first had honoured;
+  - the record is **trusted only whole**: the daemon's JSON array at the
+    head of the file. Empty, torn, or the shim's appends alone are read for
+    their names but not trusted — trusted, "nothing recorded" would revive
+    every ifdown whose record went with the rest of the file;
+  - `admin_downs.json` and `giveups.json` are **replaced whole** (write
+    beside under a name of its own, rename over, no temporary left on a
+    failed write: `default_fx.write_atomic`), and the daemon re-reads the
+    file before each write and when it decides, so a name the shim appended
+    while the daemon ran (its teardown could not reach it) is neither written
+    away nor ignored. The read-merge-write holds a flock on
+    `admin_downs.lock`, which the shim takes around its append (busybox
+    `flock`): an append between the daemon's read and its rename went to
+    the replaced file;
+  - an ifup that finds the modem gone (`modem_absent`) also ends wwand's own
+    down: its marker, kept past the ifup, sent the operator's next ifdown
+    down the "ours" branch unrecorded;
+  - the second look is **one per interface entry** (a burst of settings
+    events armed one timer each), cancelled by `stop_context`, `stop_local`
+    and `shutdown`; at the connect-first site it now also requires the same
+    CONNECTED session and an interface netifd is not bringing up by itself.
+- An answer that lands after a reload replaced the context — the activation,
+  and the two netifd status probes before a kick — is not acted on.
+
+Also corrected: netifd does not retry a failed setup of a `no_proto_task`
+handler by itself — the interface stays pending (gotchas.md). Host-tested
+with counter-proofs; the HW round on 245 is open.
+
+## A new `wwand_sim` does not restart the modem (2026-09-27)
+
+SIM overrides are left out of the modem's reload signature: adding one — by
+hand, or wwand-rsim keeping a lender's settings — restarted every modem.
+The running modem gets the new list AND matches its card against it again
+(`active_sim`, which the dial reads); handing over the list alone left a new
+override ignored and a deleted one in force until the next card read. A
+modem held at SIM_BLOCKED is still restarted, since the override may carry
+the PIN it waits for. An edit that changes what the card in use gets is also
+APPLIED like a card re-read: the attach profile is programmed again
+(`reapply_sim`; the attach APN lives only there) and the sessions still up
+re-dial — matching alone left an edited APN unused and a rejected attach
+rejected (HW-seen on 245, 2026-09-27). The attach profile now also gets the
+connection's CREDENTIALS when its APN is the connection's (no `init_apn`):
+a CHAP-only M2M APN rejected the attach without them ("EMM attach failed",
+profile 1 with the APN and no login) while data calls with the same login
+worked. The password is written once per value, so a live edit lands. And the login now goes with the APN
+(`conn_cfg`): a `wwand_sim` with its own APN never takes the interface's
+credentials — a Telekom card got an M2M card's CHAP login from the
+interface, in the attach profile and in its data calls.
+
+## A direct download's PIR reaches the SM-DP+ (2026-09-27)
+
+`esim_bridge.session_notify(ref, seq, cb)`: while an SGP.32 assistant waits
+in an event, lpac sends one pending notification to its SM-DP+ (`notification
+process -r <seq>`, removed from the card only after the acknowledgement). An
+assistant's direct download (SGP.32 v1.3 3.2.3.1) runs lpac without its
+notification step so the assistant can read the PIR into its result for the
+eIM (step 13); step 14 — the PIR to the SM-DP+ over ES9+ — had nobody doing
+it, and the eIM forwards only the PIRs of indirect downloads it ran (5.7.4).
+wwand-ipa answers ipad's new `notify` event with it. Host-tested
+(`test_esim_bridge`: that one notification with `-r`, never `-a`; lpac's
+result line decides; refused outside a waiting session); not run on hardware.
+
+## A modem waiting for its remote SIM stays off its own card (2026-09-28)
+
+A modem with a remote SIM assigned (wwand-rsim) runs on that card or not at
+all: the plugin's `radio_hold` answers for it until the modem has taken the
+remote card (CONNECT_IND), also when the remote SIM failed or its reader is
+misconfigured, and again when the modem lets go of it.
+
+- **At init (QMI):** SET_OPMODE asks the plugins first (`modem.radio_hold`,
+  set by the daemon next to `at_init_extra`). Held, the radio goes to low
+  power instead of online, as the plugin's park; the init reads the SIM,
+  waits in REGISTERING without failing (no recovery ladder), and an
+  attach-profile change does not cycle it online. The daemon's tick wakes it
+  when the hold is gone; that READY entry is the one `registered`. Before,
+  the RG650E on 245 registered with its own card 2 s after every boot — on
+  LTE an attach, the network saw the local IMSI — and was parked only after.
+  HW-checked on 245 (2026-09-28): after a reboot no registration on the
+  local card; the remote card was taken with the radio off, the radio went
+  on after.
+- **While running:** the plugin parks a modem registered on its own card
+  although held (a remote SIM configured while online, or one the modem let
+  go of); the core parks only at a new registration or an interface
+  bring-up, and refuses to dial a held modem's interfaces.
+- **Status:** `status()` carries `radio_held` (the reason, from any plugin);
+  `wwandctl status` prints it, the modem status page (luci-app-wwand) shows
+  a Radio row, the RADIO_HELD interface error names both reasons.
+- **MBIM (2026-09-28, host-tested, not yet on hardware):** until now an MBIM
+  modem had no `set_opmode` at all, so a held MBIM modem was **not parked at
+  all** — not at init and not after: it registered on its own card and stayed
+  registered, only its interfaces were refused. It has one now (passthrough
+  DMS low power, else the software Radio State),
+  so `modem_radio`, the park at a registration, `option lowpower` and the
+  init-time hold work there: the hold is asked right after MBIM OPEN (an
+  MBIM modem registers on its own, so step_register would be too late),
+  REGISTERING waits while held, a registration lost while parked is not
+  re-registered, the wake's registration is reported, and the recovery
+  ladder's radio cycle and an attach-profile change leave a parked radio off.
+- **NCM:** parked after registration (`AT+CFUN=4`), no init-time hold. NCM
+  without an AT port cannot be held at all: every park answers `unsupported`
+  (logged once per modem), `status()` carries `radio_hold_error` ("cannot
+  hold this modem"), `wwandctl status` prints the radio as on although held.
+- **Audit follow-up (2026-09-28):**
+  - a **held modem is not dialled**, parked or not (`reconnect.uc
+    retry_activate`): after a non-destructive restart the still-up interface
+    was adopted through that path, which knew nothing of the hold, and dialled
+    on the local card of a modem waiting for its remote SIM;
+  - a **hand-back is not a wake** while another hold answers
+    (`plugin_radio(on)` → `radio_held`); the tick wakes it once nothing does;
+  - a modem that **refuses low power at init** continues held instead of
+    failing its init: the ladder's cycles and resets end online, the
+    registration the hold is there to prevent. No `offline` fallback — libqmi
+    calls it RF off and "partially shutdown" (`qmi-enums-dms.h`, 1.38.0), and
+    the way back from it is a reset;
+  - the **FCC check** the held init skips with the radio runs at the wake
+    (`_fcc_due`, `modem.uc set_opmode`) — an RF-locked laptop SKU otherwise
+    stays in low power after the wake;
+  - a **re-init after the hold ended** clears the park flags (QMI at the
+    init's online switch, MBIM in step_register): the same modem object
+    outlives a failed init, and a stale `lowpower_parked` made REGISTERING
+    wait forever and swallowed the next registration loss;
+  - `wwandctl status` names the holding plugin instead of repeating the
+    reason its own status row gives.
+- **Review follow-up, MBIM park (2026-09-28):**
+  - a held modem with `fcc_auth 'quectel'` gets the vendor Radio State = on
+    (a radio-on of its own) at the WAKE, before its radio is switched back
+    on — sent before the park, an RF-locked modem could register on its
+    local card first;
+  - the **wake undoes what may be off**: DMS and the Radio State are
+    independent switches, and a DMS park outlives its modem object (a
+    daemon restart) — a new object that parked over the switch woke only
+    the switch and left DMS in low power for good. A modem object that has
+    not set DMS itself (`_dms_unknown`) wakes both; one it parked over DMS
+    is woken over DMS, without falling back to the switch. And a start
+    with NO hold asks DMS once (GET_OPERATING_MODE over the passthrough,
+    step_register): a low power an earlier daemon left is switched online
+    ("left in low power by an earlier park") — the Radio State query saw a
+    radio that was on, and the modem sat in REGISTERING until the ladder's
+    reset. OFFLINE is left to that reset; no passthrough, nothing to ask;
+  - a **failed wake of an earlier pass's park** keeps the park flags and
+    how it was made, is tried again, and fails the init after `WAKE_TRIES`;
+  - **passthrough CID releases are tracked** until acknowledged
+    (`_pt_unreleased`): retried at the next use of the stack, carried by
+    `drop_pt`'s release burst, given up (and logged) after
+    `PT_RELEASE_TRIES`. A timed-out RELEASE_CID left a CID in the modem's
+    table that nothing tracked, one per hold/wake.
 
 ## Known open
 

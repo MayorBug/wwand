@@ -31,6 +31,10 @@ A quick tour of the LuCI UI (modems overview · modem config · interface · con
 
 [![wwand in LuCI — slideshow](docs/images/luci-slideshow.gif)](docs/luci.md)
 
+The plugins bring their own pages — remote SIM ([wwand-rsim](https://github.com/ddimension/wwand-rsim), below) and eSIM fleet management through an eIM ([wwand-ipa](https://github.com/ddimension/wwand-ipa), Network → eSIM Fleet):
+
+[![Network → Remote SIM](docs/images/luci-rsim.png)](https://github.com/ddimension/wwand-rsim)
+
 ---
 
 ## Why wwand
@@ -67,8 +71,10 @@ A quick tour of the LuCI UI (modems overview · modem config · interface · con
 |---|---|
 | **Connectivity** | QMI / MBIM / NCM behind one `proto wwand` · IPv4/IPv6/dual-stack · IPv4 /32 p-t-p or pushed prefix · IPv6 RFC-7278 PD · QMAP mux (multiple contexts/modem) with full **bidirectional aggregation** — downlink (modem→host) *and* uplink (host→modem, WDA-negotiated + rmnet egress coalesce), capability-gated so a non-QMAP modem falls back to plain framing |
 | **Attach** | Attach profile programmed from config **before** registration → correct APN/IP family, avoids the EMM-33 IPv4-only reject |
-| **SIM** | PIN unlock (UIM → DMS fallback, retry-guarded) · multi-slot switching · PIN enable/disable · per-SIM overrides by ICCID (`wwand_sim`) |
+| **SIM** | PIN unlock (UIM → DMS fallback, retry-guarded) · multi-slot switching · PIN enable/disable · per-SIM overrides by ICCID (`wwand_sim`) · **SIM inventory**: every card seen, by ICCID, and where it is — modem and slot, eUICC and profile, or a remote reader (`wwandctl sims`, LuCI Status → SIM cards) |
+| **Remote SIM** | With the [wwand-rsim](https://github.com/ddimension/wwand-rsim) plugin a modem runs on a card that is not in its slot (QMI UIM Remote, also over the MBIM passthrough; HW-verified clients are **Quectel**, whose firmware switch for the service `wwandctl rsim enable` sets — on other Qualcomm modems UIM Remote has to be on in the firmware already, untested, tbd, see its [modem support](https://github.com/ddimension/wwand-rsim/blob/main/docs/modems.md)): a reader on the router or on another machine over SSH (Smartmouse USB, Phoenix, PC/SC), a phone's SIM over Bluetooth SAP, the card of another modem on the router (a *SIM sponsor*, whose radio wwand keeps off meanwhile) or of a modem on another wwand router. `wwandctl rsim scan` finds the sources, LuCI Network → Remote SIM sets them up |
 | **eSIM/eUICC** | Native ES10c list/enable/disable/delete · **SM-DP+ download** via bundled lpac · APDU transport auto-chosen: **native MBIM MS UICC Low Level Access** → QMI UIM (native or over the passthrough) → AT — so eSIM works on MBIM modems without an AT port |
+| **eSIM fleet** | With the [wwand-ipa](https://github.com/ddimension/wwand-ipa) plugin the router is the GSMA **SGP.32 IoT Profile Assistant** for an eIM, run by [ipad](https://github.com/ddimension/ipad) (`wwand-ipad`, C, SGP.32 v1.3): the eIM queues profile downloads (direct through lpac, or indirect through the eIM), enable/disable/delete and eIM configuration changes; wwand applies a profile switch to the modem, waits for a new data session and rolls the change back when none comes (SGP.32 3.3.2), and writes the enabled profile's APN into a `wwand_sim` for its ICCID. Works with IoT eUICCs and — by emulating the SGP.32 functions, results signed with a device key — with ordinary SGP.22 consumer eUICCs. `wwandctl ipa`, LuCI Network → eSIM Fleet |
 | **Binding** | Pin a modem by USB **serial**, **IMEI**, or a stable **device path** (sysfs topology, PCIe/MHI-ready) so the right SIM/APN follows the right modem across re-enumeration; **stable L3 names** `wwand0…wwand100` (auto-assigned, kernel netdev renamed, written back) survive USB renumbering on multi-modem boxes |
 | **RF unlock** | `option fcc_auth` unlocks laptop-SKU modems that boot radio-locked (Lenovo/Dell/HP Quectel EM1xx, Foxconn SDX55/SDX62, DW5821e) — QMI DMS/Foxconn auto-chain, MBIM Quectel radio-state |
 | **Setup** | **Zero-config autosetup** (default on): a modem on an unconfigured box creates `wwmodem_auto` + interface `wwan0` (L3 device `wwand0`) in the default wan firewall zone, then a one-shot internal **ICCID/IMSI → APN table** copies the carrier defaults (APN, PDP type, auth, credentials) into the config |
@@ -115,6 +121,19 @@ rather than failing.
 A typical QMI router installs **`wwand-qmi`** (which pulls in `wwand`). The LuCI
 UI is [luci-proto-wwand](https://github.com/ddimension/luci-proto-wwand) +
 [luci-app-wwand](https://github.com/ddimension/luci-app-wwand).
+
+### Plugins
+
+Features that are not meant for upstream live in their own repositories and
+hook into the daemon through a neutral plugin interface (`plugins.uc`, see
+[docs/reference.md](docs/reference.md#plugins)); the feed builds them too.
+
+| Package | Role |
+|---|---|
+| [`wwand-rsim`](https://github.com/ddimension/wwand-rsim) | remote SIM: a modem runs on a card in a reader, a phone (Bluetooth SAP), another modem here or on another wwand router; `wwandctl rsim` (`DEPENDS wwand-qmi rsim-card`) + `luci-app-wwand-rsim` |
+| `rsim-card` / `rsim-card-pcsc` | the card-side helper alone, for a **SIM host** — a PC or a second router holding the reader, reached over SSH (restricted to `rsim-card --serve`); `-pcsc` adds PC/SC readers through pcscd. Needs nothing of wwand |
+| [`wwand-ipa`](https://github.com/ddimension/wwand-ipa) + `wwand-ipad` | SGP.32 IoT Profile Assistant: eSIM fleet management through an eIM (`DEPENDS wwand-esim`) + `luci-app-wwand-ipa` |
+| [`wwand-qlog`](https://github.com/ddimension/wwand-qlog) | `wwandctl qlog`: Quectel QLog diagnostic capture on the port wwand found |
 
 ## Quick start
 
@@ -172,8 +191,13 @@ The full map, including the design notes and the running log, is
 
 Production-tested across MikroTik Chateau 5G (Quectel RG650E-EU + Huawei E392),
 Zyxel NR7101, Cudy LT300 (MeiG SLM770A) and GL.iNet X3000 (RM520N), plus further
-Quectel modems (RG502Q, EG06). A hardware-free host suite runs on every change —
-current suite/check counts live in [docs/STATUS.md](docs/STATUS.md).
+Quectel modems (RG502Q, EG06). Remote SIM (wwand-rsim) ran on the RG650E (QMI)
+and the RM520N (MBIM) with cards from a Smartmouse reader, phones over
+Bluetooth, sponsors on the same router and modems on other wwand routers — the
+details and workarounds are in its
+[README](https://github.com/ddimension/wwand-rsim#what-works). A hardware-free
+host suite runs on every change — current suite/check counts live in
+[docs/STATUS.md](docs/STATUS.md).
 
 ## License
 

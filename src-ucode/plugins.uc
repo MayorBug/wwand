@@ -12,8 +12,22 @@
 //                            // unknown, and never restart the modem on reload.
 //     create(deps) -> {      // all hooks optional
 //       tick(ref, ext),                 // every 10 s, per modem
+//       radio_hold(ref, ext),           // -> null, or a reason the modem's
+//                                       //    radio must stay off (its card
+//                                       //    is in use elsewhere)
+//       stop(),                         // the daemon exits -> true when it
+//                                       //    started work that needs the loop
+//       busy(),                         // -> true while that work runs
+//       card_source(ref, ext),          // -> the reader the active card is
+//                                       //    really in, or null
+//       status(ref, ext),               // -> status row(s), or null
 //       esim_guard(ref, op, ext),       // -> null, or { reason } to refuse a
 //                                       //    card-changing modem_esim op
+//       at_init(ref, ext, info),        // -> AT init steps for this modem:
+//                                       //    commands, or settings
+//                                       //    { check, want, set, note, reset }
+//                                       //    written only when they differ
+//                                       //    (atcmd run_sequence)
 //       ops: { <op>: (ref, ext, args, cb) },   // ubus modem_plugin
 //       read_ops: [ 'status', ... ],           // ...and which of them the
 //                                              // read-only twin may call
@@ -107,11 +121,157 @@ export function install(self, o)
 
 	let ext_of = (ref) => self.modems[ref]?.ext ?? {};
 
+	// One plugin that throws must not cost the others their tick, nor the
+	// daemon the rest of its own (the tick runs inside a uloop timer, where an
+	// exception ends the process). Logged once per plugin until it recovers.
+	// Keyed by plugin and modem: a plugin that fails for one modem and not
+	// another is logged once, not every tick.
+	let tick_failed = {};
+	let stopped = false;
+
 	self.plugins_tick = function() {
+		// stopped for the daemon's exit: a tick now would undo the stop
+		if (stopped)
+			return;
+
 		for (let name, entry in self.modems)
-			for (let p in active())
-				if (type(p.inst.tick) == 'function')
+			for (let p in active()) {
+				if (type(p.inst.tick) != 'function')
+					continue;
+
+				let k = p.name + '/' + name;
+
+				try {
 					p.inst.tick(name, entry?.ext ?? {});
+					delete tick_failed[k];
+				}
+				catch (e) {
+					if (!tick_failed[k])
+						log('warn', sprintf('plugin %s: tick for %s failed (%s)', p.name, name, e));
+					tick_failed[k] = true;
+				}
+			}
+	};
+
+	// Why this modem's radio must stay off, or null: a plugin that lent its
+	// card to another modem says so, and a bring-up of one of its interfaces
+	// must not switch the radio back on — two modems would register with one
+	// IMSI. Only plugins that already run are asked: one that never started
+	// has lent nothing.
+	self.plugins_radio_hold = function(ref) {
+		for (let p in (instances ?? [])) {
+			if (type(p.inst.radio_hold) != 'function')
+				continue;
+
+			let r = null;
+
+			try { r = p.inst.radio_hold(ref, ext_of(ref)); } catch (e) { r = null; }
+
+			if (type(r) == 'string' && length(r))
+				return sprintf('%s: %s', p.name, r);
+		}
+
+		return null;
+	};
+
+	// Whether a stopped plugin still has requests on their way (its busy()).
+	// A plugin without busy() that said it had work is given the benefit of
+	// the doubt until the caller's deadline.
+	self.plugins_busy = function() {
+		for (let p in (instances ?? [])) {
+			if (!p.stopping)
+				continue;
+
+			let b = true;
+
+			if (type(p.inst.busy) == 'function')
+				try { b = !!p.inst.busy(); } catch (e) { b = false; }
+			else if (!p.waited) {
+				p.waited = true;
+				log('info', sprintf('plugin %s: stopping, has no busy() — waiting the full grace time', p.name));
+			}
+
+			if (b)
+				return true;
+		}
+
+		return false;
+	};
+
+	// The daemon is exiting: each running plugin winds down (a lent card goes
+	// back, a remote one is withdrawn so the modem returns to its own).
+	// Returns true when one of them started work that needs the event loop
+	// for a moment longer — main.uc then runs it briefly before exiting.
+	self.plugins_stop = function() {
+		let pending = false;
+
+		stopped = true;
+
+		for (let p in (instances ?? [])) {
+			if (type(p.inst.stop) != 'function')
+				continue;
+
+			try {
+				p.stopping = !!p.inst.stop();
+				pending = p.stopping || pending;
+			}
+			catch (e) { log('warn', sprintf('plugin %s: stop failed (%s)', p.name, e)); }
+		}
+
+		return pending;
+	};
+
+	// Rows plugins add to a modem's status: [ { plugin, label, text, level } ],
+	// level 'ok' | 'warn' | 'error'. A plugin's optional `status(ref, ext)`
+	// returns one row, an array of them, or null. SYNCHRONOUS AND CHEAP:
+	// status() is what LuCI polls every second. A plugin that throws costs its
+	// own row, not the status answer — and is logged once, not every second.
+	let status_failed = {};
+
+	self.plugins_status = function(ref) {
+		let out = [];
+
+		for (let p in active()) {
+			if (type(p.inst.status) != 'function')
+				continue;
+
+			let r = null;
+
+			try { r = p.inst.status(ref, ext_of(ref)); }
+			catch (e) {
+				if (!status_failed[p.name])
+					log('warn', sprintf('plugin %s: status failed (%s)', p.name, e));
+				status_failed[p.name] = true;
+				continue;
+			}
+
+			for (let row in ((type(r) == 'array') ? r : (r ? [ r ] : [])))
+				if (type(row) == 'object' && row.label != null && row.text != null)
+					push(out, { plugin: p.name, label: sprintf('%s', row.label),
+					            text: sprintf('%s', row.text),
+					            level: (index([ 'ok', 'warn', 'error' ], row.level) >= 0) ? row.level : 'ok' });
+		}
+
+		return out;
+	};
+
+	// Where the modem's active card really is, when a plugin put it there:
+	// `card_source(ref, ext)` -> a place name (a reader), or null. The SIM
+	// inventory files a remote card under it instead of the modem's slot.
+	self.plugins_card_source = function(ref) {
+		for (let p in active()) {
+			if (type(p.inst.card_source) != 'function')
+				continue;
+
+			let r = null;
+
+			try { r = p.inst.card_source(ref, ext_of(ref)); } catch (e) { r = null; }
+
+			if (type(r) == 'string' && length(r))
+				return r;
+		}
+
+		return null;
 	};
 
 	// The first plugin that manages this card for this operation, or null.
@@ -129,6 +289,43 @@ export function install(self, o)
 		}
 
 		return null;
+	};
+
+	// The AT init steps the plugins add for a modem, in plugin order. info:
+	// the modem's identity (manufacturer, model, revision) and its control
+	// protocol. A plugin that throws adds nothing and costs the others
+	// nothing.
+	self.plugins_at_init = function(ref, info) {
+		let out = [];
+
+		for (let p in active()) {
+			if (type(p.inst.at_init) != 'function')
+				continue;
+
+			try {
+				let steps = p.inst.at_init(ref, ext_of(ref), info ?? {});
+
+				// checked HERE, where a throw is caught: atcmd runs the steps
+				// inside uloop callbacks, where a bad regex ends the daemon
+				for (let st in (type(steps) == 'array') ? steps : []) {
+					let rx_ok = (w) => { try { return type(regexp(w)) == 'regexp'; } catch (e) { return false; } };
+					let good = (type(st) == 'string') ||
+						(type(st) == 'object' && type(st.check) == 'string' &&
+						 type(st.set) == 'string' && type(st.want) == 'string' && rx_ok(st.want));
+
+					if (good)
+						push(out, st);
+					else
+						log('warn', sprintf('plugin %s: at_init step ignored (not a command or a {check, want, set} setting): %J',
+							p.name, st));
+				}
+			}
+			catch (e) {
+				log('warn', sprintf('plugin %s: at_init failed (%s)', p.name, e));
+			}
+		}
+
+		return out;
 	};
 
 	// ubus modem_plugin { modem, plugin, op, args } — and the read-only twin,

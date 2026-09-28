@@ -91,6 +91,12 @@ listed as *not present*, with when it was last seen; the cards in a
 multi-slot modem's inactive slots appear once its slot list has been read.
 `wwandctl sims` prints the same.
 
+Each row has **Edit** or **Create**: it opens the card's per-SIM override (PIN,
+APN, …) in the editor on the Modems page — the card's entry when it has one
+(matched by ICCID, or by IMSI as the daemon matches), otherwise a new one with
+the ICCID filled in, kept only by Save & Apply. The Modems page takes the card
+as `?sim=<ICCID>`.
+
 ![SIM cards](images/luci-sim-cards.png)
 
 ## Modem Tools — bands, operator, cell lock, SIM, eSIM, SMS

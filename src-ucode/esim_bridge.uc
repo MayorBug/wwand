@@ -157,9 +157,74 @@ function parse_lpac_line(s)
 	return { kind: 'log', text: s };
 }
 
+// ES10 functions by their command tag (SGP.22 v2.7 5.7 / SGP.32 v1.3 5.9)
+const ES10_NAMES = {
+	BF20: 'GetEUICCInfo1', BF22: 'GetEUICCInfo2', BF2E: 'GetEUICCChallenge',
+	BF38: 'AuthenticateServer', BF21: 'PrepareDownload', BF36: 'LoadBoundProfilePackage',
+	BF41: 'CancelSession', BF2D: 'GetProfilesInfo', BF31: 'EnableProfile',
+	BF32: 'DisableProfile', BF33: 'DeleteProfile', BF3E: 'GetEID',
+	BF2B: 'RetrieveNotificationsList', BF30: 'RemoveNotificationFromList',
+	BF3C: 'GetEuiccConfiguredAddresses', BF3F: 'SetDefaultDpAddress', BF43: 'GetRAT',
+	BF51: 'LoadEuiccPackage', BF52: 'GetEimConfigurationData', BF55: 'GetEimConfigurationData',
+	BF57: 'AddInitialEim', BF58: 'ProfileRollback', BF4F: 'IpaEuiccData',
+};
+
+// the tag a BER object starts with, as hex ('BF38', '30'), or null
+function first_tag(h)
+{
+	if (length(h) < 2)
+		return null;
+
+	let b = hex(substr(h, 0, 2));
+
+	return ((b & 0x1F) == 0x1F && length(h) >= 4) ? uc(substr(h, 0, 4)) : uc(substr(h, 0, 2));
+}
+
+// One command and its answer for the debug log: what an ES10 exchange WAS,
+// never what it carried. The command's own data — a Bound Profile Package,
+// signatures, an activation code — stays out; only its ES10 tag and length.
+// An answer is shown in full only while it is short (<= 32 bytes): that is
+// where the error codes are (an AuthenticateServerResponse error is
+// BF38 xx A1 xx 02 01 <code>), and nothing that short is a profile.
+function apdu_summary(cmd, resp)
+{
+	cmd = uc(cmd ?? '');
+	resp = uc(resp ?? '');
+
+	let ins = substr(cmd, 2, 2), p1 = substr(cmd, 4, 2), p2 = substr(cmd, 6, 2);
+	let data = substr(cmd, 10);
+	let what = sprintf('INS %s', ins);
+
+	// STORE DATA (SGP.22 5.7.2): the ES10 command begins in block 0
+	if (ins == 'E2') {
+		let tag = (p2 == '00') ? first_tag(data) : null;
+
+		what = sprintf('STORE DATA %s blk %d', (p1 == '91') ? 'last' : 'more', hex(p2 || '0'));
+		if (tag)
+			what += sprintf(' %s%s', tag, ES10_NAMES[tag] ? ' ' + ES10_NAMES[tag] : '');
+		what += sprintf(' (%d B)', length(data) / 2);
+	}
+
+	let sw = (length(resp) >= 4) ? substr(resp, length(resp) - 4) : '?';
+	let rdata = (length(resp) >= 4) ? substr(resp, 0, length(resp) - 4) : '';
+	let ans = sprintf('SW %s', sw);
+
+	if (length(rdata)) {
+		let rtag = first_tag(rdata);
+
+		ans += (length(rdata) <= 64)
+			? sprintf(' %s', rdata)
+			: sprintf(' %s (%d B)', rtag ?? '?', length(rdata) / 2);
+	}
+
+	return what + ' -> ' + ans;
+}
+
 return {
 	// exposed for tests (test_esim_bridge): the pure lpac line classifier
 	parse_lpac_line: parse_lpac_line,
+	// ...and the debug line one card command becomes
+	apdu_summary: apdu_summary,
 
 	// deps: { esim (the wwand.esim module), log(level,msg), modem_of(ref),
 	//         changed?(ref, slot) }
@@ -402,8 +467,14 @@ return {
 				case 'transmit':
 					// apdu_send yields the response hex directly (modem_apdu is
 					// what wraps it as {response}); use it as-is
-					sim.apdu_send(entry.modem, slot, chan, rec.param, (err, res) =>
-						send(err ? -1 : 0, err ? '' : (res ?? ''))); break;
+					sim.apdu_send(entry.modem, slot, chan, rec.param, (err, res) => {
+						// the ES10 sequence of a run, for whoever debugs a
+						// download or an eIM package: tags and status words
+						// only (apdu_summary)
+						logline(err ? sprintf('%s -> error %J', apdu_summary(rec.param, ''), err)
+						            : apdu_summary(rec.param, res), 'debug');
+						send(err ? -1 : 0, err ? '' : (res ?? ''));
+					}); break;
 				case 'logic_channel_close':
 					sim.apdu_close(entry.modem, slot, chan, () => send(0, '')); break;
 				default:

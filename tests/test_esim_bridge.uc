@@ -13,6 +13,26 @@ import { eq, ok, done } from './lib/check.uc';
 
 let bridge = require('wwand.esim_bridge');
 
+// --- the debug line of one card command: the ES10 tag, never its data -------
+{
+	let s = bridge.apdu_summary('81E29100' + '0C' + 'BF3809A0078001AA81020102', '');
+
+	ok(index(s, 'BF38 AuthenticateServer') >= 0, 'apdu: STORE DATA names its ES10 function');
+	eq(index(s, 'A0078001AA'), -1, 'apdu: ...and leaves the command data out');
+
+	let e = bridge.apdu_summary('81E2910003BF3800', 'BF3805A103020106' + '9000');
+
+	ok(index(e, 'SW 9000 BF3805A103020106') >= 0, 'apdu: a short answer (an error code) is shown');
+
+	let big = bridge.apdu_summary('81E2110003BF3600', 'BF36' + '8182' + substr(sprintf('%0130d', 0), 0, 130) + '9000');
+
+	ok(index(big, 'BF36 (') >= 0 && index(big, '000000000000') == -1,
+	   'apdu: a long answer only by tag and length');
+	ok(index(bridge.apdu_summary('81E2110103AABBCC', '9000'), 'blk 1') >= 0 &&
+	   index(bridge.apdu_summary('81E2110103AABBCC', '9000'), 'AA') == -1,
+	   'apdu: a later block has no tag of its own and shows none');
+}
+
 ok(type(bridge) == 'object', 'bridge: module loads via require()');
 ok(type(bridge.parse_lpac_line) == 'function', 'bridge: parser exposed');
 

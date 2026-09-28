@@ -698,7 +698,7 @@ const decode_eid = hexmod.decode_eid;
 // not the same as inventing it. Three firmwares end up here: a QMI UIM refusing
 // GET_SLOT_STATUS as 71/94, an MBIM device with no UIM client at all, and every
 // AT/NCM modem whose vendor has no dual-SIM recipe — which today is all of them
-// but Fibocom (ncm_vendors.uc:1302 is the only `slots:` entry). What they have
+// but Fibocom (ncm_vendors.uc:1769 is the only `slots:` entry). What they have
 // in common is that they cannot enumerate, not that they have nothing.
 //
 // Refusing instead left an "unsupported" error that every caller absorbed into

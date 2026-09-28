@@ -984,8 +984,12 @@ Fibocom FM350-GL, whose only band command `+GTACT` is not NV. What holds now:
   parser reads the first band as UMTS, and tuple 17's own read-back sent back
   verbatim was refused, so any other tuple is refused with a reason
   (`unsupported_tuple`, shown as a `band_lists` status warning).
-- Only bands the module lists in `AT+GTACT=?` are sent; "no band ticked" is
-  that whole list, not the unverified `0` token.
+- Once the module has answered `AT+GTACT=?` (a failed read is asked again,
+  not cached), only bands it lists are sent, sorted and each once; "no band
+  ticked" is that whole list, not the unverified `0` token. A group the tuple
+  does not carry (NR on tuple 4) is refused, not kept unapplied.
+- The band step is serialised per modem, so the bring-up and a reload's live
+  apply cannot both write.
 - QMI/MBIM and other NCM modems do not apply the options; a list there is a
   `band_lists` warning instead of silence.
 - LuCI shows only what the backend can set (`settable`): one NR list, the

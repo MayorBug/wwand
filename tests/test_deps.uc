@@ -591,4 +591,40 @@ function mkdeps(u, extra) {
 	eq(d.sim_upsert(ICC, {}, 'Bad Origin').reason, 'invalid', 'sim_upsert: an origin that is not a name is refused');
 }
 
+// --- record_bands: against REAL libuci, not the stand-in above --------------
+// The section-type check reads `cursor.get(pkg, section)`, which libuci
+// answers with the section TYPE — the stand-in answers the section object,
+// so testing through it would prove nothing about the one line that decides
+// whether a band edit is kept.
+{
+	let uci = require('uci');
+	let fs = require('fs');
+	let dir = fs.mkdtemp('/tmp/wwand-test-bands-XXXXXX');
+
+	fs.writefile(dir + '/network',
+		"config wwand_modem 'm0'\n\toption usb_path '3-1'\n\tlist band_umts '1'\n\n" +
+		"config interface 'wan'\n\toption proto 'wwand'\n");
+
+	let d = mkdeps({ cursor: () => uci.cursor(dir) });
+	let read = (opt) => uci.cursor(dir).get('network', 'm0', opt);
+
+	eq(d.record_bands('m0', { band_lte: [ '3', '20' ], band_nr: [ '78' ] }), true,
+		'record_bands: a wwand_modem section takes the lists');
+	eq([ read('band_lte'), read('band_nr') ], [ [ '3', '20' ], [ '78' ] ],
+		'record_bands: written as uci lists, in order');
+	eq(read('band_umts'), [ '1' ], 'record_bands: a list not named is left alone');
+
+	eq(d.record_bands('m0', { band_lte: [] }), true, 'record_bands: an empty list...');
+	eq(read('band_lte'), null, '...removes the option (all bands)');
+
+	eq(d.record_bands('wan', { band_lte: [ '3' ] }), false,
+		'record_bands: an interface section is not a modem');
+	eq(uci.cursor(dir).get('network', 'wan', 'band_lte'), null, '...and is not written');
+	eq(d.record_bands('compat_wan', { band_lte: [ '3' ] }), false,
+		'record_bands: a synthesized modem has no section to keep them in');
+
+	fs.unlink(dir + '/network');
+	fs.rmdir(dir);
+}
+
 done('test_deps');

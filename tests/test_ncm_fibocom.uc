@@ -518,6 +518,49 @@ fm.at.send = ((send) => (cmd, cb) => {
 fset(fm, { lte_bands: [ 3 ] }, (err, res) => { e = err; });
 eq([ e?.error, e?.group ], [ 'verify_failed', 'lte' ], 'gtact set: an OK the read-back contradicts is a failure');
 
+// tuple 4 (LTE/UMTS) carries no NR group: its settable keys say so, and an
+// NR list is refused instead of being reported unchanged and never applied
+let get4;
+fm = fake_fm350('+GTACT: 4,3,3,1,2,4,5,8,101,103');
+ncm_vendors.VENDORS.fibocom.settings_get(fm, (err, res) => { get4 = res; });
+eq(get4?.settable, [ 'umts_bands', 'lte_bands' ], 'gtact get: tuple 4 offers no NR list');
+fset(fm, { nr5g_sa_bands: [ 78 ], nr5g_nsa_bands: [ 78 ] }, (err, res) => { e = err; r = res; });
+eq([ e?.error, e?.key ], [ 'unsupported_tuple', 'nr5g_sa_bands' ], 'gtact set: NR on tuple 4 is refused');
+eq(writes(fm), [], '...and nothing is written');
+
+// sorted and each once — the only shape accepted on hardware
+fm = fake_fm350(LIVE20);
+fset(fm, { lte_bands: [ 28, 3, 3 ] }, (err, res) => { e = err; });
+eq(writes(fm), [ 'AT+GTACT=20,6,3,1,2,4,5,8,103,128,503,507,5020,5028,5078' ],
+	'gtact set: a band list goes out ascending, without duplicates');
+
+fset(fake_fm350(LIVE20), { lte_bands: [ 3, 'x' ] }, (err, res) => { e = err; });
+eq(e?.error, 'invalid_setting', 'gtact set: a non-number in a band list is refused');
+
+// a failed catalogue read is asked again, not cached as "none"
+fm = fake_fm350(LIVE20);
+let caps_asked = 0;
+fm.at.send = ((send) => (cmd, cb) => {
+	if (cmd == 'AT+GTACT=?' && ++caps_asked == 1)
+		return cb('timeout');
+	send(cmd, cb);
+})(fm.at.send);
+fset(fm, { lte_bands: [] }, (err, res) => { e = err; });
+eq(e?.error, 'invalid_setting', 'gtact set: "all bands" needs the catalogue (first read timed out)');
+fset(fm, { lte_bands: [] }, (err, res) => { e = err; });
+eq([ e, caps_asked ], [ null, 2 ], 'gtact set: ...and the next call asks =? again and succeeds');
+
+// between two bring-ups: still an FM350 (no false "no band command"), but
+// nothing is sent — the next bring-up applies the lists
+fm = fake_fm350(LIVE20);
+fm.at = null;
+ok(ncm_vendors.VENDORS.fibocom.settings_capable(fm), 'gtact: capability is the model, not a live AT engine');
+fset(fm, { lte_bands: [ 3 ] }, (err, res) => { e = err; });
+eq(e?.error, 'modem_not_ready', 'gtact set: without an AT engine it answers not-ready');
+
+// The real AT engine DROPS in-flight callbacks on close; a stub that reports
+// the close is the other shape a teardown can take, and the write must not
+// then dereference the nulled engine.
 fm = fake_fm350(LIVE20);
 fm.at.send = ((send) => (cmd, cb) => {
 	// torn down while the catalogue was being read

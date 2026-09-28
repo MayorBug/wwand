@@ -457,7 +457,50 @@ export function create(opts)
 	// Apply the configured band lists (config wwand_modem). An unset list
 	// leaves that RAT alone, so nothing configured is no write at all.
 	// cb(err, res) always; errors are logged here, never fatal to bring-up.
+	//
+	// SERIALISED: the bring-up and a reload's live apply can both ask, and
+	// two concurrent runs would each read the old mask (the AT queue is FIFO)
+	// and each write it — two re-registrations for one edit. A request that
+	// arrives during a run makes the run go once more, with the config as it
+	// is then. The run belongs to the AT engine it started on: a teardown
+	// drops that engine's callbacks, and a run left marked busy would hold
+	// the next bring-up's band step forever.
+	let apply_once;
+
 	self.apply_config_bands = function(cb) {
+		cb = cb ?? (() => null);
+
+		let run = self._bands_run;
+
+		if (run && self.at && run.at === self.at) {
+			push(run.waiters, cb);
+			run.again = true;
+			return;
+		}
+
+		run = self._bands_run = { at: self.at, waiters: [ cb ], again: false };
+
+		let go;
+
+		go = () => {
+			run.again = false;
+
+			apply_once((err, res) => {
+				if (run.again && self.at === run.at)
+					return go();
+
+				if (self._bands_run === run)
+					self._bands_run = null;
+
+				for (let w in run.waiters)
+					w(err, res);
+			});
+		};
+
+		go();
+	};
+
+	apply_once = function(cb) {
 		let c = self.config ?? {};
 		let want = {};
 
@@ -480,6 +523,11 @@ export function create(opts)
 				self.info?.model ?? 'this modem'));
 			return cb({ error: 'unsupported_on_backend' });
 		}
+
+		// no AT engine (between two bring-ups): not a failure — the next
+		// bring-up applies the lists
+		if (!self.at)
+			return cb({ error: 'modem_not_ready' });
 
 		self.settings_set(want, (err, res) => {
 			// kept for status (daemon band_warnings): a refused tuple or
@@ -981,8 +1029,13 @@ export function create(opts)
 								// of on a bearer that was just brought up. Not NV on
 								// +GTACT (ncm_vendors, rule 3), hence every bring-up;
 								// a mask the modem already runs is not written.
+								// the engine this run started on: a retry after
+								// make_fail opens a NEW one on the same object, and
+								// only this run may go on to the dial
+								let run_at = self.at;
+
 								self.apply_config_bands(() => {
-									if (!self.at)
+									if (!self.at || self.at !== run_at)
 										return;   // torn down while the band write ran
 
 									step_resolve_dial();
@@ -1060,7 +1113,7 @@ export function create(opts)
 		// down and re-enumerates it, so `self.at` can be null by the time the
 		// call lands. Reading `.send` off it throws inside a uloop callback,
 		// which does not fail the call: it takes the daemon with it. Field-seen
-		// at modem_ncm.uc:899, and only with `sim_slot` configured — that is
+		// at modem_ncm.uc:967, and only with `sim_slot` configured — that is
 		// what makes step_simslot walk the second pass at all
 		// (ddimension/wwand#32).
 		if (!self.at)

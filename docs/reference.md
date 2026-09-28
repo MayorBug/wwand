@@ -483,9 +483,10 @@ config wwand_modem 'm0'
 	option lock_4g '1300:246'        # earfcn:pci — LTE cell lock (repeatable / list)
 	option lock_5g '242:431070:15:1' # pci:arfcn:scs:band — NR SA cell lock
 	option lock_persist '0'          # store the cell lock in modem NV
-	list band_lte '1' '3' '7'        # LTE bands — Fibocom FM350/FM150 only (see below)
-	list band_nr '28' '78'           # NR bands, one list for SA and NSA (same)
-	list band_umts '1' '2'           # UMTS bands (rarely wanted, see below)
+	list band_lte '3'                # LTE bands, one per line — Fibocom FM350/FM150 only (see below)
+	list band_lte '20'
+	list band_nr '78'                # NR bands, one list for SA and NSA alike
+	# list band_umts '1'             # UMTS bands (rarely wanted, see below)
 	option location '0'              # start the QMI LOC positioning session
 	option stats_interval '60'       # telemetry period in seconds (0 = off)
 	option delay '0'                 # seconds to wait before the first init
@@ -544,9 +545,14 @@ wwandctl settings          # read back what the modem actually runs
 ```
 
 An **unset list leaves that RAT's bands as the modem runs them**, so a partial
-edit never drops the other RATs' bands. Only bands the module lists in
-`AT+GTACT=?` are accepted; any other is refused by name instead of being sent,
-because one unknown token aborts the whole `+GTACT` command.
+edit never drops the other RATs' bands. That also means deleting a list by hand
+does **not** widen the modem again until it is power-cycled; to go back to every
+band now, untick all bands of that RAT in the settings editor, which writes the
+module's full list and removes the option. Once the module has answered
+`AT+GTACT=?`, only bands it lists are accepted; any other is refused by name
+instead of being sent, because one unknown token aborts the whole `+GTACT`
+command. A band list for a group the running tuple does not carry (NR on the
+LTE/UMTS tuple 4) is refused as well rather than kept unapplied.
 
 These options do **not** choose the RAT. `+GTACT` carries the RAT tuple in front
 of the bands and refuses a write that contradicts it, so wwand keeps the tuple

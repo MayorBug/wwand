@@ -4243,6 +4243,11 @@ export function create(opts)
 			if (e?.modem?.config)
 				e.modem.config[k] = v;
 		}
+
+		// the modem runs what was just accepted: an earlier failed apply is
+		// no longer the state to report
+		if (e?.modem)
+			e.modem.band_apply_error = null;
 	};
 
 	// settings / network-selection / operator-scan ubus ops — in netsel_ops.uc

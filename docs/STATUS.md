@@ -826,10 +826,14 @@ shim's `proto_block_restart` cleared autostart for good. Two changes:
     their names but not trusted — trusted, "nothing recorded" would revive
     every ifdown whose record went with the rest of the file;
   - `admin_downs.json` and `giveups.json` are **replaced whole** (write
-    beside, rename over: `default_fx.write_atomic`), and the daemon re-reads
-    the file before each write and when it decides, so a name the shim
-    appended while the daemon ran (its teardown could not reach it) is
-    neither written away nor ignored;
+    beside under a name of its own, rename over, no temporary left on a
+    failed write: `default_fx.write_atomic`), and the daemon re-reads the
+    file before each write and when it decides, so a name the shim appended
+    while the daemon ran (its teardown could not reach it) is neither written
+    away nor ignored. The read-merge-write holds a flock on
+    `admin_downs.lock`, which the shim takes around its append (busybox
+    `flock`): an append between the daemon's read and its rename went to
+    the replaced file;
   - an ifup that finds the modem gone (`modem_absent`) also ends wwand's own
     down: its marker, kept past the ifup, sent the operator's next ifdown
     down the "ours" branch unrecorded;
@@ -907,7 +911,7 @@ misconfigured, and again when the modem lets go of it.
   modem had no `set_opmode` at all, so a held MBIM modem was **not parked at
   all** — not at init and not after: it registered on its own card and stayed
   registered, only its interfaces were refused. It has one now (passthrough
-  DMS low power, else the software Radio State; woken the way it was parked),
+  DMS low power, else the software Radio State),
   so `modem_radio`, the park at a registration, `option lowpower` and the
   init-time hold work there: the hold is asked right after MBIM OPEN (an
   MBIM modem registers on its own, so step_register would be too late),
@@ -939,6 +943,24 @@ misconfigured, and again when the modem lets go of it.
     wait forever and swallowed the next registration loss;
   - `wwandctl status` names the holding plugin instead of repeating the
     reason its own status row gives.
+- **Review follow-up, MBIM park (2026-09-28):**
+  - a held modem with `fcc_auth 'quectel'` gets the vendor Radio State = on
+    (a radio-on of its own) at the WAKE, before its radio is switched back
+    on — sent before the park, an RF-locked modem could register on its
+    local card first;
+  - the **wake undoes what may be off**: DMS and the Radio State are
+    independent switches, and a DMS park outlives its modem object (a
+    daemon restart) — a new object that parked over the switch woke only
+    the switch and left DMS in low power for good. A modem object that has
+    not set DMS itself (`_dms_unknown`) wakes both; one it parked over DMS
+    is woken over DMS, without falling back to the switch;
+  - a **failed wake of an earlier pass's park** keeps the park flags and
+    how it was made, is tried again, and fails the init after `WAKE_TRIES`;
+  - **passthrough CID releases are tracked** until acknowledged
+    (`_pt_unreleased`): retried at the next use of the stack, carried by
+    `drop_pt`'s release burst, given up (and logged) after
+    `PT_RELEASE_TRIES`. A timed-out RELEASE_CID left a CID in the modem's
+    table that nothing tracked, one per hold/wake.
 
 ## Known open
 

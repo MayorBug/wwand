@@ -587,6 +587,28 @@ export function create(opts)
 		? join('', map(keys(self._admin_downs), (n) => sprintf('"%s"\n', n)))
 		: sprintf('%J', keys(self._admin_downs)));
 
+	// THE READ-MERGE-WRITE HOLDS THE SHIM'S LOCK. Re-reading before the write
+	// is not enough on its own: a name the shim appends after the read and
+	// before the rename goes to the file the rename replaces, and is lost.
+	// The shim appends under the same flock (files/wwand-proto.sh
+	// proto_wwand_teardown, `admin_downs.lock` beside the record); without
+	// a lock (an fx that has none) this is the unlocked read-merge-write.
+	let admin_lock_file = replace(admin_downs_file, /\.json$/, '') + '.lock';
+
+	let admin_locked = (fn) => {
+		let unlock = deps.datapath_fx?.lock ? deps.datapath_fx.lock(admin_lock_file) : null;
+
+		try {
+			merge_admin_record();
+			fn();
+		}
+		catch (e) {
+			log('warn', sprintf('admin_downs update failed: %s', e));
+		}
+
+		unlock?.();
+	};
+
 	// an interface named by a ubus caller, for the records keyed by interface
 	// when there is no context entry for it; null for anything the state
 	// files' name pattern would not read back
@@ -599,19 +621,19 @@ export function create(opts)
 		if (!iface)
 			return;
 
-		// re-read before the write: names the shim appended since the last
-		// one must survive it
-		merge_admin_record();
+		// re-read before the write (admin_locked): names the shim appended
+		// since the last one must survive it
+		admin_locked(() => {
+			if (!!self._admin_downs[iface] == on)
+				return;
 
-		if (!!self._admin_downs[iface] == on)
-			return;
+			if (on)
+				self._admin_downs[iface] = true;
+			else
+				delete self._admin_downs[iface];
 
-		if (on)
-			self._admin_downs[iface] = true;
-		else
-			delete self._admin_downs[iface];
-
-		persist_admin_downs();
+			persist_admin_downs();
+		});
 	};
 
 	// true when netifd's cleared autostart is the operator's and must be
@@ -658,10 +680,10 @@ export function create(opts)
 		self._admin_seeding = true;
 
 		let left = length(ifaces);
-		let finish = () => {
+		let finish = () => admin_locked(() => {
 			self._admin_seed_pending = false;
 			persist_admin_downs();
-		};
+		});
 
 		if (!left || !deps.iface_status)
 			return finish();
@@ -1172,7 +1194,7 @@ export function create(opts)
 	// whether anything started it.
 	//
 	// COMPARED HERE rather than trusted from the event. modem_mbim filters its
-	// own emit on a change (modem_mbim.uc:877-886) while the shared reapply
+	// own emit on a change (modem_mbim.uc:896-905) while the shared reapply
 	// tail emits on every re-read (modem_common.uc:553-559); one comparison, in
 	// the place that acts on it, cannot disagree with itself.
 	let modem_sim_refresh = (modem, data) => {

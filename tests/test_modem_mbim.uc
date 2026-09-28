@@ -29,6 +29,7 @@ import * as uimmod from 'wwand/codec/schema/uim.uc';
 import * as wmsmod from 'wwand/codec/schema/wms.uc';
 import * as bc from 'wwand/codec/mbim_schema/basic_connect.uc';
 import * as ext from 'wwand/codec/mbim_schema/ms_basic_connect_ext.uc';
+import * as quectel from 'wwand/codec/mbim_schema/quectel.uc';
 
 uloop.init();
 
@@ -1945,6 +1946,255 @@ function assert_mbim_reinit_clears_park() {
 }
 
 assert_mbim_reinit_clears_park();
+
+// A held RF-locked modem (fcc_auth quectel): the vendor Radio State = on is a
+// radio-on of its own, and sent before the park the modem could register on
+// its local card. Held, it waits for the wake, which sends it first and then
+// switches the parked radio back on.
+function assert_mbim_hold_defers_fcc() {
+	uloop.init();
+
+	let st = { on: true, order: [], on_while_held: false };
+	let hold = 'rsim: its remote SIM x is not connected yet';
+	let h = radio_modem_handlers(st);
+	let bc_radio = h.RADIO_STATE;
+
+	h.RADIO_STATE = (args, meta) => {
+		if (meta.cid == quectel.commands.RADIO_STATE.cid) {
+			push(st.order, 'fcc');
+			// the vendor switch turns the radio on — the risk
+			st.on = true;
+			if (hold)
+				st.on_while_held = true;
+			return { radio_state: quectel.RADIO_ON };
+		}
+
+		if (meta.kind == 'set')
+			push(st.order, (args.radio_state == bc.RADIO_STATE_ON) ? 'on' : 'off');
+
+		return bc_radio(args, meta);
+	};
+
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext, quectel ], handlers: h });
+	let events = [], seen = {};
+	let m = mk_radio_modem('m_fcchold', mock, events);
+
+	m.config.fcc_auth = 'quectel';
+	m.radio_hold = () => hold;
+	m.start();
+
+	uloop.timer(200, () => {
+		seen.held_order = [ ...st.order ];
+		seen.state = m.state;
+		hold = null;
+		m.set_opmode('online', () => reg_ind(mock, true));
+	});
+
+	uloop.timer(400, () => { m.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(seen.held_order, [ 'off' ], 'mbim hold + fcc: parked, and no vendor radio-on while held');
+	eq(st.on_while_held, false, 'mbim hold + fcc: the radio was never on while held');
+	eq(seen.state, 'REGISTERING', 'mbim hold + fcc: the init went on to wait in REGISTERING');
+	eq(st.order, [ 'off', 'fcc', 'on' ], 'mbim hold + fcc: the wake unlocks first, then switches the radio on');
+	eq(length(filter(events, (e) => e == 'registered')), 1, 'mbim hold + fcc: registered after the wake');
+}
+
+assert_mbim_hold_defers_fcc();
+
+// A DMS PARK OUTLIVES THE MODEM OBJECT: a daemon parks over DMS and restarts;
+// the new object, held at init, parks over the radio switch and knows nothing
+// of the DMS low power — a wake of the switch alone left the modem off.
+function assert_mbim_wake_after_restart() {
+	uloop.init();
+
+	let st = { on: true, dms: 'online' };
+	let h = radio_modem_handlers(st);
+	let bc_reg = h.REGISTER_STATE;
+
+	// registers only with both switches on
+	h.REGISTER_STATE = (args, meta) => {
+		let r = bc_reg(args, meta);
+
+		if (st.dms != 'online') {
+			r.register_state = bc.REGISTER_STATE_SEARCHING;
+			r.provider_id = '';
+		}
+
+		return r;
+	};
+
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: h });
+	let dms = (mode, cb) => { st.dms = mode; cb(null); };
+	let events1 = [], events2 = [], seen = {};
+	let m1 = mk_radio_modem('m_restart1', mock, events1);
+	let m2 = null, hold = 'rsim: its remote SIM x is not connected yet';
+
+	m1._pt_opmode = dms;
+	m1.start();
+
+	uloop.timer(120, () => {
+		m1.set_opmode('low_power', () => {
+			seen.first = [ m1._park_via, st.dms ];
+			m1.stop();               // the daemon restarts
+
+			m2 = mk_radio_modem('m_restart2', mock, events2);
+			m2._pt_opmode = dms;
+			m2.radio_hold = () => hold;
+			m2.start();
+		});
+	});
+
+	uloop.timer(300, () => {
+		seen.second = [ m2.lowpower_parked, m2._park_via, st.on ];
+		hold = null;
+		m2.set_opmode('online', (e) => {
+			seen.wake_err = e;
+			reg_ind(mock, st.on && st.dms == 'online');
+		});
+	});
+
+	uloop.timer(450, () => { m2.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(seen.first, [ 'dms', 'low_power' ], 'restart: the first object parked over DMS');
+	eq(seen.second, [ true, 'radio', false ], 'restart: the second, held at init, over the radio switch');
+	eq([ seen.wake_err, st.dms, st.on ], [ null, 'online', true ],
+	   'restart: the wake switches BOTH back on — the DMS park of the earlier object too');
+	ok(index(events2, 'registered') >= 0, 'restart: ...and the modem registers');
+}
+
+assert_mbim_wake_after_restart();
+
+// A FAILED WAKE OF AN EARLIER PARK KEEPS THE PARK, and is tried again
+function assert_mbim_reinit_wake_fails_once() {
+	uloop.init();
+
+	let st = { on: true, dms: 'low_power' };
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers(st) });
+	let events = [], calls = [], seen = {};
+	let m = mk_radio_modem('m_wakefail', mock, events);
+
+	m.lowpower_parked = true;
+	m._plugin_held = true;
+	m._park_via = 'dms';
+	m._pt_opmode = (mode, cb) => {
+		push(calls, mode);
+
+		if (length(calls) == 1)
+			return cb({ error: 'qmi', code: 1 });
+
+		seen.at_retry = [ m.lowpower_parked, m._park_via ];
+		st.dms = mode;
+		cb(null);
+	};
+	m.start();
+
+	uloop.timer(250, () => { seen.final = m.state; m.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq(calls, [ 'online', 'online' ], 'wake fails once: tried again');
+	eq(seen.at_retry, [ true, 'dms' ], 'wake fails once: the park and how it was made are kept meanwhile');
+	eq([ seen.final, m.lowpower_parked ], [ 'READY', false ], 'wake fails once: woken and registered on the retry');
+	eq(length(filter(events, (e) => e == 'error')), 0, 'wake fails once: no failure for one refusal');
+
+	// ...and one that keeps refusing fails the init, bounded
+	uloop.init();
+
+	let st2 = { on: true };
+	let mock2 = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: radio_modem_handlers(st2) });
+	let ev2 = [], n = 0;
+	let m2 = mk_radio_modem('m_wakefail2', mock2, ev2);
+
+	m2.lowpower_parked = true;
+	m2._park_via = 'dms';
+	m2._pt_opmode = (mode, cb) => { n++; cb({ error: 'qmi', code: 1 }); };
+	m2.start();
+
+	uloop.timer(200, () => { m2.stop(); uloop.timer(20, () => uloop.end()); });
+	uloop.run();
+
+	eq([ n >= 3, index(ev2, 'error') >= 0 ], [ true, true ], 'wake keeps failing: the init fails after its tries');
+}
+
+assert_mbim_reinit_wake_fails_once();
+
+// AN UNACKNOWLEDGED RELEASE IS STILL OWED. The real _pt_opmode over a mock QMI
+// passthrough: a RELEASE_CID that times out or fails is kept, retried at the
+// next use of the stack, given up after its tries, and carried by the release
+// burst when the stack is dropped.
+function assert_pt_release_owed() {
+	uloop.init();
+
+	let rel_mode = 'ok', rel_count = 0;
+	let qmock = qmi_mockhub.create({ handlers: {
+		SET_OPERATING_MODE: {},
+		RELEASE_CID: (a) => {
+			rel_count++;
+			return (rel_mode == 'timeout') ? null
+			     : (rel_mode == 'fail') ? { __error: 1 }
+			     : { release: a.release };
+		},
+	} });
+	let pthub = qmock.transport_open('/dev/ptmock_rel', {});
+	let ctl = client_mod.create(pthub, ctlmod.default, 0);
+	let logs = [];
+	let m = modem_mbim.create({
+		id: 'm_rel', device: '/dev/mockrel', config: {},
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1, pt_release_ms: 20 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: (l, msg) => push(logs, msg), on_event: () => null },
+	});
+
+	m.mbim = { destroy: () => null, command: () => null };
+	m.state = 'READY';
+	m.pt = { shim: pthub, ctl: ctl };
+	m._ensure_pt = (cb) => cb(true);
+
+	let spin = (ms) => { uloop.timer(ms, () => uloop.end()); uloop.run(); };
+	let opmode = (mode) => { let r = 'unset'; m._pt_opmode(mode, (e) => { r = e; }); spin(60); return r; };
+
+	eq(opmode('low_power'), null, 'pt release: the set went over the passthrough');
+	eq(length(m._pt_unreleased), 0, 'pt release: acknowledged — nothing owed');
+
+	rel_mode = 'timeout';
+	opmode('online');
+	eq(length(m._pt_unreleased), 1, 'pt release: a release that timed out is still owed');
+
+	rel_mode = 'fail';
+	rel_count = 0;
+	opmode('low_power');
+	// the owed one retried (fails) and the new one (fails)
+	eq([ rel_count, length(m._pt_unreleased) ], [ 2, 2 ], 'pt release: retried at the next use; a failed one is owed too');
+
+	rel_mode = 'ok';
+	rel_count = 0;
+	opmode('online');
+	eq([ rel_count, length(m._pt_unreleased) ], [ 3, 0 ], 'pt release: ...and settled once the modem acknowledges');
+
+	// given up after its tries, and said
+	rel_mode = 'fail';
+	opmode('low_power');
+	opmode('online');
+	opmode('low_power');
+	ok(length(filter(logs, (l) => index(l, 'giving it up') >= 0)) >= 1, 'pt release: given up after its tries, and logged');
+
+	// the burst of a dropped stack carries what is still owed
+	rel_mode = 'timeout';
+	m._pt_unreleased = [];
+	opmode('online');
+
+	let owed = m._pt_unreleased[0]?.cid;
+
+	rel_count = 0;
+	m.teardown();
+	ok(owed != null && length(filter(qmock.calls, (c) => c.name == 'RELEASE_CID' && c.args?.release?.cid == owed)) >= 2,
+	   'pt release: the teardown\'s release burst includes the owed CID');
+	eq(length(m._pt_unreleased), 0, 'pt release: ...and nothing is owed on a stack that is gone');
+}
+
+assert_pt_release_owed();
 
 // --- the attach cause comes from AT+CEER when MBIM has none ------------------
 //

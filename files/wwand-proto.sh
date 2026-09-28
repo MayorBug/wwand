@@ -375,9 +375,17 @@ proto_wwand_teardown() {
 		# interface would otherwise read as wwand's own block when the daemon
 		# comes back (daemon.uc operator_down). The daemon reads the names in
 		# this file by pattern, so an appended one is enough; its next up
-		# clears it.
+		# clears it. Under the daemon's lock (daemon.uc admin_locked): a
+		# daemon that is running but did not answer re-reads, merges and
+		# renames a new file over this one, and an append landing between
+		# its read and its rename went to the replaced file and was lost.
+		# busybox has flock on OpenWrt (CONFIG_BUSYBOX_DEFAULT_FLOCK=y); one
+		# without it appends unlocked, as before.
 		mkdir -p /tmp/wwand/state
-		echo "\"$interface\"" >> /tmp/wwand/state/admin_downs.json
+		(
+			command -v flock >/dev/null 2>&1 && flock -x 9
+			echo "\"$interface\"" >> /tmp/wwand/state/admin_downs.json
+		) 9>>/tmp/wwand/state/admin_downs.lock
 	}
 	# no link-down update here: netifd rejects notify_proto while in S_TEARDOWN
 	# and drops the link itself once this script exits

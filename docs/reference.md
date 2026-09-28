@@ -944,7 +944,8 @@ whole reload; a no-op reload bounced nothing.)*
 
 An `ifdown` is **recorded** (`/tmp/wwand/state/admin_downs.json`, by the
 daemon's `context_down`, or appended by the shim when the daemon cannot be
-reached) and stays in force across daemon restarts until the next `ifup` of
+reached, under a flock on `admin_downs.lock` that the daemon also holds while
+it rewrites the file) and stays in force across daemon restarts until the next `ifup` of
 that interface; a down wwand issued itself (a SIM block, a give-up) is not
 recorded and is undone when the modem registers again. The file is replaced
 whole on every change and trusted only when intact — an empty or damaged one,

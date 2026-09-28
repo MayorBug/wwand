@@ -792,4 +792,16 @@ revives every operator ifdown it held. The daemon replaces the file whole
 (`netlink.uc default_fx.write_atomic`: beside it, then `rename(2)`) and
 trusts it only when its own JSON array is at the head (`daemon.uc
 admin_record_complete`); anything else is read for its names and treated like
-the first start after an upgrade.
+the first start after an upgrade. Re-reading before the rewrite is not enough
+either: the shim's append can land between the daemon's read and its rename
+and go to the file the rename replaces, so both sides take a flock on
+`admin_downs.lock` (`daemon.uc admin_locked`, `files/wwand-proto.sh
+proto_wwand_teardown`).
+
+**"The radio is on again, the modem woke it."** On MBIM there are two radio
+switches, and they are independent: DMS SET_OPERATING_MODE over the QMI
+passthrough, and the Basic Connect Radio State. Undoing one leaves the other
+off. A DMS low power also outlives the modem object that set it — a daemon
+restart — so the object that wakes the radio does not necessarily know what
+parked it; `modem_mbim.uc set_opmode` wakes DMS too until this object has set
+it itself (`_dms_unknown`).

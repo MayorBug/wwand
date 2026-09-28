@@ -49,11 +49,43 @@ export function create(opts)
 
 	// default_fx.write_atomic: a whole-file replace, recorded under its own
 	// name so a test can tell it from an in-place write
+	// `before_rename(path)`: a test's hook between the temporary's write and
+	// the rename — where another process's append to `path` is lost
 	self.write_atomic = function(path, data) {
 		push(self.actions, sprintf('write_atomic %s %s', path, trim(data)));
+		self.before_rename?.(path);
 		self.files[path] = data;
 
 		return true;
+	};
+
+	// default_fx.lock: an exclusive lock per path. `when_unlocked(path, fn)`
+	// plays the other process — blocked while the lock is held, run at the
+	// release, the way flock(1) waits for it.
+	self.locks = {};
+	self.lock_waiters = {};
+
+	self.lock = function(path) {
+		self.locks[path] = true;
+
+		return () => {
+			delete self.locks[path];
+
+			let q = self.lock_waiters[path] ?? [];
+
+			self.lock_waiters[path] = [];
+
+			for (let fn in q)
+				fn();
+		};
+	};
+
+	self.when_unlocked = function(path, fn) {
+		if (!self.locks[path])
+			return fn();
+
+		self.lock_waiters[path] ??= [];
+		push(self.lock_waiters[path], fn);
 	};
 
 	self.link_del = function(name) {

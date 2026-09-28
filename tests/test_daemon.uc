@@ -8,7 +8,7 @@
 import { eq, ok, done } from './lib/check.uc';
 import * as uloop from 'uloop';
 import * as libubus from 'ubus';
-import { access, unlink } from 'fs';
+import { access, unlink, glob, readfile, writefile } from 'fs';
 import * as mockhub from './lib/mockhub.uc';
 import * as fakefx from './lib/fakefx.uc';
 import * as config from 'wwand/config.uc';
@@ -3351,6 +3351,28 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	   'shim append while the daemon runs: honoured at the next registration');
 	d.shutdown();
 
+	// ...AND ONE THAT LANDS BETWEEN THE DAEMON'S READ AND ITS RENAME: the
+	// append goes to the file the rename replaces. The shim appends under
+	// the lock the daemon holds across its read-merge-write, so it waits
+	// and lands after the rename.
+	fx.files[FILE] = '[]';
+	d = mk();
+	d.apply_config(cfg2);
+	fx.before_rename = (path) => {
+		if (path != FILE)
+			return;
+
+		fx.before_rename = null;
+		fx.when_unlocked(replace(FILE, /\.json$/, '') + '.lock',
+			() => fx.files[FILE] = (fx.files[FILE] ?? '') + '"wan2"\n');
+	};
+	d.contexts.wan.ctx.state = 'CONNECTED';
+	d.context_down('wan', () => null);
+	fx.before_rename = null;
+	ok(index(fx.files[FILE], '"wan"') >= 0 && index(fx.files[FILE], '"wan2"') >= 0,
+	   'shim append during the daemon\'s write: waits for the lock and is not lost');
+	d.shutdown();
+
 	// A RECORD IS TRUSTED ONLY WHOLE. Empty, torn, or the shim's appends
 	// alone: read for the names, but "nothing recorded" is not believed —
 	// trusted, it would revive every ifdown whose record went with the rest
@@ -3528,11 +3550,57 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	let fx = netlink_mod.default_fx(() => null);
 	let p = '/tmp/wwand-test-write-atomic.json';
 
-	ok(fx.write_atomic(p, '[ "wan" ]') && fx.read(p) == '[ "wan" ]' && !fx.exists(p + '.tmp'),
+	let leftovers = () => length(glob(p + '.tmp*') ?? []);
+
+	// what an earlier run (or a counter-proof of one) left behind
+	for (let f in (glob(p + '*') ?? []))
+		unlink(f);
+
+	ok(fx.write_atomic(p, '[ "wan" ]') && fx.read(p) == '[ "wan" ]' && !leftovers(),
 	   'write_atomic: replaces the file, no temporary left');
 	ok(fx.write_atomic(p, '[]') && fx.read(p) == '[]', 'write_atomic: ...again over an existing one');
 	ok(!fx.write_atomic('/nonexistent-dir/x.json', '[]'), 'write_atomic: false when it cannot write');
-	unlink(p);
+
+	// a write that fails half-way (a full tmpfs) leaves no temporary behind,
+	// and each write has a temporary of its own
+	let real = fx.write, tmps = [];
+
+	fx.write = (path, data) => { push(tmps, path); real(path, 'half'); return false; };
+	ok(!fx.write_atomic(p, '[ "x" ]') && fx.read(p) == '[]' && !leftovers(),
+	   'write_atomic: a failed write leaves the old file and no temporary');
+	fx.write_atomic(p, '[ "y" ]');
+	ok(length(tmps) == 2 && tmps[0] != tmps[1], 'write_atomic: each write has a temporary of its own');
+	fx.write = real;
+
+	for (let f in (glob(p + '*') ?? []))
+		unlink(f);
+
+	// THE SHIM'S APPEND AND THE DAEMON'S LOCK EXCLUDE EACH OTHER: the append
+	// block of the shim itself, run while default_fx holds the lock, waits
+	// until it is released — then lands
+	let dir = '/tmp/wwand-test-shimlock';
+	let shim = readfile('../files/wwand-proto.sh') ?? '';
+	let block = match(shim, /\n\t\t(\(\n[^\n]*\n[^\n]*admin_downs\.json\n\t\t\) 9>>\/tmp\/wwand\/state\/admin_downs\.lock)\n/);
+
+	ok(block != null, 'shim lock: the teardown appends inside a flock block');
+
+	if (block) {
+		system(sprintf('rm -rf %s; mkdir -p %s', dir, dir));
+
+		let sh = replace(replace(block[1], /\/tmp\/wwand\/state/g, dir), /\$interface/g, 'wanX');
+		writefile(dir + '/append.sh', sh + '\n');
+
+		let unlock = fx.lock(dir + '/admin_downs.lock');
+		let rc = system(sprintf('timeout 1 sh %s/append.sh', dir));
+
+		ok(unlock != null && rc != 0 && readfile(dir + '/admin_downs.json') == null,
+		   'shim lock: the shim\'s append waits while the daemon holds the lock');
+		unlock?.();
+		rc = system(sprintf('timeout 2 sh %s/append.sh', dir));
+		eq([ rc, readfile(dir + '/admin_downs.json') ], [ 0, '"wanX"\n' ],
+		   'shim lock: ...and lands once it is released');
+		system(sprintf('rm -rf %s', dir));
+	}
 })();
 
 // THE OPERATOR'S IFDOWN AROUND A BLOCK. After the shim blocked a setup

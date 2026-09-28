@@ -190,7 +190,7 @@ export function create(opts)
 	// AFTER the cancel pass. The new timer fires with self.dms already null
 	// (modem.uc:1656) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
 	// which in ucode is a throw inside a uloop callback: the daemon dies and procd
-	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1230), and
+	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1249), and
 	// every QMI site that re-arms tm.settle needs it too.
 	//
 	// `gen` is captured where the OPERATION begins, not read here — by the time a
@@ -503,7 +503,7 @@ export function create(opts)
 				// done() IS answered on the cancelled path. It is not only
 				// make_fail's internal continuation: the daemon passes a real
 				// caller's callback through note_connect_failure
-				// (daemon.uc:3714), and dropping it strands a ubus request.
+				// (daemon.uc:3736), and dropping it strands a ubus request.
 				// Restarting a torn-down modem is prevented where it belongs
 				// instead — make_fail now refuses a `cancelled` outright
 				// (modem_common.uc).

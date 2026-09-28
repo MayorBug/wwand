@@ -163,7 +163,7 @@ const ES10_NAMES = {
 	BF38: 'AuthenticateServer', BF21: 'PrepareDownload', BF36: 'LoadBoundProfilePackage',
 	BF41: 'CancelSession', BF2D: 'GetProfilesInfo', BF31: 'EnableProfile',
 	BF32: 'DisableProfile', BF33: 'DeleteProfile', BF3E: 'GetEID',
-	BF2B: 'RetrieveNotificationsList', BF30: 'RemoveNotificationFromList',
+	BF28: 'ListNotification', BF2B: 'RetrieveNotificationsList', BF30: 'RemoveNotificationFromList',
 	BF3C: 'GetEuiccConfiguredAddresses', BF3F: 'SetDefaultDpAddress', BF43: 'GetRAT',
 	BF51: 'LoadEuiccPackage', BF52: 'GetEimConfigurationData', BF55: 'GetEimConfigurationData',
 	BF57: 'AddInitialEim', BF58: 'ProfileRollback', BF4F: 'IpaEuiccData',

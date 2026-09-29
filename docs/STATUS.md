@@ -998,6 +998,15 @@ Fibocom FM350-GL, whose only band command `+GTACT` is not NV. What holds now:
 Not verified on hardware in this form: the awaited bring-up write and the
 `=?`-driven "all bands" (the codec is tested against the captures in #43).
 
+## The FM350 is asked whether it is ready before it is asked what it is (#45, 2026-09-30)
+
+NCM bring-up now polls ATI (1 s, at most 30 s: `ready_timeout`/`ready_poll`)
+before reading CGMI/CGMM. A modem still refusing after that is filled field by
+field from its last bring-up, then from its USB id (`ncm_vendors.USB_IDENTITY`:
+the FM350-GL's 0e8d:7126/7127), and a CGMM answering the manufacturer counts as
+no model. Host-tested (test_ncm s9zb-s9ze); not yet confirmed on the reporter's
+H29K.
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

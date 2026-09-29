@@ -1864,6 +1864,17 @@ const MODEL_VENDORS = [
 // pick the vendor recipe from the AT+CGMI manufacturer string, falling back to
 // the AT+CGMM model when the manufacturer is empty or unrecognised; generic
 // (match null) is skipped in the scan and returned last.
+// The identity of a device by its USB id, for a modem that refuses CGMI/CGMM
+// and has no earlier bring-up to carry the answer over from. Only ids this tree
+// has field evidence for: the FM350-GL's two compositions, whose AT interface
+// atcmd.uc LOCAL_PORTS already maps (mode 40 = 7126, mode 41 = 7127), with
+// the strings the module itself answers (`cgmi Fibocom Wireless Inc., cgmm
+// FM350-GL`, reporter log ddimension/wwand#45, 2026-09-29).
+export const USB_IDENTITY = {
+	'0e8d:7126': { manufacturer: 'Fibocom Wireless Inc.', model: 'FM350-GL' },
+	'0e8d:7127': { manufacturer: 'Fibocom Wireless Inc.', model: 'FM350-GL' },
+};
+
 export function vendor_for(manufacturer, model)
 {
 	let s = lc(manufacturer ?? '');

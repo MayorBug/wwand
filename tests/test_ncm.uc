@@ -119,6 +119,7 @@ function script(over)
 {
 	return [
 		...(over ?? []),
+		{ re: /^ATI$/,        lines: [ 'Quectel', 'RG650E-EU', 'Revision: RG650EM4G_01.001' ] },
 		{ re: /^AT\+CGMI$/,   lines: [ 'Quectel' ] },
 		{ re: /^AT\+CGMM$/,   lines: [ 'RG650E-EU' ] },
 		{ re: /^AT\+CGMR$/,   lines: [ 'RG650EM4G_01.001' ] },
@@ -167,16 +168,16 @@ function run_next()
 	};
 
 	modem = modem_ncm.create({
-		id: s.name, device: '/dev/cdc-wdm0',
+		id: s.name, device: s.device ?? '/dev/cdc-wdm0',
 		config: { tty: '/dev/ttyUSB2', stats_interval: 1, zero_rx_timeout: 0, ...(s.mconfig ?? {}) },
 		timing: { settle: 1, reg_timeout: 500, reg_poll: 5, backoff_min: 1, backoff_max: 5, at_drain: 1,
-		          ...(s.mtiming ?? {}) },
+		          ready_timeout: 50, ready_poll: 5, ...(s.mtiming ?? {}) },
 		datapath: s.datapath,
 		pinned_over: s.pinned_over,
 		known_ident: s.known_ident,
 		// inject the scripted tty; a re-opened tty is not closed (a scenario
 		// that restarts the modem re-opens the same mock and keeps its history)
-		at: { open_transport: () => { tr.closed = false; return tr; } },
+		at: { open_transport: () => { tr.closed = false; return tr; }, fx: s.atfx },
 		deps: {
 			log: () => null,
 			on_event: (m, event, data) => {
@@ -1257,6 +1258,7 @@ ok(modem_ncm.ensure_serial_bind(bfx4, 'usb0') === false, 'new_id: driver absent 
 push(scenarios, {
 	name: 's6_rg650e_cgact',
 	script: [
+		{ re: /^ATI$/,        lines: [ 'Quectel', 'RG650E-EU', 'Revision: RG650EM4G_01.001' ] },
 		{ re: /^AT\+CGMI$/,   lines: [ 'Quectel' ] },
 		{ re: /^AT\+CGMM$/,   lines: [ 'RG650E-EU' ] },
 		{ re: /^AT\+CGMR$/,   lines: [ 'RG650EM4G_01.001' ] },
@@ -1594,6 +1596,7 @@ function fscript(over)
 {
 	return [
 		...(over ?? []),
+		{ re: /^ATI$/, lines: [ 'Fibocom Wireless Inc.', 'FM350-GL' ] },
 		{ re: /^AT\+CGMI$/, lines: [ 'Fibocom Wireless Inc.' ] },
 		{ re: /^AT\+CGMM$/, lines: [ 'FM350-GL' ] },
 		{ re: /^AT\+CGMR$/, lines: [ 'FM350GL_04.02.10' ] },
@@ -2874,6 +2877,143 @@ push(scenarios, {
 		let aerr = 'unset';
 		m.apply_config_bands((e) => { aerr = e; });
 		eq(aerr, null, 's9za: the band step answers "later", not "no band command"');
+		env.finish();
+	},
+});
+
+// s9zb: the same refusal on the first bring-up after boot, nothing to carry
+// over — the USB id names the FM350 (ddimension/wwand#45: generic on every
+// boot with a new card, so no slot recipe and no band command)
+push(scenarios, {
+	name: 's9zb_fibocom_identity_from_usb',
+	device: 'wwan9',
+	atfx: fakefx.create({ files: {
+		'/sys/class/net/wwan9/device/../idVendor': '0e8d\n',
+		'/sys/class/net/wwan9/device/../idProduct': '7127\n',
+	} }),
+	script: fscript([
+		{ re: /^AT\+CGMI$/, term: 'ERROR', lines: [] },
+		{ re: /^AT\+CGMM$/, term: 'ERROR', lines: [] },
+	]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4v6' },
+	mconfig: { apn: 'internet' },
+	run: (env) => {
+		let m = env.modem;
+
+		eq(ncm_vendors.vendor_name(m.vendor), 'fibocom', 's9zb: the USB id makes it the FM350 it is');
+		eq([ m.info.manufacturer, m.info.model, m.info.ident_from_usb ],
+			[ 'Fibocom Wireless Inc.', 'FM350-GL', true ], 's9zb: ...and says where the identity came from');
+		ok(m.vendor.slots != null, 's9zb: with it the slot recipe the generic path lacks');
+		eq(m.bands_applicable(), true, 's9zb: and the band command');
+		env.finish();
+	},
+});
+
+// s9zc: CGMM answering the manufacturer is no model; the USB id fills it (#45
+// log 2026-09-30 01:10:23)
+push(scenarios, {
+	name: 's9zc_cgmm_answers_the_manufacturer',
+	device: 'wwan9',
+	atfx: fakefx.create({ files: {
+		'/sys/class/net/wwan9/device/../idVendor': '0e8d\n',
+		'/sys/class/net/wwan9/device/../idProduct': '7126\n',
+	} }),
+	script: fscript([
+		{ re: /^AT\+CGMM$/, lines: [ 'Fibocom Wireless Inc.' ] },
+	]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4v6' },
+	mconfig: { apn: 'internet' },
+	run: (env) => {
+		let m = env.modem;
+
+		eq([ m.info.manufacturer, m.info.model ], [ 'Fibocom Wireless Inc.', 'FM350-GL' ],
+			's9zc: the real CGMI kept, the model taken from the USB id');
+		eq(m.bands_applicable(), true, 's9zc: so the band command is there');
+		env.finish();
+	},
+});
+
+// s9zd: a remembered identity that has the model but no manufacturer (the
+// first bring-up got `cgmi -`) is still carried over (#45 log 01:05:16)
+push(scenarios, {
+	name: 's9zd_carry_over_model_only',
+	known_ident: { manufacturer: '', model: 'FM350-GL', imei: '350000000000000' },
+	script: fscript([
+		{ re: /^AT\+CGMI$/, term: 'ERROR', lines: [] },
+		{ re: /^AT\+CGMM$/, term: 'ERROR', lines: [] },
+	]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4v6' },
+	mconfig: { apn: 'internet' },
+	run: (env) => {
+		let m = env.modem;
+
+		eq(m.info.model, 'FM350-GL', 's9zd: the remembered model is carried over without a manufacturer');
+		eq(ncm_vendors.vendor_name(m.vendor), 'fibocom', 's9zd: ...and the recipe follows the model');
+		eq(m.info.ident_carried, true, 's9zd: marked as borrowed');
+		env.finish();
+	},
+});
+
+// s9ze: the ready gate — ATI refused twice (a modem still coming up), the
+// identity is asked only once ATI answers with content
+push(scenarios, {
+	name: 's9ze_ready_gate_waits_for_ati',
+	mtiming: { ready_timeout: 1000, ready_poll: 5 },
+	script: fscript([
+		{ re: /^ATI$/, nth: 3, lines: [ 'Fibocom Wireless Inc.', 'FM350-GL' ] },
+		{ re: /^ATI$/, term: 'ERROR', lines: [] },
+	]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4v6' },
+	mconfig: { apn: 'internet' },
+	run: (env) => {
+		eq(env.tr.count(/^ATI$/), 3, 's9ze: ATI is asked until it answers');
+		ok(env.tr.at_pos(/^AT\+CGMI$/) > env.tr.at_pos(/^ATI$/) + 1,
+			's9ze: the identity is read only after the ready answer');
+		eq(ncm_vendors.vendor_name(env.modem.vendor), 'fibocom', 's9ze: and the modem is what it is');
+		env.finish();
+	},
+});
+
+// s9zf: an ATI that answers OK and nothing, forever — the gate gives up at its
+// deadline and identifies anyway (review: attempts are not a deadline)
+push(scenarios, {
+	name: 's9zf_ready_gate_deadline',
+	mtiming: { ready_timeout: 80, ready_poll: 5 },
+	script: fscript([
+		{ re: /^ATI$/, lines: [] },
+	]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4v6' },
+	mconfig: { apn: 'internet' },
+	run: (env) => {
+		ok(env.tr.count(/^ATI$/) >= 2, 's9zf: ATI polled while it says nothing');
+		ok(env.tr.at_pos(/^AT\+CGMI$/) > 0, 's9zf: and the identity is read after the deadline');
+		eq(ncm_vendors.vendor_name(env.modem.vendor), 'fibocom', 's9zf: from the real answers');
+		env.finish();
+	},
+});
+
+// s9zg: a carried model from DIFFERENT hardware (IMEI mismatch) is dropped —
+// but only the carried field: the manufacturer the modem answered itself
+// stays, and the USB id fills the model (review)
+push(scenarios, {
+	name: 's9zg_imei_mismatch_drops_only_carried',
+	device: 'wwan9',
+	atfx: fakefx.create({ files: {
+		'/sys/class/net/wwan9/device/../idVendor': '0e8d\n',
+		'/sys/class/net/wwan9/device/../idProduct': '7127\n',
+	} }),
+	known_ident: { manufacturer: 'Other Corp', model: 'X-1', imei: '999999999999999' },
+	script: fscript([
+		{ re: /^AT\+CGMM$/, term: 'ERROR', lines: [] },
+	]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4v6' },
+	mconfig: { apn: 'internet' },
+	run: (env) => {
+		let m = env.modem;
+
+		eq(m.info.manufacturer, 'Fibocom Wireless Inc.', 's9zg: the answered manufacturer survives the mismatch');
+		eq(m.info.model, 'FM350-GL', 's9zg: the dropped carried model is filled from the USB id');
+		eq(m.info.ident_carried, null, 's9zg: nothing borrowed any more');
 		env.finish();
 	},
 });

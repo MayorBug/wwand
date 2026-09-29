@@ -63,6 +63,7 @@ let cg_h    = { re: /^AT\+CREG\?$/,   lines: [ '+CREG: 2,0' ] };
 function register_handlers()
 {
 	return [
+		{ re: /^ATI$/, lines: [ 'Fibocom Wireless Inc.', 'FM350-GL' ] },
 		{ re: /^AT\+CGMI$/, lines: [ 'Fibocom Wireless Inc.' ] },
 		{ re: /^AT\+CGMM$/, lines: [ 'FM350-GL' ] },
 		{ re: /^AT\+CGMR$/, lines: [ 'FM350GL_04.02.10' ] },
@@ -88,7 +89,8 @@ function make_modem(tr, deps)
 	return modem_ncm.create({
 		id: 'urc', device: '/dev/cdc-wdm0',
 		config: { tty: '/dev/ttyUSB2', zero_rx_timeout: 0 },
-		timing: { settle: 1, reg_timeout: 2000, reg_poll: 60000, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		timing: { settle: 1, reg_timeout: 2000, reg_poll: 60000, backoff_min: 1, backoff_max: 5, at_drain: 1,
+		          ready_timeout: 50, ready_poll: 5 },
 		at: { open_transport: () => tr },
 		deps: { log: () => null, on_event: deps.on_event, set_clock: deps.set_clock },
 	});

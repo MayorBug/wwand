@@ -805,3 +805,17 @@ restart — so the object that wakes the radio does not necessarily know what
 parked it; `modem_mbim.uc set_opmode` wakes DMS too until this object has set
 it itself (`_dms_unknown`), and an unheld init asks DMS once and switches a
 low power left by an earlier daemon online (`step_register`).
+
+### An AT port that opens is a modem that answers
+**Wrong.** After power-up, a re-enumeration or a slot switch the FM350-GL's AT
+port is open while the modem behind it is not ready: AT+CGMI and AT+CGMM answer
+ERROR, and sometimes CGMM answers with the manufacturer. An identity read at that
+moment made the modem `generic` for the whole session — no slot recipe, no band
+command — until it was deleted and re-added. wwand now asks ATI until it answers
+with content (at most 30 s, `ready_timeout`) before the identity, fills a missing
+part from the last bring-up or from the USB id, and treats a CGMM equal to CGMI
+as no model.
+
+*Evidence:* ddimension/wwand#45, reporter logs 2026-09-29/30 (`vendor recipe:
+generic — no manufacturer and model ?`, `cgmi -, cgmm FM350-GL`, `cgmm Fibocom
+Wireless Inc.`); #32 for the same refusal after a slot switch.

@@ -72,7 +72,8 @@ modem = modem_ncm.create({
 	id: 'm_lt300', device: null,                       // discovery: NCM has no control node
 	datapath: { netdev: 'usb0', fx: fx },
 	config: {},                                        // cfg.tty NOT pinned (boot race)
-	timing: { settle: 1, reg_timeout: 500, reg_poll: 5, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+	timing: { settle: 1, reg_timeout: 500, reg_poll: 5, backoff_min: 1, backoff_max: 5, at_drain: 1,
+	          ready_timeout: 50, ready_poll: 5 },
 	at: { fx: fx, open_transport: open_transport },
 	deps: {
 		log: () => null,

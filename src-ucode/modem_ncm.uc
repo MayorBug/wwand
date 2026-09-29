@@ -47,6 +47,10 @@ const TIMING_DEFAULTS = {
 	// enough that a modem which simply has no CGMI costs one second at
 	// bring-up (step_identify, ddimension/wwand#32).
 	ident_retry: 1000,
+	// how long to wait for the AT port to answer ATI with content before the
+	// identity is asked for (step_identify's ready gate), and how often to ask
+	ready_timeout: 30000,
+	ready_poll: 1000,
 };
 
 // The vendor model (PDP/auth builders, per-vendor dial tables + recipes,
@@ -185,18 +189,33 @@ const SERIAL_NEW_ID = {
 	// interface and crash-loop the card (forum-observed).
 };
 
+// The USB device of an anchor — a netdev name, or a /dev/cdc-wdmN node — as
+// { base, id: 'vid:pid' } (lowercase hex), or null when sysfs has no ids there.
+export function usb_id(fx, anchor)
+{
+	if (!anchor)
+		return null;
+
+	let base = (substr(anchor, 0, 5) == '/dev/')
+		? sprintf('/sys/class/usbmisc/%s/device/..', substr(anchor, rindex(anchor, '/') + 1))
+		: sprintf('/sys/class/net/%s/device/..', anchor);
+	let vid = lc(trim(fx.read(sprintf('%s/idVendor', base)) ?? ''));
+	let pid = lc(trim(fx.read(sprintf('%s/idProduct', base)) ?? ''));
+
+	return (vid != '' && pid != '') ? { base: base, id: sprintf('%s:%s', vid, pid) } : null;
+};
+
 // bind the vendor serial driver for a known composition (netdev anchors the USB
 // parent). Returns true when a new_id write was performed. No-op when the device
 // is unknown, ttys already exist, or the driver module is not loaded.
 export function ensure_serial_bind(fx, netdev)
 {
-	if (!netdev)
+	if (!netdev || substr(netdev, 0, 5) == '/dev/')
 		return false;
 
-	let base = sprintf('/sys/class/net/%s/device/..', netdev);
-	let vid = lc(trim(fx.read(sprintf('%s/idVendor', base)) ?? ''));
-	let pid = lc(trim(fx.read(sprintf('%s/idProduct', base)) ?? ''));
-	let drv = SERIAL_NEW_ID[sprintf('%s:%s', vid, pid)];
+	let u = usb_id(fx, netdev);
+	let base = u?.base;
+	let drv = SERIAL_NEW_ID[u?.id ?? ''];
 
 	if (!drv)
 		return false;
@@ -210,7 +229,7 @@ export function ensure_serial_bind(fx, netdev)
 	if (!fx.exists(node))
 		return false;
 
-	return fx.write(node, sprintf('%s %s\n', vid, pid)) == true;
+	return fx.write(node, sprintf('%s\n', replace(u.id, ':', ' '))) == true;
 };
 
 export function create(opts)
@@ -269,6 +288,8 @@ export function create(opts)
 	let retry_timer = null, reg_timer = null, reg_poll_timer = null, settle_timer = null;
 	let reenum_timer = null;   // slot-switch re-enumeration watchdog (step_simslot)
 	let ident_retry_timer = null;   // delayed CGMI/CGMM retry (step_identify)
+	let ready_timer = null;         // ATI poll before the identity (step_identify)
+	let ready_deadline_timer = null; // ...and its wall-clock limit
 	let poll_inflight = false;   // one register-poll chain at a time (URC fast-path coalescing)
 	let no_c5greg = false;       // modem answered ERROR to AT+C5GREG? — stop asking
 	// forward-declared: the URC handler below refreshes telemetry on a RAT
@@ -655,6 +676,9 @@ export function create(opts)
 		// attempts in a row while ttyUSB0-3 existed the whole time.
 		let anchor = self.device ?? opts.datapath?.netdev;
 
+		// for identify: the one identity a modem cannot withhold (see there)
+		self._usb_id = usb_id(bind_fx, anchor)?.id;
+
 		if (ensure_serial_bind(bind_fx, anchor))
 			log('notice', sprintf('registered vendor serial driver id for %s (usb-serial new_id)', anchor));
 
@@ -697,6 +721,9 @@ export function create(opts)
 		// set when the vendor recipe came from self.known_ident rather than
 		// from this modem's own answer; the IMEI read cross-checks it below.
 		let carried_ident = false;
+		// which fields the carry-over filled: an IMEI mismatch drops exactly
+		// those, never a field the modem answered itself
+		let carried_fields = [];
 
 		// The AT layer now routes interleaved URCs to on_urc, so a line
 		// arriving here is the command's own answer. It can still be MISSING:
@@ -776,7 +803,73 @@ export function create(opts)
 			done(err ? null : val);
 		}, o);
 
-		ask('AT+CGMI', (manuf) => {
+		// READY GATE. Right after power-up, a re-enumeration or a slot switch
+		// the AT port can be open while the modem behind it is not: the
+		// FM350-GL then refuses CGMI/CGMM (ddimension/wwand#32, #45) and the
+		// identity read decided `generic` for the whole session. Ask ATI until
+		// it answers with content, at most ready_timeout, and only then read
+		// the identity. A modem that stays silent is identified anyway — the
+		// carry-over and USB-id fallbacks below are for exactly that.
+		// A DEADLINE, not a count of attempts: a silent ATI waits out its
+		// send timeout before the next poll, and counting attempts turned
+		// "at most 30 s" into about 90.
+		let wait_ready = (go) => {
+			let attempts = 0, finished = false;
+			let poll;
+
+			let finish = (ready) => {
+				if (finished)
+					return;
+
+				finished = true;
+
+				for (let t in [ ready_timer, ready_deadline_timer ])
+					if (t)
+						t.cancel();
+
+				ready_timer = ready_deadline_timer = null;
+
+				if (!self.at || self.at != ident_at)
+					return;   // torn down while waiting
+
+				if (!ready)
+					log('notice', sprintf('AT port gave no ATI answer for %d s — identifying anyway',
+						int(self.timing.ready_timeout / 1000)));
+				else if (attempts > 1)
+					log('info', sprintf('AT port ready after %d ATI attempt(s)', attempts));
+
+				go();
+			};
+
+			poll = () => {
+				if (finished || !self.at || self.at != ident_at)
+					return;
+
+				attempts++;
+
+				self.at.send('ATI', (err, res) => {
+					if (finished || !self.at || self.at != ident_at)
+						return;
+
+					if (!err && length(filter(res?.lines ?? [], (l) => trim(l) != '')) > 0)
+						return finish(true);
+
+					ready_timer = uloop.timer(self.timing.ready_poll, () => {
+						ready_timer = null;
+						poll();
+					});
+				}, { timeout: 2000 });
+			};
+
+			ready_deadline_timer = uloop.timer(self.timing.ready_timeout, () => {
+				ready_deadline_timer = null;
+				finish(false);
+			});
+
+			poll();
+		};
+
+		wait_ready(() => ask('AT+CGMI', (manuf) => {
 			self.info.manufacturer = manuf;
 
 			ask('AT+CGMM', (model) => {
@@ -805,20 +898,68 @@ export function create(opts)
 				// when the modem in front of us refuses too, and any real answer
 				// always wins over it. The IMEI read further down cross-checks
 				// it and warns if the hardware turns out to be different.
-				if ((manuf ?? '') == '' && (model ?? '') == '' &&
-				    (self.known_ident?.manufacturer ?? '') != '') {
-					manuf = self.known_ident.manufacturer;
-					model = self.known_ident.model;
+				// A MODEL THAT IS THE MANUFACTURER IS NO MODEL. Right after a
+				// slot switch the FM350-GL answered AT+CGMM with "Fibocom
+				// Wireless Inc." (ddimension/wwand#45, reporter log 2026-09-30
+				// 01:10:23); taken as the model it matched no recipe with a
+				// band command. It counts as not answered, and is filled below.
+				if ((model ?? '') != '' && model == manuf) {
+					log('info', sprintf('AT+CGMM answered the manufacturer (%s) — not a model', model));
+					model = '';
+					self.info.model = model;
+				}
+
+				// Fill what is MISSING, one field at a time — a real answer is
+				// never replaced. The FM350 refuses CGMI and CGMM separately:
+				// one bring-up had the model and no manufacturer (#45 log
+				// 01:05:16, `cgmi -`), and a carry-over that insisted on a
+				// remembered manufacturer then never happened.
+				let fill = (src) => {
+					let took = [];
+
+					if ((manuf ?? '') == '' && (src?.manufacturer ?? '') != '') {
+						manuf = src.manufacturer;
+						push(took, 'manufacturer');
+					}
+
+					if ((model ?? '') == '' && (src?.model ?? '') != '') {
+						model = src.model;
+						push(took, 'model');
+					}
+
 					self.info.manufacturer = manuf;
 					self.info.model = model;
+					return took;
+				};
+
+				// first from the last bring-up of THIS modem (bound to its
+				// serial/IMEI/path; the IMEI read further down cross-checks it)
+				let took = fill(self.known_ident);
+
+				if (length(took)) {
+					carried_fields = [ ...took ];
 					carried_ident = true;
 					// borrowed, not read from this modem. detach_modem must not
 					// write it back as what THIS hardware said, or one carried
 					// guess becomes the remembered identity of the next object.
 					self.info.ident_carried = true;
 
-					log('notice', sprintf('identity refused (CGMI/CGMM) — carried over from the last bring-up of this modem: %s %s',
-						manuf, model ?? '?'));
+					log('notice', sprintf('identity refused (%s) — carried over from the last bring-up of this modem: %s %s',
+						join(', ', took), manuf ?? '?', model ?? '?'));
+				}
+
+				// then from the USB id — the hardware's, not an AT answer — for
+				// the first bring-up after boot, when there is nothing to carry
+				// (#45: `vendor recipe: generic` on a boot with a new card, so
+				// no slot recipe and no band command until the modem was
+				// re-added). Only ids ncm_vendors.USB_IDENTITY names.
+				took = fill(ncm_vendors.USB_IDENTITY[self._usb_id ?? '']);
+
+				if (length(took)) {
+					self.info.ident_from_usb = true;
+
+					log('notice', sprintf('identity refused (%s) — taken from the USB id %s: %s %s',
+						join(', ', took), self._usb_id, manuf ?? '?', model ?? '?'));
 				}
 
 				// resolve the recipe from manufacturer AND model: the model is
@@ -890,19 +1031,34 @@ export function create(opts)
 						// about it is not enough — running on another vendor's
 						// ip_config, dial, slot and URC recipe is worse than
 						// running on none. Put it back where it would have been
-						// without the carry-over: generic, and honest about it.
-						// Raised by review, 2026-09-19.
+						// without the carry-over: what the modem answered
+						// itself, the USB id for the rest, else generic.
 						if (carried_ident && (imei ?? '') != '' &&
 						    (self.known_ident?.imei ?? '') != '' &&
 						    imei != self.known_ident.imei) {
-							log('warn', sprintf('carried-over identity belongs to imei %s but this modem reports %s — dropping it, the recipe is generic until this modem identifies itself',
-								self.known_ident.imei, imei));
+							log('warn', sprintf('carried-over identity belongs to imei %s but this modem reports %s — dropping what was carried (%s)',
+								self.known_ident.imei, imei, join(', ', carried_fields)));
+
+							// only the carried fields: an answer the modem gave
+							// itself stays, and the USB id — the hardware's own —
+							// may still fill what was dropped
+							for (let f in carried_fields) {
+								if (f == 'manufacturer')
+									manuf = null;
+								else if (f == 'model')
+									model = null;
+							}
 
 							carried_ident = false;
-							self.info.manufacturer = null;
-							self.info.model = null;
+							carried_fields = [];
+							self.info.manufacturer = manuf;
+							self.info.model = model;
 							self.info.ident_carried = null;
-							self.vendor = vendor_for(null, null);
+
+							if (length(fill(ncm_vendors.USB_IDENTITY[self._usb_id ?? ''])))
+								self.info.ident_from_usb = true;
+
+							self.vendor = vendor_for(manuf, model);
 							// the vendor's service query may already have
 							// answered under the borrowed recipe; that reading
 							// describes a modem we are no longer claiming to be.
@@ -1059,7 +1215,7 @@ export function create(opts)
 					});
 				});
 			});
-		});
+		}));
 	};
 
 	// resolve the dial method ONCE per modem: try the vendor's ordered dials,
@@ -1127,7 +1283,7 @@ export function create(opts)
 		// down and re-enumerates it, so `self.at` can be null by the time the
 		// call lands. Reading `.send` off it throws inside a uloop callback,
 		// which does not fail the call: it takes the daemon with it. Field-seen
-		// at modem_ncm.uc:972, and only with `sim_slot` configured — that is
+		// at modem_ncm.uc:1137, and only with `sim_slot` configured — that is
 		// what makes step_simslot walk the second pass at all
 		// (ddimension/wwand#32).
 		if (!self.at)
@@ -1957,12 +2113,14 @@ export function create(opts)
 		self._teardown_depth = (self._teardown_depth ?? 0) + 1;
 
 		for (let t in [ retry_timer, reg_timer, reg_poll_timer, settle_timer, at_drain_timer,
-		                telemetry_timer, reenum_timer, ident_retry_timer ])
+		                telemetry_timer, reenum_timer, ident_retry_timer,
+		                ready_timer, ready_deadline_timer ])
 			if (t)
 				t.cancel();
 
 		retry_timer = reg_timer = reg_poll_timer = settle_timer = at_drain_timer = null;
 		telemetry_timer = reenum_timer = ident_retry_timer = null;
+		ready_timer = ready_deadline_timer = null;
 		telem_watch.stop();
 
 		modem_common.close_at(self);

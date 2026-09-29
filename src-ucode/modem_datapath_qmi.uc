@@ -20,8 +20,11 @@ import * as netlink from 'wwand.netlink';
 import * as wdamod from 'wwand.codec.schema.wda';
 
 // QMAP aggregation maxima offered to the modem in SET_DATA_FORMAT: downlink
-// datagrams per aggregate (matches the qmi_wwan/rmnet driver default) and the
-// uplink batch the host may send (the modem echoes what it actually honors).
+// datagrams per aggregate and the uplink batch the host may send (the modem
+// echoes what it actually honors). Neither driver has a downlink count to
+// match — qmi_wwan and rmnet (6.18.41) define none, and qmicli leaves the TLV
+// unset (qmicli-wda.c:38,564, libqmi 1.38.0) — so 32 is our offer, bounded in
+// practice by dl_max_size.
 const DL_MAX_DATAGRAMS = 32;
 const UL_MAX_DATAGRAMS = 11;
 
@@ -473,11 +476,14 @@ export function setup(self, dp, o, next)
 			// a datapath that declares [1] leaves [1], and the status page then
 			// still reads QMAP v1 with no explanation anywhere (reported from
 			// the field, 2026-09-06).
-			if (want && index(caps.qmap_versions, want) < 0)
+			rungs = filter(caps.qmap_versions, (v) => !want || v <= want);
+
+			// only when the pin changed nothing: a 2 or 3 does lower the
+			// ladder (to what is below it), which config.uc already reports
+			if (want && index(caps.qmap_versions, want) < 0 &&
+			    length(rungs) == length(caps.qmap_versions))
 				log('warn', sprintf('datapath %s declares QMAP %J — `option qmap_version %d` selects from that list and cannot add to it, so it has no effect here',
 					backend, caps.qmap_versions, want));
-
-			rungs = filter(caps.qmap_versions, (v) => !want || v <= want);
 
 			if (!length(rungs))
 				rungs = [ 1 ];

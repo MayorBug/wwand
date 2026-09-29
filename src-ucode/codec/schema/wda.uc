@@ -11,9 +11,8 @@ export const LLP_RAW_IP = 2;
 
 // QmiWdaDataAggregationProtocol — the full ladder, because taking the two we
 // use out of context is how the v5 value came to be wrong: it was 8, which is
-// QMAPv4. libqmi 1.38 (src/libqmi-glib/qmi-enums-wda.h) has QMAPV4 = 0x08 and
-// QMAPV5 = 0x09, and quectel-cm agrees from the other side — it sends 0x05 or
-// 0x09 and nothing in between (`if (qmap_version != 0x09) qmap_version = 0x05`).
+// QMAPv4. libqmi 1.38.0 has QMAP = 0x05, QMAPV4 = 0x08 and QMAPV5 = 0x09
+// (src/libqmi-glib/qmi-enums-wda.h:78-82).
 //
 // The old value has a field symptom on record: the RG650E "declining DAP 8
 // aggregation edge cases" and renegotiating plain QMAP was not a firmware
@@ -61,11 +60,14 @@ export default {
 				dl_max_datagrams: { t: 0x15, f: 'u32' },
 				dl_max_size:      { t: 0x16, f: 'u32' },
 				endpoint:         { t: 0x17, f: { type: 'u32', iface: 'u32' } },
-				// Three request TLVs libqmi 1.38 does not model — its input set
-				// is 0x10-0x17, 0x1B, 0x1C. They are no longer inferred from the
-				// WDA spec alone: 0x18/0x19/0x1A appear in two independent vendor
-				// IDL trees and in the message table of the RG650E in front of
-				// us, agreeing on ids and widths.
+				// Three request TLVs libqmi 1.38.0 does not model — its input
+				// set is 0x10-0x17, 0x1B, 0x1C (qmi-service-wda.json:43-98) —
+				// so libqmi cannot confirm them, and the vendor IDL trees and
+				// RG650E message table they were taken from are not in this
+				// tree and carry no version: UNVERIFIED. Its RESPONSE puts
+				// download minimum padding at 0x1A and flow control at 0x1B
+				// (qmi-service-wda.json:161-168), which is a reason to doubt,
+				// not confirm, the request ids below.
 				//
 				// `dl_min_padding` is the interesting one — it decides whether
 				// the modem pads downlink QMAP frames, which lands directly on

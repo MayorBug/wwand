@@ -9,7 +9,7 @@
 'use strict';
 
 import { fmt_plmn, fmt_sig, fmt_locks, reg_text, packet_service_text,
-	collectd_lines, collectd_interval, recovery_text, radio_text } from 'wwand.wwandctl_fmt';
+	collectd_lines, collectd_interval, recovery_text, radio_text, select_args } from 'wwand.wwandctl_fmt';
 
 import * as libubus from 'ubus';
 import * as fs from 'fs';
@@ -868,13 +868,12 @@ case 'select': {
 		printf('automatic network selection set\n');
 	}
 	else if (length(rest) == 2) {
-		// `select 310 030` and `select 310 30` are different operators, and the
-		// ubus policy takes mnc as an INTEGER — so the leading zero cannot cross
-		// that boundary on its own, and the CLI is the last place that still has
-		// the string the user typed.
-		call_ok('modem_set_network_selection',
-			{ modem: r.modem, mode: 'manual', mcc: rest[0], mnc: rest[1],
-			  mnc_digits: length(replace(rest[1], /[^0-9]/g, '')) });
+		let args = select_args(r.modem, rest[0], rest[1]);
+
+		if (!args)
+			die('usage: wwandctl select [modem] auto | <mcc> <mnc>  (3-digit MCC, 2- or 3-digit MNC)');
+
+		call_ok('modem_set_network_selection', args);
 		printf('manual selection %s/%s set\n', rest[0], rest[1]);
 	}
 	else {

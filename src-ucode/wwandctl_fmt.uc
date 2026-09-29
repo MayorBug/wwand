@@ -606,3 +606,19 @@ export function fmt_locks(locks)
 
 	return length(out) ? join(' · ', out) : null;
 };
+
+// `wwandctl select <mcc> <mnc>` -> the modem_set_network_selection args, or
+// null when either is not a number. The ubus policy declares mcc and mnc as
+// INTEGERS and ucode refuses an argument of another blob type outright
+// (lib/ubus.c:2377-2385, ucode 2026.07.09~b885dd0f) — the argv strings sent
+// as they are made every manual selection fail with "Invalid argument". The
+// width is taken from the string first: `310 030` and `310 30` are different
+// operators, and the integer no longer knows which one was typed.
+export function select_args(modem, mcc, mnc)
+{
+	if (!match(mcc ?? '', /^[0-9]{3}$/) || !match(mnc ?? '', /^[0-9]{2,3}$/))
+		return null;
+
+	return { modem: modem, mode: 'manual', mcc: +mcc, mnc: +mnc,
+	         mnc_digits: length(mnc) };
+};

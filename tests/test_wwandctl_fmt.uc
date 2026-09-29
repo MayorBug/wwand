@@ -480,4 +480,13 @@ eq(fmt.radio_text({ radio_held: 'rsim: lends its card to m1', plugins: [],
 	'ON although held — cannot hold this modem (no at channel); rsim: lends its card to m1',
 	'radio: a hold the modem cannot honour says the radio is on');
 
+// select: numbers for an INT32 policy, the width from the typed string
+eq(fmt.select_args('m0', '310', '030'),
+	{ modem: 'm0', mode: 'manual', mcc: 310, mnc: 30, mnc_digits: 3 },
+	'select: mcc/mnc go out as integers, 030 keeps its three digits');
+eq(fmt.select_args('m0', '262', '01')?.mnc_digits, 2, 'select: a two-digit MNC says so');
+eq(type(fmt.select_args('m0', '262', '01')?.mcc), 'int', 'select: not the argv string');
+eq(fmt.select_args('m0', '26x', '01'), null, 'select: a non-number is refused, not sent');
+eq(fmt.select_args('m0', '262', '1'), null, 'select: a one-digit MNC is no MNC');
+
 done('test_wwandctl_fmt');

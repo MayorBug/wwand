@@ -228,7 +228,7 @@ Radio State service (`codec/mbim_schema/quectel.uc`, mirroring `mbimcli
 Backend selection per modem: rmnet pass-through preferred (needs
 `kmod-rmnet`), qmimux via sysfs `add_mux` as fallback, plain raw-ip without
 muxing. Sequence preserved from years of field experience: link down →
-`raw_ip` (before `pass_through` — driver requirement) → MTU 1504 → create
+`raw_ip` (before `pass_through` — driver requirement) → MTU 1508 → create
 mux links → parent MTU = negotiated aggregation size + 4 → children up.
 rmnet links are created through the native helper including
 `IFLA_RMNET_FLAGS` (ingress deaggregation is mandatory; MAPv5 checksum

@@ -7,7 +7,7 @@
 
 import { eq, ok, done } from './lib/check.uc';
 import * as uloop from 'uloop';
-import { defer } from 'wwand/ubus.uc';
+import { defer, publish } from 'wwand/ubus.uc';
 
 uloop.init();
 
@@ -79,5 +79,29 @@ push(steps, (next) => {
 
 run_next();
 uloop.run();
+
+// Every method must declare ubus_rpc_session, and as a string. LuCI's calls
+// reach the object through uhttpd-mod-ubus, which adds the session id to the
+// arguments as a STRING (uhttpd ubus.c:564-579, 2026.06.16~7b1bec45), and
+// ucode's ubus module refuses any argument its policy does not name, or names
+// with another type (lib/ubus.c:2377-2385, ucode 2026.07.09~b885dd0f). A
+// method that lost the declaration answers INVALID_ARGUMENT, which LuCI's
+// legacy call format turns into an empty result — a silent `{}`, not an error.
+{
+	let table = null;
+	let fake_conn = { publish: (name, methods) => { table = methods; return {}; } };
+
+	publish(fake_conn, {}, null);
+
+	ok(table != null && length(keys(table)) > 0, 'publish: the method table was handed over');
+
+	let missing = [];
+
+	for (let name, m in (table ?? {}))
+		if (type(m?.args?.ubus_rpc_session) != 'string')
+			push(missing, name);
+
+	eq(missing, [], 'publish: every method accepts ubus_rpc_session as a string');
+}
 
 done('test_ubus');

@@ -43,7 +43,7 @@ is always user-triggered.
 | Huasifei WH3000 Pro (sponsor) | E3372H, NCM | `huawei_cdc_ncm` | connected, traffic — AT on the cdc-wdm control channel, IP via CGPADDR (CGCONTRDP/GTDNS absent on stick firmware 21.200), v6 via RA + dhcpv6 subinterface |
 | Huasifei WH3000 Pro (sponsor) | E182E, QMI (minimal 2011 stack) | `ethernet` | **E2E verified: CONNECTED + traffic on 2G** (sponsor SIM). No UIM/DSD/WDA; DMS fallback, GET_SIGNAL_STRENGTH signal, 802.3 kept with ARP on (the function is an L2 bridge into the GGSN segment — NOARP broke the traffic path, HW-proven) |
 
-Neither QMI modem accepts QMAP v4; both take v5 and fall back to v1 when asked
+Neither QMI modem accepts QMAP v4 (HW-observed, same runs as the table); both take v5 and fall back to v1 when asked
 for something they decline. The MBIM and NCM paths report no QMAP version at
 all, which is correct — QMAP is not on the wire there.
 

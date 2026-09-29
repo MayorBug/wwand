@@ -1473,8 +1473,12 @@ luci-app-statistics renders graphs from a per-plugin definition, and there is no
 
 ## ubus API
 
-Object `wwand`. Every method also accepts `ubus_rpc_session` (injected by rpcd
-when called from LuCI).
+Object `wwand`. Every method also accepts `ubus_rpc_session`: uhttpd-mod-ubus
+adds the session id to every call made from LuCI, as a string (uhttpd `ubus.c:564-579`,
+2026.06.16~7b1bec45; rpcd only answers the ACL question, `session.access`), and
+ucode's ubus module refuses an argument a method's policy does not declare
+(`lib/ubus.c:2377-2385`, ucode 2026.07.09~b885dd0f). `tests/test_ubus.uc` holds
+every method to it.
 
 | Method | Arguments | Description |
 |---|---|---|
@@ -2083,7 +2087,7 @@ extending a table, not branching the code — see
 | AT port discovery | fallback: `option tty` → board table → the `atport.uc` udev table (generated from ModemManager) → first-ttyUSB heuristic → an AT-bearing cdc-wdm (huawei_cdc_ncm) → AT over the MBIM pipe (Quectel QDU CID 8) | — |
 | Init AT commands | `MODEL_QUIRKS` (atcmd.uc): model pattern → commands run once before registration | EG06/EM06/RG50xQ → `AT+QMBNCFG="AutoSel",1` (carrier-config auto-select) |
 | QMAP aggregation size | `board_dgram_size`: DL datagram size per model, then per board, overridable via `dl_datagram_max_size` | RG650E-EU → 31 KB (else 4 KB default) |
-| QMAP DAP fallback | rmnet requests MAPv5 checksum offload, renegotiates plain QMAP when the modem declines aggregation | RG650E declines DAP 8 edge cases |
+| QMAP version ladder | rmnet offers QMAP v5 (DAP 9), then v4 (DAP 8), then v1 (DAP 5) and takes the first the modem echoes exactly; `option qmap_version` caps the ladder | — |
 | eSIM host access | `esim_quirks`: some firmwares must have the internal LPA's `lpa_enable` disabled (one-time NV reset) so host-side ES10 APDUs work | RG65xx |
 | Identity read | UIM raw EF read → DMS getter fallback | EG06 rejects EF reads → IMSI/ICCID via DMS |
 | PIN unlock | UIM `VERIFY_PIN` → DMS fallback, with retry guards | — |

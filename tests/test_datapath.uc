@@ -92,13 +92,13 @@ let i_pt = fx.action_index('write /sys/class/net/wwan0/qmi/pass_through Y');
 ok(i_rawip > 0 && i_pt > i_rawip, 'rmnet: raw_ip before pass_through');
 ok(fx.action_index('write /sys/class/net/wwan0/qmi/rx_urb_size 4100') > 0, 'rmnet: urb size written');
 
-let i_mtu1504 = fx.action_index('mtu 1504');
+let i_mtu1504 = fx.action_index('mtu 1508');
 let i_add1 = fx.action_index('link_add_rmnet wwan0m1 link wwan0 mux_id 1 flags 0x1');
 let i_add2 = fx.action_index('link_add_rmnet wwan0m2 link wwan0 mux_id 2 flags 0x1');
 let i_mtu_urb = fx.action_index('link_set wwan0 mtu 4100');
 let i_up = fx.action_index('link_set wwan0 up');
 
-ok(i_mtu1504 >= 0 && i_add1 > i_mtu1504 && i_add2 > i_add1, 'rmnet: 1504 before link add');
+ok(i_mtu1504 >= 0 && i_add1 > i_mtu1504 && i_add2 > i_add1, 'rmnet: 1508 (child + MAP v4 headroom) before link add');
 ok(i_mtu_urb > i_add2, 'rmnet: parent mtu urb after links');
 ok(i_up > i_mtu_urb, 'rmnet: up last');
 ok(fx.action_index('link_set wwan0m1 mtu 1500') > i_up, 'rmnet: child default mtu 1500');
@@ -229,6 +229,17 @@ ok(fx.action_index('write /sys/class/net/wwan0/link_state 1') >= 0, 'agg: link_s
 ok(fx.action_index('write /sys/class/net/wwan0/link_state 2') >= 0, 'agg: link_state enables mux 2');
 ok(fx.action_index('rmnet_tx_aggr wwan0m1 bytes 8192 frames 11 usecs 800') >= 0,
 	'agg: uplink aggregation configured from negotiated maxima');
+
+// the host limit, not the modem's: rmnet refuses more than 64 frames or
+// 32768 bytes (rmnet_vnd.c:247-251, 6.18.41) and aggregation then stays off
+fx = fakefx.create({ present: caps_rmnet });
+netlink.setup(fx, {
+	netdev: 'wwan0', backend: 'rmnet', v5: true,
+	mux: [ { id: 1, name: 'wwan0m1' } ], dgram_size: 4096,
+	ul_agg: { count: 100, size: 65536 },
+});
+ok(fx.action_index('rmnet_tx_aggr wwan0m1 bytes 32768 frames 64 usecs 800') >= 0,
+	'agg: a modem limit above the kernel\'s is clamped, not refused');
 
 // no link_state node + aggregation count<=1 -> neither poke happens
 fx = fakefx.create({ present: caps_rmnet });

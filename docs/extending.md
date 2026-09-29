@@ -345,8 +345,9 @@ capability:
    },
    ```
 
-   Every method callable from LuCI must accept `ubus_rpc_session: ''` (rpcd
-   injects it).
+   Every method callable from LuCI must accept `ubus_rpc_session: ''`
+   (uhttpd-mod-ubus adds it to every LuCI call, and ucode's ubus module refuses
+   an argument the policy does not declare — see reference.md, ubus API).
 3. **ACL** — grant read/write in the LuCI ACL JSON (`luci-app-wwand` /
    `luci-proto-wwand` `root/usr/share/rpcd/acl.d/*.json`).
 4. **Test** — assert it end-to-end in `test_daemon` (real ubusd) or against the

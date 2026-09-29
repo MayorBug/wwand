@@ -177,7 +177,8 @@ be decided by load order; `_wwand_apply_settings` builds the netifd update).
   unanchored claim cannot be re-verified, only believed, and it decays silently
   when the dependency moves. This applies to code comments as much as to docs.
 - **LuCI ubus**: every ucode ubus method called from LuCI must accept
-  `ubus_rpc_session: ''` in its args (rpcd injects it).
+  `ubus_rpc_session: ''` in its args (uhttpd-mod-ubus adds it to every LuCI
+  call, and ucode refuses an undeclared argument; `test_ubus` checks it).
 - **Packaging is checkable, not just documented**: `tools/check-packaging.py`
   asserts that every `.uc` is installed by exactly one package, that nothing
   named is missing, and that every `files/…` path resolves — against the working

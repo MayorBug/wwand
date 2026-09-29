@@ -12,7 +12,7 @@
 // - dl-datagram-max-size from a per-board quirk table (4K default,
 //   31K on zyxel lte3301-plus / nr7101), overridable via config
 // - rx_urb_size = dl_datagram_max_size + 4 (QMAP header) when muxing
-// - parent MTU 1504 while creating rmnet links, then parent MTU = urb size
+// - parent MTU 1508 while creating rmnet links, then parent MTU = urb size
 // - mux child MTU: configured value if > 576, else 1500
 // - link down before changing driver format / urb size, up afterwards
 
@@ -805,12 +805,20 @@ function child_mtu(mtu, fx, what)
 // Returns { ok, urb_size, mux_devs: [ 'wwan0m1', ... ], error? }
 // rmnet backend: one rmnet child per mux entry, tolerating pre-existing links
 // on a daemon restart. Fills mux_mtus, returns the created child dev names.
-// (preserved MTU dance: 1504 while adding links, then the urb size on the parent)
+// (preserved MTU dance: 1508 while adding links, then the urb size on the parent)
 function setup_rmnet_links(fx, netdev, mux, qmap_version, urb_size, mux_mtus, child_name)
 {
 	let mux_devs = [];
 
-	link_op(fx, 'rmnet mtu', netdev, { mtu: 1504 });
+	// A 1500-byte child plus the largest rmnet headroom: the 4-byte MAP header,
+	// and 4 more for the uplink checksum header under MAP v4
+	// (rmnet_vnd_headroom, rmnet_vnd.c:64-73, 6.18.41). The kernel refuses a
+	// parent MTU below child + headroom (NETDEV_CHANGEMTU -> NOTIFY_BAD,
+	// rmnet_config.c:265-267, rmnet_vnd.c:368-386) and measures the headroom
+	// from the flags the port holds NOW — on a restart the previous run's, not
+	// the ones about to be applied — so the step must fit v4 whatever the new
+	// version is. 1504 did not, and adopted v4 children made it fail.
+	link_op(fx, 'rmnet mtu', netdev, { mtu: 1508 });
 
 	// deaggregation is mandatory (multi-packet QMAP frames); v4/v5 add the
 	// checksum offload WDA negotiated, each with its own flag pair
@@ -1649,10 +1657,18 @@ export function setup(fx, opts)
 	// real_dev port, so configuring any one child updates it.
 	if (impl?.tx_aggr && fx.rmnet_tx_aggr &&
 	    opts.ul_agg && (opts.ul_agg.count ?? 0) > 1 && (opts.ul_agg.size ?? 0) > 0) {
+		// The kernel refuses frames outside 1..64 and more than 32768 bytes
+		// with EINVAL (rmnet_vnd.c:247-251, 6.18.41) — and then aggregation
+		// stays off. The modem echoes its own limits, and dl_datagram_max_size
+		// is overridable, so either can be larger; the host limit is what
+		// the host can do, whatever the modem would accept.
+		let count = (opts.ul_agg.count > 64) ? 64 : opts.ul_agg.count;
+		let size = (opts.ul_agg.size > 32768) ? 32768 : opts.ul_agg.size;
+
 		for (let child in mux_devs) {
-			if (fx.rmnet_tx_aggr(child, opts.ul_agg.size, opts.ul_agg.count, 800))
+			if (fx.rmnet_tx_aggr(child, size, count, 800))
 				fx.log('notice', sprintf('%s: uplink aggregation on (%d frames / %d bytes)',
-					child, opts.ul_agg.count, opts.ul_agg.size));
+					child, count, size));
 			else
 				fx.log('info', sprintf('%s: uplink aggregation unavailable, kernel default kept%s',
 					child, fx.last_error ? sprintf(': %s', fx.last_error) : ''));

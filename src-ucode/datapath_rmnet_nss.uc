@@ -289,8 +289,8 @@ return {
 		if (info) {
 			out.driver_reported = true;
 			// `driver_qmap_version`, NOT `qmap_version`. The two numbers are in
-			// different vocabularies: the datapath's own `qmap_version` is 4 or
-			// 5 (QMAP v4 / v5), while the driver's field is the libqmi data-
+			// different vocabularies: the datapath's own `qmap_version` is 1, 4
+			// or 5 (QMAP v1 / v4 / v5), while the driver's field is the libqmi data-
 			// aggregation-protocol enum, where 5 is QMAP v1 and 9 is QMAP v5
 			// (mhi_netdev_quectel.c: `u32 qmap_version; // 5 ~ QMAP V1, 9 ~
 			// QMAP V5`). Under one name the same reply showed "5" at the top

@@ -47,14 +47,13 @@ inherits the previous run's format, and why correcting one child corrects them
 all.
 
 ### `DAP_QMAPV5` is 8
-**Wrong, and it was wrong in this tree for months.** libqmi 1.38 has
-`QMAPV4 = 0x08` and `QMAPV5 = 0x09`; quectel-cm only ever sends `0x05` or `0x09`.
-Asking for 8 got declined by every modem here, and the fallback to plain QMAP
-looked like a firmware quirk — the note in this repo blamed the RG650E for years.
-It was our bug.
+**Wrong.** libqmi 1.38.0 has `QMAPV4 = 0x08` and `QMAPV5 = 0x09`. With 8 as
+"v5" every v5 request asked for QMAP v4; the RG650E declined it, and the
+fallback to plain QMAP was written down as a firmware quirk of that modem. It was
+our bug.
 
-*Evidence:* `src/libqmi-glib/qmi-enums-wda.h`; the ladder in
-`codec/schema/wda.uc` now spells all of v1..v5 so 5-means-v1 cannot be misread
+*Evidence:* `src/libqmi-glib/qmi-enums-wda.h:78-82` (libqmi 1.38.0); the ladder
+in `codec/schema/wda.uc` now spells all of v1..v5 so 5-means-v1 cannot be misread
 again.
 
 ### A modem that ACKs SET_DATA_FORMAT has changed format

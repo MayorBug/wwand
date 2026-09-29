@@ -18,8 +18,21 @@
 # implementation the code is verified against is the "standard", with its
 # version: that is the rule in CLAUDE.md ("QMI schemas must match libqmi").
 
-# No check recorded yet. The first one gets id R1.
-reviews = []
+[[reviews]]
+id = "R1"
+date = "2026-09-29"
+kind = "reference read next to the code (libqmi 1.38.0 WDA json/enums, linux 6.18.41 rmnet)"
+by = "Claude (audit agent), findings verified and fixed by Claude"
+reviewed = "wwand c5ea7d0"
+fixed = "wwand de04662"
+
+[[reviews]]
+id = "R2"
+date = "2026-09-29"
+kind = "reference read next to the code (uhttpd 2026.06.16~7b1bec45, rpcd 2026.07.19~e37ed9d8, ucode 2026.07.09~b885dd0f, luci-base rpc.js 4b6dda1a); every LuCI call site and ACL"
+by = "Claude (audit agent), findings verified and fixed by Claude"
+reviewed = "wwand c5ea7d0, luci-app-wwand 5064320"
+fixed = "wwand de04662, luci-app-wwand ff40b7c"
 
 [[component]]
 name = "QMI codec and service schemas"
@@ -189,7 +202,7 @@ code = "src-ucode/codec/schema/rat.uc, codec/arfcn_bands.uc"
 
 [[component]]
 name = "Datapath: QMAP and rmnet"
-code = "src-ucode/{netlink,datapath_rmnet_nss,datapath_rmnet_nss_mhi}.uc, io/src/wwand-io.c"
+code = "src-ucode/{netlink,modem_datapath_qmi,datapath_rmnet_nss,datapath_rmnet_nss_mhi}.uc, codec/schema/wda.uc, io/src/wwand-io.c"
   [[component.standard]]
   name = "Linux rmnet / qmi_wwan / cdc_mbim drivers"
   basis = "linux 6.18.41 (drivers/net/ethernet/qualcomm/rmnet, drivers/net/usb)"
@@ -201,7 +214,9 @@ code = "src-ucode/{netlink,datapath_rmnet_nss,datapath_rmnet_nss_mhi}.uc, io/src
   basis = "libqmi 1.38.0 (WDA data aggregation protocol enums)"
   sections = "DAP ids, aggregation limits"
     [[component.standard.review]]
-    review = "tbd"
+    review = "R1"
+    result = "ids, TLVs, widths and enums match; DAP -> rmnet flags right; UL aggregation limits now clamped to the kernel's, parent MTU step fits MAP v4"
+    open = "request TLVs 0x18-0x1A unverified (not modelled by libqmi, not sent); QMAP v4 not HW-proven (both QMI modems decline it)"
 
 [[component]]
 name = "netifd integration"
@@ -238,7 +253,9 @@ name = "ubus / LuCI interface"
 code = "src-ucode/ubus.uc, wwandctl.uc"
   [[component.standard]]
   name = "OpenWrt rpcd / ubus conventions"
-  basis = "rpcd (ubus_rpc_session injection)"
+  basis = "uhttpd-mod-ubus (ubus_rpc_session injection), rpcd session.access (ACL), ucode lib/ubus.c (argument policy)"
   sections = "every LuCI-called method accepts ubus_rpc_session"
     [[component.standard.review]]
-    review = "tbd"
+    review = "R2"
+    result = "all 49 methods declare it as a string (now a test); every LuCI call granted, every grant exists; wwandctl select and the LuCI MNC width fixed"
+    open = ""

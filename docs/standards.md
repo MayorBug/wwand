@@ -7,7 +7,10 @@ A **check** means the standard's text was read next to the code. *Basis* is what
 
 ## Check log
 
-No check recorded yet.
+| ID | Date | Kind | By | Checked | Fixed in |
+|---|---|---|---|---|---|
+| <a id="r1"></a>R1 | 2026-09-29 | reference read next to the code (libqmi 1.38.0 WDA json/enums, linux 6.18.41 rmnet) | Claude (audit agent), findings verified and fixed by Claude | `wwand c5ea7d0` | `wwand de04662` |
+| <a id="r2"></a>R2 | 2026-09-29 | reference read next to the code (uhttpd 2026.06.16~7b1bec45, rpcd 2026.07.19~e37ed9d8, ucode 2026.07.09~b885dd0f, luci-base rpc.js 4b6dda1a); every LuCI call site and ACL | Claude (audit agent), findings verified and fixed by Claude | `wwand c5ea7d0, luci-app-wwand 5064320` | `wwand de04662, luci-app-wwand ff40b7c` |
 
 ## Components
 
@@ -55,8 +58,8 @@ No check recorded yet.
 <tr><td rowspan="1"><b>Radio vocabulary and bands</b><br><code>src-ucode/codec/schema/rat.uc, codec/arfcn_bands.uc</code></td><td rowspan="1">3GPP TS 36.101 / TS 38.101-1/-2 (bands, EARFCN, NR-ARFCN)</td><td rowspan="1"></td><td rowspan="1">operating band tables, ARFCN ranges</td><td>tbd</td><td></td><td></td></tr>
 </tbody>
 <tbody>
-<tr><td rowspan="2"><b>Datapath: QMAP and rmnet</b><br><code>src-ucode/{netlink,datapath_rmnet_nss,datapath_rmnet_nss_mhi}.uc, io/src/wwand-io.c</code></td><td rowspan="1">Linux rmnet / qmi_wwan / cdc_mbim drivers</td><td rowspan="1">linux 6.18.41 (drivers/net/ethernet/qualcomm/rmnet, drivers/net/usb)</td><td rowspan="1">IFLA_RMNET_* flags (masked apply), mux ids, raw-ip, rx_urb_size</td><td>tbd</td><td></td><td></td></tr>
-<tr><td rowspan="1">QMAP v1/v4/v5 data aggregation, as documented by libqmi</td><td rowspan="1">libqmi 1.38.0 (WDA data aggregation protocol enums)</td><td rowspan="1">DAP ids, aggregation limits</td><td>tbd</td><td></td><td></td></tr>
+<tr><td rowspan="2"><b>Datapath: QMAP and rmnet</b><br><code>src-ucode/{netlink,modem_datapath_qmi,datapath_rmnet_nss,datapath_rmnet_nss_mhi}.uc, codec/schema/wda.uc, io/src/wwand-io.c</code></td><td rowspan="1">Linux rmnet / qmi_wwan / cdc_mbim drivers</td><td rowspan="1">linux 6.18.41 (drivers/net/ethernet/qualcomm/rmnet, drivers/net/usb)</td><td rowspan="1">IFLA_RMNET_* flags (masked apply), mux ids, raw-ip, rx_urb_size</td><td>tbd</td><td></td><td></td></tr>
+<tr><td rowspan="1">QMAP v1/v4/v5 data aggregation, as documented by libqmi</td><td rowspan="1">libqmi 1.38.0 (WDA data aggregation protocol enums)</td><td rowspan="1">DAP ids, aggregation limits</td><td><a href="#r1">R1</a> 2026-09-29</td><td>ids, TLVs, widths and enums match; DAP -&gt; rmnet flags right; UL aggregation limits now clamped to the kernel's, parent MTU step fits MAP v4</td><td>request TLVs 0x18-0x1A unverified (not modelled by libqmi, not sent); QMAP v4 not HW-proven (both QMI modems decline it)</td></tr>
 </tbody>
 <tbody>
 <tr><td rowspan="1"><b>netifd integration</b><br><code>files/wwand-proto.sh, src-ucode/{daemon,reconnect,deps,ctx_settings}.uc</code></td><td rowspan="1">OpenWrt netifd proto handler contract</td><td rowspan="1">netifd 2026.07.08~6088f7b3 (proto-ext.c, interface.c, netifd-proto.sh)</td><td rowspan="1">no_proto_task, proto_notify_error, proto_block_restart, autostart, renew</td><td>tbd</td><td></td><td></td></tr>
@@ -68,6 +71,6 @@ No check recorded yet.
 <tr><td rowspan="1"><b>GNSS</b><br><code>src-ucode/{gps,nmea}.uc, codec/schema/loc.uc</code></td><td rowspan="1">NMEA 0183</td><td rowspan="1"></td><td rowspan="1">GGA, RMC, GSA, GSV; talker ids; checksum</td><td>tbd</td><td></td><td></td></tr>
 </tbody>
 <tbody>
-<tr><td rowspan="1"><b>ubus / LuCI interface</b><br><code>src-ucode/ubus.uc, wwandctl.uc</code></td><td rowspan="1">OpenWrt rpcd / ubus conventions</td><td rowspan="1">rpcd (ubus_rpc_session injection)</td><td rowspan="1">every LuCI-called method accepts ubus_rpc_session</td><td>tbd</td><td></td><td></td></tr>
+<tr><td rowspan="1"><b>ubus / LuCI interface</b><br><code>src-ucode/ubus.uc, wwandctl.uc</code></td><td rowspan="1">OpenWrt rpcd / ubus conventions</td><td rowspan="1">uhttpd-mod-ubus (ubus_rpc_session injection), rpcd session.access (ACL), ucode lib/ubus.c (argument policy)</td><td rowspan="1">every LuCI-called method accepts ubus_rpc_session</td><td><a href="#r2">R2</a> 2026-09-29</td><td>all 49 methods declare it as a string (now a test); every LuCI call granted, every grant exists; wwandctl select and the LuCI MNC width fixed</td><td></td></tr>
 </tbody>
 </table>

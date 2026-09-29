@@ -1895,7 +1895,11 @@ answer after the upgrade re-arms it.
   armed, and on a modem without its own `reset_gpio`), plus
   `recovery.unarmed_reset_in` — seconds until the pulse is due while it is
   still pending — and `recovery.unarmed_reset_off: 'no_reset_gpio' | 'disabled'`
-  saying why there is none. The clock is monotonic (an NTP step after boot
+  saying why there is none. With `no_reset_gpio`, `recovery.board_reset_gpio`
+  names the board's own reset line when there is one an explicit reset would
+  take: the automatic pulse does not use it (on a box with a second modem it
+  could be that one's), so setting the modem's `reset_gpio` to it is how the
+  pulse is enabled. The clock is monotonic (an NTP step after boot
   neither fires nor postpones it), and it also runs on a control channel that
   produces only protocol errors and never completes an attempt.
 - **Status LEDs** — driven from the modem's registration + signal: a **5-bar

@@ -799,7 +799,19 @@ rd.shutdown();
 		'recovery view: the board default line does not make the unarmed pulse available');
 	eq(sd.status().modems.m0.recovery.unarmed_reset_off, 'no_reset_gpio',
 		'recovery view: ...and names the missing per-modem line as the reason');
+	eq(sd.status().modems.m0.recovery.board_reset_gpio, 'gpio900',
+		'recovery view: ...and the board line it deliberately does not take (#40)');
+	sd.modems.m0.cfg = { reset_gpio: '' };
+	eq(sd.status().modems.m0.recovery.board_reset_gpio, null,
+		'recovery view: an empty reset_gpio names no board line — an explicit reset would not take it either');
+	sd.modems.m0.cfg = {};
+	sd.modems.m1 = sd.modems.m0;
+	eq(sd.status().modems.m0.recovery.board_reset_gpio, null,
+		'recovery view: with a second modem the board line is not this one\'s to name');
+	delete sd.modems.m1;
 	sd.modems.m0.cfg = { reset_gpio: 'gpio515', unarmed_reset_after: 300 };
+	eq(sd.status().modems.m0.recovery.board_reset_gpio, null,
+		'recovery view: no board line to explain once the modem has its own');
 	sd.modems.m0.modem.counters.outage_since = clock(true)[0] - 100;
 	let ur = sd.status().modems.m0.recovery;
 	eq(ur.unarmed_reset, 'available', 'recovery view: with its own line the pulse is pending');

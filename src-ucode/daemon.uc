@@ -3865,6 +3865,15 @@ export function create(opts)
 				unarmed_reset_off: c.proto_ok ? null
 					: !entry.cfg?.reset_gpio ? 'no_reset_gpio'
 					: (+(entry.cfg?.unarmed_reset_after ?? 300) <= 0) ? 'disabled' : null,
+				// with 'no_reset_gpio': the board's own reset line, if it has
+				// one. The pulse deliberately does not take it — on a box with
+				// a second modem it may be that one's — and "no reset GPIO"
+				// alone read as "this board has none" to an NR7101 owner whose
+				// explicit resets pulse exactly that line (#40). Through the
+				// modem's own config, so it names exactly the line an explicit
+				// reset would take: none for `reset_gpio ''`, none on a box
+				// with more than one modem (board_gpio_ok).
+				board_reset_gpio: (!c.proto_ok && !entry.cfg?.reset_gpio) ? board_reset_line(entry.cfg) : null,
 				// seconds until that pulse is due (0 = on the next failed
 				// attempt), null when it is not pending — the ladder counts time
 				// since the outage began, so attempts cannot answer "when"

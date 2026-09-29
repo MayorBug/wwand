@@ -304,6 +304,8 @@ export function recovery_text(r)
 			? ' · reset-line pulse already used this outage'
 			: (r.unarmed_reset_off == 'disabled')
 				? ' · nothing physical until the control channel answers (unarmed_reset_after 0)'
+				: (r.unarmed_reset_off == 'no_reset_gpio' && r.board_reset_gpio)
+					? sprintf(' · nothing physical until the control channel answers (the board\'s reset line %s is used only by an explicit reset; set reset_gpio on this modem for the automatic pulse)', r.board_reset_gpio)
 				: (r.unarmed_reset_off == 'no_reset_gpio')
 					? ' · nothing physical until the control channel answers (no reset_gpio assigned to this modem)'
 					: ' · nothing physical until the control channel answers';

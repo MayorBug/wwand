@@ -450,6 +450,10 @@ eq(fmt.reg_text({ state: 'READY', rat: 'LTE',
 	                       unarmed_reset_off: 'no_reset_gpio' }),
 	   'NOT armed (never answered in this protocol) · 1 failed attempt · nothing physical until the control channel answers (no reset_gpio assigned to this modem)',
 	   'recovery: without a reset line, that nothing will happen on its own');
+	eq(fmt.recovery_text({ armed: false, attempts: 1, rungs: rungs, unarmed_reset: null,
+	                       unarmed_reset_off: 'no_reset_gpio', board_reset_gpio: 'gpio515' }),
+	   'NOT armed (never answered in this protocol) · 1 failed attempt · nothing physical until the control channel answers (the board\'s reset line gpio515 is used only by an explicit reset; set reset_gpio on this modem for the automatic pulse)',
+	   'recovery: a board line the pulse does not take is named, with what enables it (#40)');
 	eq(fmt.recovery_text({ armed: false, attempts: 30, rungs: rungs, unarmed_reset: 'available',
 	                       unarmed_reset_in: 0 }),
 	   'NOT armed (never answered in this protocol) · 30 failed attempts · reset-line pulse on the next failed attempt',

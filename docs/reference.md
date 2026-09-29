@@ -518,7 +518,10 @@ A QMI or MBIM modem keeps its bands in its own NV (the settings editor writes
 them with a permanent change duration), so these options are not applied there,
 nor on any other NCM modem: set the bands in *Modem Tools* instead. A list
 configured on such a modem is reported in `status` as a `band_lists` config
-warning, as is a list the FM350 could not take (see the tuple rule below).
+warning, as is a list the FM350 could not take (see the tuple rule below). An
+NCM modem that has not identified itself yet — the FM350 refuses `AT+CGMM` for
+a while after a slot switch — gets no verdict and no write; the next bring-up
+with a model applies the lists.
 
 **The settings editor keeps them for you.** A band edit in *Modem Tools* (or the
 `modem_set_settings` ubus call) on an FM350 is written to the modem's

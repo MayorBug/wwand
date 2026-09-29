@@ -452,7 +452,12 @@ export function create(opts)
 
 	// Whether this modem applies `band_lte` / `band_nr` / `band_umts` at all —
 	// the daemon warns about a configured list that nothing would apply.
-	self.bands_applicable = () => !!self.vendor?.settings_capable?.(self);
+	// null while the modem has not said what it is: after a slot switch the
+	// FM350 refuses CGMM for a while (ddimension/wwand#32), and a modem that
+	// is `generic` only for that moment must not be reported as one without
+	// a band command (ddimension/wwand#45).
+	self.bands_applicable = () => ((self.info?.model ?? '') == '') ? null
+		: !!self.vendor?.settings_capable?.(self);
 
 	// Apply the configured band lists (config wwand_modem). An unset list
 	// leaves that RAT alone, so nothing configured is no write at all.
@@ -518,7 +523,16 @@ export function create(opts)
 		if (!length(keys(want)))
 			return cb(null, { applied: [], unchanged: true });
 
-		if (!self.bands_applicable()) {
+		let applicable = self.bands_applicable();
+
+		// not identified (yet): neither apply nor claim the modem has no band
+		// command — the next bring-up with a model answers it (#45)
+		if (applicable == null) {
+			log('info', 'configured band lists left for the next bring-up: the modem has not said what it is');
+			return cb(null, { applied: [] });
+		}
+
+		if (!applicable) {
 			log('warn', sprintf('configured band lists not applied: no band command wwand drives on %s',
 				self.info?.model ?? 'this modem'));
 			return cb({ error: 'unsupported_on_backend' });
@@ -1113,7 +1127,7 @@ export function create(opts)
 		// down and re-enumerates it, so `self.at` can be null by the time the
 		// call lands. Reading `.send` off it throws inside a uloop callback,
 		// which does not fail the call: it takes the daemon with it. Field-seen
-		// at modem_ncm.uc:967, and only with `sim_slot` configured — that is
+		// at modem_ncm.uc:972, and only with `sim_slot` configured — that is
 		// what makes step_simslot walk the second pass at all
 		// (ddimension/wwand#32).
 		if (!self.at)

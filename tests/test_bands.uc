@@ -93,6 +93,22 @@ fake.bands_applicable = () => false;
 let w = filter(d.status().modems.m0.config_warnings ?? [], (x) => x.check == 'band_lists');
 
 eq(length(w), 1, 'status: a band list on a modem without a band command warns');
+ok(index(w[0]?.message ?? '', 'FM350-GL') >= 0 && index(w[0]?.message ?? '', 'keeps its bands itself') < 0,
+	'status: ...naming the model, not claiming an NCM modem keeps bands in NV');
+
+// not identified yet (the FM350 refuses CGMM after a slot switch, #32): no
+// verdict at all rather than a wrong one (#45)
+fake.bands_applicable = () => null;
+w = filter(d.status().modems.m0.config_warnings ?? [], (x) => x.check == 'band_lists');
+eq(length(w), 0, 'status: a modem that has not said what it is gets no band verdict (#45)');
+
+// a QMI/MBIM modem has no band command wwand drives: it keeps bands in NV
+let keep = fake.bands_applicable;
+delete fake.bands_applicable;
+w = filter(d.status().modems.m0.config_warnings ?? [], (x) => x.check == 'band_lists');
+ok(length(w) == 1 && index(w[0].message, 'keeps its bands itself') >= 0,
+	'status: a QMI/MBIM modem is told to set its bands in Modem Tools');
+fake.bands_applicable = keep;
 
 // ... and so is a failed apply
 fake.bands_applicable = () => true;

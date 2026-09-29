@@ -127,10 +127,20 @@ function band_warnings(entry)
 	if (!configured || m?.info?.model == null)
 		return w;
 
+	// the NCM backend answers true/false/null (null: not identified yet);
+	// QMI and MBIM have no such method — they keep bands in modem NV
+	let own = type(m.bands_applicable) == 'function';
+	let ok = own ? m.bands_applicable() : false;
 	let note = null;
 
-	if (!m.bands_applicable?.())
+	if (ok == null)
+		return w;
+
+	if (!ok && !own)
 		note = 'band_lte/band_nr/band_umts are applied only where the band command does not persist (Fibocom FM350/FM150, +GTACT); this modem keeps its bands itself — set them in Modem Tools';
+	else if (!ok)
+		note = sprintf('band_lte/band_nr/band_umts are not applied: wwand drives no band command on %s (only Fibocom FM350/FM150, +GTACT)',
+			m.info.model);
 	else if (m.band_apply_error)
 		note = sprintf('configured band lists not applied: %s',
 			m.band_apply_error.detail ?? m.band_apply_error.error ?? '?');

@@ -2852,6 +2852,32 @@ push(scenarios, {
 	},
 });
 
+// s9za: an FM350 that refuses CGMI/CGMM (as after a slot switch, #32) and
+// has no identity to carry over: bands are neither written nor declared
+// unsupported (#45)
+push(scenarios, {
+	name: 's9za_fibocom_band_lists_unidentified',
+	script: fscript([
+		{ re: /^AT\+CGMI$/, term: 'ERROR', lines: [] },
+		{ re: /^AT\+CGMM$/, term: 'ERROR', lines: [] },
+		{ re: /^AT\+GTACT/, lines: [ GTACT_LIVE ] },
+	]),
+	cconfig: { apn: 'internet', pdp_type: 'ipv4v6' },
+	mconfig: { apn: 'internet', band_lte: [ '3' ] },
+	run: (env) => {
+		let m = env.modem;
+
+		eq(env.tr.saw(/^AT\+GTACT/), null, 's9za: nothing is sent to an unidentified modem');
+		eq(m.bands_applicable(), null, 's9za: no verdict on the band command');
+		eq(m.band_apply_error, null, 's9za: and no error kept for status');
+
+		let aerr = 'unset';
+		m.apply_config_bands((e) => { aerr = e; });
+		eq(aerr, null, 's9za: the band step answers "later", not "no band command"');
+		env.finish();
+	},
+});
+
 // s9o: the same option on a modem with NO vendor slots recipe keeps the
 // warning (the identify-time gate) — the active slot stays untouched
 push(scenarios, {

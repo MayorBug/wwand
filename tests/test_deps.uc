@@ -605,8 +605,11 @@ function mkdeps(u, extra) {
 		"config wwand_modem 'm0'\n\toption usb_path '3-1'\n\tlist band_umts '1'\n\n" +
 		"config interface 'wan'\n\toption proto 'wwand'\n");
 
-	let d = mkdeps({ cursor: () => uci.cursor(dir) });
-	let read = (opt) => uci.cursor(dir).get('network', 'm0', opt);
+	// a private delta directory: libuci's default (/tmp/.uci) belongs to
+	// whoever made it first, and a set it cannot save there is simply lost
+	let cur = () => uci.cursor(dir, dir + '/.save');
+	let d = mkdeps({ cursor: cur });
+	let read = (opt) => cur().get('network', 'm0', opt);
 
 	eq(d.record_bands('m0', { band_lte: [ '3', '20' ], band_nr: [ '78' ] }), true,
 		'record_bands: a wwand_modem section takes the lists');
@@ -619,11 +622,12 @@ function mkdeps(u, extra) {
 
 	eq(d.record_bands('wan', { band_lte: [ '3' ] }), false,
 		'record_bands: an interface section is not a modem');
-	eq(uci.cursor(dir).get('network', 'wan', 'band_lte'), null, '...and is not written');
+	eq(cur().get('network', 'wan', 'band_lte'), null, '...and is not written');
 	eq(d.record_bands('compat_wan', { band_lte: [ '3' ] }), false,
 		'record_bands: a synthesized modem has no section to keep them in');
 
 	fs.unlink(dir + '/network');
+	fs.rmdir(dir + '/.save');
 	fs.rmdir(dir);
 }
 

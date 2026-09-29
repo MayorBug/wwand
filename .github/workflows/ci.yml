@@ -38,15 +38,19 @@ jobs:
             cmake --build "/tmp/$repo/build" -j"$(nproc)" > /dev/null
             cmake --install "/tmp/$repo/build" > /dev/null
           }
-          # libubox/ubus have no GitHub mirror — clone from git.openwrt.org;
-          # the ucode upstream lives at jow-/ucode
+          # libubox/ubus/uci have no GitHub mirror — clone from
+          # git.openwrt.org; the ucode upstream lives at ucode-lang/ucode
           build libubox https://git.openwrt.org/project/libubox.git \
                 -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF
           build ubus https://git.openwrt.org/project/ubus.git \
                 -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF
-          build ucode https://github.com/jow-/ucode.git \
+          # libuci: test_deps drives record_bands through the real uci
+          # module, whose section-type answer the stand-in cursor cannot give
+          build uci https://git.openwrt.org/project/uci.git \
+                -DBUILD_LUA=OFF
+          build ucode https://github.com/ucode-lang/ucode.git \
                 -DFS_SUPPORT=ON -DSTRUCT_SUPPORT=ON -DULOOP_SUPPORT=ON \
-                -DUBUS_SUPPORT=ON -DUCI_SUPPORT=OFF -DNL80211_SUPPORT=OFF \
+                -DUBUS_SUPPORT=ON -DUCI_SUPPORT=ON -DNL80211_SUPPORT=OFF \
                 -DRTNL_SUPPORT=OFF -DRESOLV_SUPPORT=OFF
           # run_tests.sh looks for ubusd at ~/.local/sbin
           mkdir -p "$PREFIX/sbin"
@@ -64,7 +68,22 @@ jobs:
       - name: Run test suite
         run: |
           export LD_LIBRARY_PATH="$HOME/.local/lib"
-          cd tests && sh run_tests.sh
+          # The private ubusd refuses a non-root client's publish unless an
+          # ACL file names it, and loads only a file root owns (ubus
+          # 2026-09-25). Before that ubusd did not start here at all, so
+          # test_daemon was SKIPPED — never run — in every earlier CI pass.
+          ACL=/tmp/wwand-test-acl
+          sudo install -d -o root -g root -m 755 "$ACL"
+          printf '{ "user": "%s", "access": { "*": { "methods": [ "*" ] } }, "publish": [ "*" ], "subscribe": [ "*" ], "listen": [ "*" ], "send": [ "*" ] }\n' \
+            "$(id -un)" | sudo tee "$ACL/wwand-test.json" > /dev/null
+          sudo chmod 644 "$ACL/wwand-test.json"
+          export WWAND_TEST_UBUS_ACL="$ACL"
+          cd tests
+          set -o pipefail
+          sh run_tests.sh | tee run.log
+          # an environment-gated suite that skips proves nothing here — the
+          # integration test must actually have run
+          ! grep -q '^test_daemon: SKIPPED' run.log
 
   shell-lint:
     runs-on: ubuntu-latest

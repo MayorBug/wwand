@@ -26,9 +26,16 @@ for cand in "$HOME/.local/sbin/ubusd" /sbin/ubusd /usr/sbin/ubusd; do
 	[ -x "$cand" ] && { UBUSD="$cand"; break; }
 done
 
+# A ubusd from 2026-09-25 on (ubus 0086559, b012bc0) refuses every publish
+# by a non-root client that no ACL file names, and reports it as "Invalid
+# argument: Unable to add ubus object". It loads an ACL file only when root
+# owns it and neither group nor other can write it, so a test run as an
+# ordinary user needs one prepared with root's help: point
+# WWAND_TEST_UBUS_ACL at a directory holding it (the CI workflow does). An
+# older ubusd, and a run as root, need none.
 if [ -n "$UBUSD" ]; then
 	export WWAND_TEST_UBUS_SOCK="${TMPDIR:-/tmp}/wwand-test-ubus-$$.sock"
-	"$UBUSD" -s "$WWAND_TEST_UBUS_SOCK" &
+	"$UBUSD" ${WWAND_TEST_UBUS_ACL:+-A "$WWAND_TEST_UBUS_ACL"} -s "$WWAND_TEST_UBUS_SOCK" &
 	UBUSD_PID=$!
 	trap '[ -n "$UBUSD_PID" ] && kill $UBUSD_PID 2>/dev/null; rm -f "$WWAND_TEST_UBUS_SOCK"' EXIT
 	sleep 0.2

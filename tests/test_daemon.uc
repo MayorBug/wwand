@@ -171,7 +171,19 @@ let parsed = config.parse({
 eq(length(parsed.warnings), 0, 'test config parses clean');
 
 daemon.apply_config(parsed);
-ok(ubus_api.publish(conn_srv, daemon, null) != null, 'wwand object published');
+
+let published = ubus_api.publish(conn_srv, daemon, null);
+
+ok(published != null, 'wwand object published');
+
+// Without the object nothing below can run, and waiting out the guard only
+// buries the cause under two more failures. The usual one is a ubusd that
+// wants an ACL for a non-root client (see run_tests.sh, WWAND_TEST_UBUS_ACL).
+if (published == null) {
+	printf("test_daemon: publish refused (%s) — a current ubusd needs an ACL file for a non-root test user; see WWAND_TEST_UBUS_ACL in run_tests.sh\n",
+		conn_srv.error() ?? '?');
+	done('test_daemon');
+}
 
 let guard = uloop.timer(5000, () => {
 	ok(false, 'daemon test timed out');

@@ -3723,9 +3723,35 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 		s2: { '.type': 'wwand_sim', iccid: '89490200001844967110', apn: 'other' } } }));
 	eq([ reapplied, downs, d.modems.m0.modem.active_sim?.apn ], [ 0, 0, 'two' ],
 	   'live wwand_sim: an override for another card touches nothing');
+
+	// a label is not a setting: naming the card in use re-dials nothing (#44)
+	reapplied = 0; downs = 0;
+	d.apply_config(config.parse({ network: { ...base,
+		s1: { '.type': 'wwand_sim', iccid: '89882390000064624748', apn: 'two', name: 'Work' } } }));
+	eq([ reapplied, downs ], [ 0, 0 ], 'sim name: naming the card in use applies nothing and re-dials nothing');
+	eq(d.status().modems.m0.sim_name, 'Work', 'sim name: the modem status shows the card by its name');
+	eq(filter(d.sim_inventory().cards, (c) => c.iccid == '89882390000064624748')[0]?.name, 'Work',
+	   'sim name: ...and so does the SIM inventory');
+	eq([ d.sim_name_of('89882390000064624748'), d.sim_name_of('89882390000064624748F'), d.sim_name_of('1234567') ],
+	   [ 'Work', 'Work', null ], 'sim name: the slot list finds it by the normalised ICCID, and nothing for another card');
+	eq(d.sim_name_of('89882390000064624748', null, 'm0'), 'Work', 'sim name: ...and through the modem\'s own list');
+
+	// matched by IMSI, as the modem matches it
+	d.apply_config(config.parse({ network: { ...base,
+		s1: { '.type': 'wwand_sim', iccid: '89882390000064624748', apn: 'two', name: 'Work' },
+		s2: { '.type': 'wwand_sim', imsi: '262010000000001', name: 'Travel' } } }));
+	eq(d.sim_name_of('89490000000000000001', '262010000000001', 'm0'), 'Travel',
+	   'sim name: a section matched by IMSI names its card too');
 	d.contexts.wan.ctx.state = 'IDLE';
 	d.apply_config(config.parse({ network: base }));
 	eq(d.modems.m0.modem.active_sim, null, 'live wwand_sim: a deleted one stops');
+
+	// a new section that holds only a name is no override to apply
+	reapplied = 0;
+	d.apply_config(config.parse({ network: { ...base,
+		s1: { '.type': 'wwand_sim', iccid: '89882390000064624748', name: 'Work' } } }));
+	eq(reapplied, 0, 'sim name: a name-only section applies nothing to the card');
+	d.apply_config(config.parse({ network: base }));
 	eq(made, 1, 'live wwand_sim: ...all without a modem restart');
 
 	d.modems.m0.modem.state = 'SIM_BLOCKED';

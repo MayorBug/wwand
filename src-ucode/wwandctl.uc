@@ -113,7 +113,8 @@ function cmd_status(args)
 			m.mbimex ? sprintf(' MBIMEx %s', m.mbimex) : '', m.device ?? '?');
 		printf('  state       %s%s\n', m.state,
 			m.control_note ? sprintf('  [%s]', m.control_note) : '');
-		printf('  SIM         imsi %s  iccid %s\n', m.imsi ?? '-', m.iccid ?? '-');
+		printf('  SIM         %simsi %s  iccid %s\n', m.sim_name ? sprintf('"%s"  ', m.sim_name) : '',
+			m.imsi ?? '-', m.iccid ?? '-');
 
 		let radio = radio_text(m);
 
@@ -957,8 +958,9 @@ case 'sims': {
 		let esim = c.eid ? sprintf(' · eUICC %s%s', c.eid,
 			c.profile ? sprintf(' profile %s%s', c.profile.state ?? '?', c.profile.name ? sprintf(' "%s"', c.profile.name) : '') : '') : '';
 
-		printf('%-21s %-22s %s%s%s\n', c.iccid, where,
+		printf('%-21s %-22s %s%s%s%s\n', c.iccid, where,
 			!c.present ? 'not present' : c.active ? 'active' : 'present',
+			c.name ? sprintf(' · "%s"', c.name) : '',
 			c.imsi ? sprintf(' · imsi %s', c.imsi) : '', esim);
 	}
 	break;

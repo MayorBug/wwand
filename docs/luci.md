@@ -75,6 +75,10 @@ Match a specific card by its ICCID and give it a PIN — and optionally its own
 APN / auth / PDP type, optionally bound to one modem. Ideal for dual-SIM or
 swapping eUICC profiles with different PINs.
 
+A **Name** ("Work", "Travel") labels the card; it is shown on the SIM cards page
+and in the modem status slot cards, and renaming the card in use changes nothing
+on the connection.
+
 The table's **Now** column says where each card is at the moment, from the SIM
 inventory: modem and slot, `eSIM <state>` for an eUICC profile, `rsim <reader>`
 for a card in a remote reader, `in use` for the one a modem runs on, or *not

@@ -104,6 +104,20 @@ let load_ncm = lazy_backend('wwand.ncm_lazy', loaded_note('ncm'));
 // optional eSIM module (wwand-esim); absent => feature reports esim_not_installed
 let load_esim = lazy_backend('wwand.esim', loaded_note('esim'));
 
+// What a wwand_sim DOES to the card in use: the fields the SIM step and the
+// dial read. Its `name` is a label, and a rename — or a new section holding
+// only a name — must not look like a change of settings, which re-programs
+// the attach profile and re-dials (apply_config, apply_sim_change).
+// plmn_list names the list and plmn_restore is what it resolves to: an edit to
+// the list itself changes only the second, and must still be applied.
+const SIM_EFFECT = [ 'pincode', 'apn', 'auth', 'username', 'password', 'pdp_type',
+	'plmn_list', 'plmn_restore' ];
+
+function sim_effect(s)
+{
+	return sprintf('%J', map(SIM_EFFECT, (k) => s?.[k] ?? null));
+}
+
 // The per-modem band allow-lists (config wwand_modem). Applied live and kept
 // out of the restart signature — see apply_config.
 const BAND_OPTS = [ 'band_lte', 'band_nr', 'band_umts' ];
@@ -445,7 +459,7 @@ export function create(opts)
 	// KEYED BY INTERFACE, NOT CARRIED ON THE ENTRY. The marker is evidence
 	// about an interface, and the context entry lives SHORTER than the
 	// interface. A config reload that cannot resolve an interface's modem
-	// produces no entry for it at all (config.uc:880-883 warns "references
+	// produces no entry for it at all (config.uc:884-887 warns "references
 	// unknown modem" and skips it), so a marker on the entry would have nothing
 	// to be carried over from. Re-adding the modem would then build a fresh
 	// entry with no marker, the status poll would see netifd's cleared
@@ -851,13 +865,36 @@ export function create(opts)
 		inventory.forget_except('modem:', keep);
 	};
 
+	// One card's label, by the same ICCID/IMSI matching the modem uses for its
+	// active_sim (modem_common.match_sim_override) — so a section matched by
+	// IMSI is named too, and with `modem` given, that modem's own list decides
+	// (two modem-bound sections may name one card differently). A card with no
+	// modem (a reader) is looked up in every list: config.uc hands an unbound
+	// section to all of them.
+	self.sim_name_of = (iccid, imsi, modem) => {
+		if (modem != null)
+			return modem_common.match_sim_override(self.modems?.[modem]?.cfg?.sims, iccid, imsi)?.name ?? null;
+
+		for (let mn, e in self.modems) {
+			let s = modem_common.match_sim_override(e?.cfg?.sims, iccid, imsi);
+
+			if (s?.name)
+				return s.name;
+		}
+
+		return null;
+	};
+
 	self.sim_inventory = function() {
 		// an exception in a ubus handler ends the loop, as in the tick
 		try { inventory_refresh(); }
 		catch (e) { log('warn', sprintf('SIM inventory refresh failed (%s)', e)); }
 
+		let cards = map(inventory.list(), (c) =>
+			({ ...c, name: self.sim_name_of(c.iccid, c.imsi, c.modem) }));
+
 		// `now` on the same clock as last_seen: a viewer's own clock may differ
-		return { cards: inventory.list(), now: time() };
+		return { cards: cards, now: time() };
 	};
 
 	// modem reached service: write back l3 device names, run autosetup APN
@@ -3186,7 +3223,7 @@ export function create(opts)
 				m.config.sims = parsed.modems[mn]?.sims;
 
 				if (changed && (m.info?.iccid != null || m.info?.imsi != null)) {
-					let before = sprintf('%J', m.active_sim);
+					let before = sim_effect(m.active_sim);
 
 					m.active_sim = modem_common.match_sim_override(m.config.sims,
 						m.info.iccid, m.info.imsi);
@@ -3200,7 +3237,7 @@ export function create(opts)
 					// and a card whose attach was being rejected stayed rejected
 					// (HW-seen on 245, 2026-09-27). Edits for other cards change
 					// nothing here and touch nothing.
-					if (sprintf('%J', m.active_sim) != before)
+					if (sim_effect(m.active_sim) != before)
 						apply_sim_change(mn, m);
 					else
 						log('info', sprintf('modem %s: SIM overrides changed — none for the card in use', mn));
@@ -4017,6 +4054,8 @@ export function create(opts)
 				mbimex: mbimex_text(entry.modem?.mbim?.mbimex_version),
 				imsi: entry.modem?.info?.imsi,
 				iccid: entry.modem?.info?.iccid,
+				// the card's label from its wwand_sim (`option name`), or null
+				sim_name: entry.modem?.active_sim?.name ?? null,
 				msisdn: entry.modem?.info?.msisdn,
 				usb: entry.modem?.info?.usb,
 				identity_mismatch: entry.modem?.identity_mismatch,   // {expected,found} if the pinned IMEI didn't match

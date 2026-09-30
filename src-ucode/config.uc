@@ -370,7 +370,7 @@ function iface_id(name, s, result)
 // `origin` marks a section a module wrote (deps.uc sim_upsert) and is read
 // by nothing else: it only has to not be warned about
 const SIM_KNOWN_OPTS = [ 'modem', 'iccid', 'imsi', 'pincode', 'apn', 'auth',
-	'username', 'password', 'plmn_list', 'pdp_type', 'origin' ];
+	'username', 'password', 'plmn_list', 'pdp_type', 'origin', 'name' ];
 
 // flag section options the parser does not consume; suggest the known option
 // the unknown one is a prefix of (or vice versa) — catches pin/pincode-style
@@ -596,6 +596,10 @@ function sim_from_section(s, warnings, label)
 		pdp_type: pdp_in,
 		// optional per-SIM user-PLMN list (wwand_plmnlist), wins over the modem's
 		plmn_list: (s.plmn_list != null && s.plmn_list != '') ? s.plmn_list : null,
+		// a label for the card ("work", "travel"), shown wherever the card is:
+		// on a box with several cards the ICCID alone does not say which one
+		// is which (ddimension/wwand#44). Display only — nothing matches on it.
+		name: (s.name != null && s.name != '') ? sprintf('%s', s.name) : null,
 		plmn_restore: null,   // resolved at the end of parse()
 	};
 }

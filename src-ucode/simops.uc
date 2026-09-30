@@ -56,11 +56,16 @@ export function install(self, o)
 			// one extra round trip: a modem carrying the QMI-over-MBIM
 			// passthrough answers the slot list over QMI-UIM, so without asking
 			// separately we would infer what the modem can simply state.
+			// each card's label from its wwand_sim, for the status page's slot
+			// cards — the inactive slot's card included, which is the one a
+			// name helps with most before switching to it
+			let named = map(slots ?? [], (s) => ({ ...s, name: self.sim_name_of?.(s.iccid, s.imsi, ref) ?? null }));
+
 			if (entry.modem?.read_multisim_caps)
 				return entry.modem.read_multisim_caps((caps) =>
-					cb(null, { slots: slots, multisim: sim.multisim(slots, caps) }));
+					cb(null, { slots: named, multisim: sim.multisim(slots, caps) }));
 
-			cb(null, { slots: slots, multisim: sim.multisim(slots, null) });
+			cb(null, { slots: named, multisim: sim.multisim(slots, null) });
 		});
 	};
 

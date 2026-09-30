@@ -147,6 +147,7 @@ config wwand_modem 'm0'
 config wwand_sim 'vodafone'          # optional per-card override
 	option modem 'm0'
 	option iccid '89490...'
+	option name 'Work'                # a label, shown wherever the card is
 	option pincode '5678'
 	option apn 'internet'
 
@@ -2179,7 +2180,7 @@ restart and clear on reboot (the recovery ladder's last rung).
 wwand keeps a table of every SIM card it has seen, by ICCID, and where it is:
 modem and slot, eUICC (EID) and profile, or a reader (remote SIM through
 wwand-rsim). `ubus call wwand sim_inventory` returns it as `cards[]`
-(`iccid`, `present`, `active`, `imsi`, `modem`, `slot`, `reader`, `eid`,
+(`iccid`, `name`, `present`, `active`, `imsi`, `modem`, `slot`, `reader`, `eid`,
 `profile {state,name}`, `first_seen`, `last_seen`, `sources`) with `now`,
 the router's time on the same clock as the two timestamps. `active` means the
 modem runs on that card, matched by ICCID; the card in the active slot of a
@@ -2187,6 +2188,11 @@ modem using a remote SIM is present but not active. An eSIM download, enable,
 disable or delete through wwand-esim re-reads the eUICC's profile list, and so
 does every run of the IoT Profile Assistant (wwand-ipa);
 `wwandctl sims` prints it; LuCI shows it under Status → SIM cards.
+
+`name` is the card's label from its `wwand_sim` (`option name`), or null. It is
+display only: nothing matches on it, and naming or renaming the card in use —
+even with a section that holds nothing else — re-dials nothing. The modem
+status carries the label of the card in use as `sim_name`.
 
 It is rebuilt from the modems' state on every `sim_inventory` call and every tick, in
 memory (siminventory.uc), so it follows identity re-reads, slot switches,

@@ -824,8 +824,20 @@ export function create(transport, opts)
 		// field-analysis gold (CGCONTRDP/CGPADDR dotted tokens, GTDNS, …).
 		// Errors log at warn so a silent line-drop never hides a failure.
 		// Auth commands are redacted — never log credentials.
-		log(err ? 'warn' : 'debug', sprintf('%s -> %s', redact(cur.cmd),
-			err ? sprintf('error: %s', err.error ?? '?') : join(' | ', lines ?? [])));
+		//
+		// EXCEPT a bare ERROR to a PROBE (send option `probe`): a read of a
+		// vendor setting that only some modules have, asked to find out.
+		// Mostly its ERROR means "not in this firmware", printed as a warning
+		// on every modem start — AT+QCFG="autoconnect" and "iotopmode" on an
+		// RG502Q-EA, AT+QNWLOCK="common/5g" on an EG25-G, which has no 5G
+		// (ddimension/wwand#47). But a busy modem answers a bare ERROR too, so
+		// the line says only what was seen, not that the command is absent.
+		// A timeout or a +CME ERROR to a probe still warns.
+		let declined = (cur.probe && err?.error == 'ERROR');
+
+		log(!err ? 'debug' : declined ? 'info' : 'warn', sprintf('%s -> %s%s', redact(cur.cmd),
+			err ? sprintf('error: %s', err.error ?? '?') : join(' | ', lines ?? []),
+			declined ? ' (optional setting, declined by the modem)' : ''));
 
 		if (cur.cb)
 			cur.cb(err, { lines: lines });
@@ -1001,6 +1013,7 @@ export function create(transport, opts)
 			cmd: cmd,
 			cb: cb,
 			timeout: o?.timeout ?? DEFAULT_TIMEOUT,
+			probe: !!o?.probe,
 		});
 
 		next();

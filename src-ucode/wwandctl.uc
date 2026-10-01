@@ -9,7 +9,7 @@
 'use strict';
 
 import { fmt_plmn, fmt_sig, fmt_locks, reg_text, packet_service_text,
-	collectd_lines, collectd_interval, recovery_text, radio_text, select_args } from 'wwand.wwandctl_fmt';
+	collectd_lines, collectd_interval, recovery_text, radio_text, select_args, euicc_text } from 'wwand.wwandctl_fmt';
 
 import * as libubus from 'ubus';
 import * as fs from 'fs';
@@ -169,6 +169,11 @@ function cmd_status(args)
 
 		if (m.sim_note)
 			printf('  sim_note    %s\n', m.sim_note);
+
+		let eut = euicc_text(m.euicc);
+
+		if (eut)
+			printf('  euicc       %s\n', eut);
 
 		if (m.fcc_lock != null && m.fcc_lock != 0)
 			printf('  fcc_lock    mode %d (radio locked — fcc_auth may unlock)\n', m.fcc_lock);
@@ -526,7 +531,7 @@ if (json_mode) {
 //
 // WHY THE FLOOR. `modem_signal` keeps wwand's adaptive fast-telemetry loop warm
 // (daemon.uc calls modem.watch()); that loop polls the modem at 1 Hz and decays
-// 6 s after the last request (modem_common.uc:704-705). One sample therefore
+// 6 s after the last request (modem_common.uc:707-708). One sample therefore
 // costs ~6 s of 1 Hz modem traffic, so the duty cycle is 6/interval: 10 % at
 // 60 s, 20 % at 30 s, 60 % at 10 s — and at 6 s or below the loop NEVER decays
 // and the modem is polled around the clock. A global `Interval 10` in

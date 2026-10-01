@@ -188,15 +188,15 @@ export function create(opts)
 	// clients, which delivers a synchronous `cancelled` to everything in flight —
 	// so an outer set_opmode callback that ignores its error re-arms tm.settle
 	// AFTER the cancel pass. The new timer fires with self.dms already null
-	// (modem.uc:1656) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
+	// (modem.uc:1607) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
 	// which in ucode is a throw inside a uloop callback: the daemon dies and procd
-	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1249), and
+	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1276), and
 	// every QMI site that re-arms tm.settle needs it too.
 	//
 	// `gen` is captured where the OPERATION begins, not read here — by the time a
 	// callback arrives the generation has already moved.
 	// EACH WAIT OWNS ITS OWN TIMER AND ITS OWN DEBT. `tm.settle` is a shared
-	// one-shot slot, also written by the init chain (modem_init_qmi.uc:323,
+	// one-shot slot, also written by the init chain (modem_init_qmi.uc:333,
 	// :383, :604), so parking radio-bounce waits there let a second one
 	// overwrite the first: teardown then cancelled only the newest, the older
 	// timer survived unreachable, and whichever fired first cleared the other's
@@ -503,7 +503,7 @@ export function create(opts)
 				// done() IS answered on the cancelled path. It is not only
 				// make_fail's internal continuation: the daemon passes a real
 				// caller's callback through note_connect_failure
-				// (daemon.uc:3840), and dropping it strands a ubus request.
+				// (daemon.uc:3864), and dropping it strands a ubus request.
 				// Restarting a torn-down modem is prevented where it belongs
 				// instead — make_fail now refuses a `cancelled` outright
 				// (modem_common.uc).
@@ -515,15 +515,25 @@ export function create(opts)
 			});
 			return;
 
-		case 'modem_reset':
+		case 'modem_reset': {
+			// a control channel that does not answer cannot reset the modem
+			// (modem_common.at_reset): a missing DMS client — the bring-up
+			// failed before allocating it — or a request that timed out
+			let via_at = (why) => modem_common.at_reset(self, at_opts, log, why, () => done(action));
+			let hung = (e) => (e?.error == 'timeout');
+
 			if (!self.dms)
-				return done(action);
+				return via_at('no QMI DMS client to reset with');
 
 			log('warn', 'recovery: resetting modem');
-			opmode_ours('offline', () => {
-				opmode_ours('reset', () => done(action));
+			opmode_ours('offline', (e1) => {
+				if (hung(e1))
+					return via_at('QMI does not answer');
+
+				opmode_ours('reset', (e2) => hung(e2) ? via_at('QMI does not answer') : done(action));
 			});
 			return;
+		}
 
 		default:
 			return done(action);
@@ -535,12 +545,27 @@ export function create(opts)
 	// `deferred` selection/band settings): DMS offline -> reset. The modem
 	// re-enumerates; discovery rebuilds it and re-kicks the auto interfaces.
 	self.reset = function(cb) {
+		// QMI cannot reset a modem whose QMI side hangs: AT (at_reset)
+		let via_at = (why) => modem_common.at_reset(self, at_opts, log, why, (sent) => {
+			if (!sent)
+				return cb({ error: 'unsupported_on_backend' });
+
+			notify_contexts('lost');
+			cb(null, { resetting: true, via: 'at' });
+		});
+
 		if (!self.dms)
-			return cb({ error: 'unsupported_on_backend' });
+			return via_at('no QMI DMS client to reset with');
 
 		log('warn', 'admin modem reset (DMS offline -> reset)');
-		opmode_ours('offline', () => {
+		opmode_ours('offline', (e1) => {
+			if (e1?.error == 'timeout')
+				return via_at('QMI does not answer');
+
 			opmode_ours('reset', (err) => {
+				if (err?.error == 'timeout')
+					return via_at('QMI does not answer');
+
 				// A REFUSED RESET IS NOT A RESET. Dropping the error here would
 				// report `resetting: true` either way, and LuCI and the ubus
 				// caller would wait for a modem that is not going anywhere.
@@ -719,42 +744,12 @@ export function create(opts)
 			return;
 		self._uim_refresh_armed = true;
 
-		let session = () => ({
-			session_type: uimmod.SESSION_TYPE_PRIMARY_GW_PROVISIONING, aid: '',
-		});
-
-		self.uim.on('REFRESH_IND', (data) => {
-			let stage = data?.event?.stage;
-			let enf = data?.enforcement;
-
-			// What the card is prepared to interrupt to get this through. Worth
-			// logging because DATA_CALL means our WAN is about to be pulled and
-			// nothing else would explain it.
-			let forced = (enf != null && (enf & uimmod.REFRESH_ENFORCE_DATA_CALL))
-				? ' (will interrupt an active data call)' : '';
-
-			log('info', sprintf('sim refresh (stage %d)%s', stage ?? -1, forced));
-
-			// WAIT_FOR_OK: the card is ASKING and is now waiting for an answer.
-			// wwand does not ASK to be asked (see the registration below), but a
-			// card can reach this stage for its own reasons, and then the only
-			// safe thing is to answer — a card waiting on a terminal response is
-			// a card that can stall.
-			if (stage == uimmod.REFRESH_STAGE_WAIT_FOR_OK) {
-				self.uim.request('REFRESH_OK', {
-					session: session(), ok: { ok_to_refresh: 1 },
-				}, (e) => {
-					if (e)
-						log('warn', sprintf('refresh-ok refused (%s) — the card may stall until its own timeout',
-							e.error ?? '?'));
-				}, { no_recovery: true });
-
-				return;
-			}
-
-			// full reapply only once the refresh completed successfully
-			if (stage == uimmod.REFRESH_STAGE_END_SUCCESS)
-				self.reapply_sim();
+		// REFRESH: the card announcing it rewrote or re-initialised itself.
+		// The apply for one that never ends is shared with the MBIM backend
+		// (sim.refresh_fallback), which arms it from its native ready-state.
+		self._refresh_disarm = sim.install_refresh(self, self.uim, {
+			log: log, reapply: () => self.reapply_sim(),
+			end_ms: self.timing.refresh_end, apply_ms: self.timing.refresh_apply,
 		});
 
 		// Diagnostics. Each of these was previously invisible: the card would
@@ -857,25 +852,6 @@ export function create(opts)
 			log('debug', 'uim event registration refused for the full mask, falling back to card status');
 			uim.request('REGISTER_EVENTS', { mask: uimmod.EVENT_CARD_STATUS },
 				(e2) => null, { no_recovery: true });
-		}, { no_recovery: true });
-
-		self.uim.request('REFRESH_REGISTER_ALL', {
-			session:  session(),
-			register: { register_flag: 1 },
-			// vote_for_init is DELIBERATELY not sent. Voting asks the card to
-			// consult us before it refreshes, which sounds strictly better —
-			// until the reply does not happen. Then the card waits out its own
-			// timeout instead of refreshing immediately, and every way the reply
-			// can be lost (the request failing, the client being torn down and
-			// rebuilt mid-refresh) turns a brief session interruption into a
-			// stall. Not voting is the status quo: the card refreshes at once
-			// and may pull the session, which is worse in one narrow case and
-			// better in every failure case. The TLV stays modelled, and the
-			// WAIT_FOR_OK handler above stays, so a card that asks anyway still
-			// gets an answer.
-		}, (e) => {
-			if (e)
-				log('debug', 'uim refresh register failed (sim-refresh notifications unavailable)');
 		}, { no_recovery: true });
 	};
 
@@ -1529,6 +1505,7 @@ export function create(opts)
 				if (e2)
 					return log('warn', sprintf('loc register events failed: %J', e2));
 
+				self._loc_session = true;
 				loc.request('START', {
 					session_id: 1,
 					intermediate_reports: 1,
@@ -1631,7 +1608,7 @@ export function create(opts)
 		//
 		// This sat one line BELOW close_at() while saying the same thing, which
 		// was only true of the client destroys. atcmd.close() happens to drop
-		// pending callbacks silently (atcmd.uc:1017-1024 — it clears `current`
+		// pending callbacks silently (atcmd.uc:1029-1036 — it clears `current`
 		// and the queue without calling anything), so nothing exploited the gap;
 		// but that is a property of the AT engine, not a guarantee this function
 		// should lean on.
@@ -1649,6 +1626,19 @@ export function create(opts)
 		// synchronously, and destroying ctl just below cancels the answers we do
 		// not need. ctl goes LAST, and is only destroyed — it is the implicit
 		// client (cid 0) and it is what carries RELEASE_CID for all the others.
+		// END THE POSITION SESSION before its client goes. START opens a
+		// session on the modem that reports every second, and RELEASE_CID only
+		// drops the client — nothing told the location engine to stop. On an
+		// EG25-G with `option location` the QMI side stopped answering three
+		// times in one afternoon, each time right after such a teardown and the
+		// CTL SYNC of the rebuild (EG25GGBR07A08M2G, 2026-10-01: CTL SYNC and
+		// GET_VERSION_INFO time out, AT answers); none before the option was
+		// set. Written before the release below, so it reaches the modem first.
+		if (self.loc && self._loc_session && self.hub && !self.hub.closed)
+			self.loc.request('STOP', { session_id: 1 }, (e) => null, { no_recovery: true });
+
+		self._loc_session = false;
+
 		for (let c in [ self.dms, self.nas, self.uim, self.wda, self.loc, self.wds_cfg,
 		               self.dsd, self.tmd, self.cat, self.wms, self.pdc,
 		               ...(self.extra_clients ?? []) ]) {
@@ -1692,6 +1682,8 @@ export function create(opts)
 		// reassembly attached — silently, because everything still worked except
 		// the things that only fire when something goes wrong.
 		self._uim_refresh_armed = false;
+		self._refresh_disarm?.();
+		self._refresh_disarm = null;
 
 		// card-side diagnostics belong to the card we were talking to. A
 		// transient busy left set would otherwise survive the reconnect and

@@ -1,6 +1,6 @@
 # wwand — current state
 
-_State of 2026-09-29, after v1.6.8. 59 host suites, all green (`cd tests && sh
+_State of 2026-10-01, v1.6.9. 61 host suites, all green (`cd tests && sh
 run_tests.sh` — it prints the count, which moves too often to be worth repeating
 here)._
 
@@ -1006,6 +1006,54 @@ field from its last bring-up, then from its USB id (`ncm_vendors.USB_IDENTITY`:
 the FM350-GL's 0e8d:7126/7127), and a CGMM answering the manufacturer counts as
 no model. Host-tested (test_ncm s9zb-s9ze); not yet confirmed on the reporter's
 H29K.
+
+## A profile switched by somebody else is applied (2026-10-01)
+
+An SGP.32 IPAe profile enable on the EG25-G at 3.123 (QMI) dropped the session
+and left wwand on the old identity: UIM REFRESH stage 1 (START), then
+`uim session closed: refresh` and no END — the re-read only ran on END. The
+status kept the old ICCID and APN, the modem sat in limited service, until a
+restart. wwand's own eSIM switch never hit this, because `esim_bridge`
+power-cycles the card after lpac's enable rather than trusting the refresh.
+
+- **`sim.uc refresh_fallback`:** an announced card re-initialisation that has
+  not ended after `refresh_end` (10 s) gets the bridge's apply — power-cycle,
+  unlock, `reapply_sim` — whose `sim_refresh` re-dials on the new card. Left
+  alone when somebody power-cycled after the start (the bridge), and not armed
+  by the echo of a recent power-cycle.
+- **QMI** (`sim.uc install_refresh`, moved out of `modem.uc`): armed by REFRESH
+  START in any mode but FCN; END_SUCCESS re-reads as before, END_FAILURE
+  applies at once.
+- **MBIM, natively:** armed by the Basic Connect ready-state leaving
+  INITIALIZED (to NOT_INITIALIZED or DEVICE_LOCKED), disarmed when it returns.
+  No passthrough or MS extensions needed; the reset goes passthrough UIM →
+  native UICC reset → AT. SLOT_INFO_STATUS is deliberately not a trigger: its
+  slot index is not mapped to the card in use here.
+- **Recovery hold for IPAe cards** (`recovery.uc hold_for_card`): after the
+  card's own IPA changed the subscription, no modem reset / repower / reboot
+  for `card_hold` (35 min) so the card's rollback/fallback is not reset under
+  it; the opmode cycle and the counting go on. Only for a card whose IPAe is
+  in charge — `sim.uc card_euicc_info`: FCI tag `E1` with `ipaeSupported`,
+  and GetEUICCInfo1 refused with 6985.
+- **Modem reset when the control channel hangs** (`modem_common.at_reset`):
+  QMI (no DMS client or a timed-out request) and MBIM (no passthrough, or it
+  times out) reset over `AT+CFUN=1,1`, opening the AT port for the write if
+  needed — ladder rung and admin reset alike. Before, an EG25-G whose QMI
+  hung (3x on 2026-10-01, AT fine) had only the router reboot left.
+- **QMI LOC session ended before its client goes** (`modem.uc` teardown,
+  schema `STOP` 0x0023 per libqmi 1.38): an EG25-G with `option location`
+  hung its QMI side three times after teardowns (2026-10-01); `location`
+  is now off on 3.123. Not yet HW-proven that the STOP prevents it.
+- **AT port mute at cold boot** (ddimension/wwand#47, NR7101 RG502Q-EA):
+  QMI/MBIM ask a port that opened but did not answer again 30/60/120 s later
+  on the same modem object (`modem_common.at_late_retry`) — before, AT came
+  back only with a modem reset. And a bare ERROR to a vendor-setting PROBE
+  (`atcmd.send` option `probe`: QCFG autoconnect/iotopmode, QNWLOCK reads)
+  logs at info as "not implemented by this firmware" instead of a warning on
+  every start.
+- **Open:** NCM (AT-only) has no card-reinitialisation signal wired; a
+  `+QSIMSTAT`/`+CPIN` URC would be the hook. Not HW-verified yet (the
+  QMI path is the case seen on 3.123).
 
 ## Known open
 

@@ -526,3 +526,14 @@ export const REFRESH_STAGE_WAIT_FOR_OK   = 0;
 export const REFRESH_STAGE_START         = 1;
 export const REFRESH_STAGE_END_SUCCESS   = 2;
 export const REFRESH_STAGE_END_FAILURE   = 3;
+
+// QmiUimRefreshMode (qmi-enums-uim.h:471-479, libqmi 1.38.0). FCN is the only
+// mode that leaves the card's applications running — every other one
+// re-initialises them, which is how an eSIM profile enable reaches the modem.
+export const REFRESH_MODE_RESET          = 0;
+export const REFRESH_MODE_INIT           = 1;
+export const REFRESH_MODE_INIT_FCN       = 2;
+export const REFRESH_MODE_FCN            = 3;
+export const REFRESH_MODE_INIT_FULL_FCN  = 4;
+export const REFRESH_MODE_APP_RESET      = 5;
+export const REFRESH_MODE_3G_RESET       = 6;

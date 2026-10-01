@@ -1483,4 +1483,79 @@ eq(mc.resolve_diag_port({ config: {}, device: '/dev/cdc-wdm0' }, diag_fx(), null
 	eq(mc.init_commands(bad), [], 'init list: a failing extra adds nothing and breaks nothing');
 }
 
+// --- an AT port that was only not ready yet (ddimension/wwand#47) ----------
+// Mute for the bring-up probe after a cold boot, answering a little later: a
+// QMI/MBIM modem gets its AT side channel on a later try of the SAME modem
+// object instead of only after a modem reset.
+{
+	uloop.init();
+
+	let alive = false;
+	let mute_tr = () => {
+		let t = { close: () => null, drain: () => null };
+
+		t.write = (d) => {
+			if (alive && t.data_cb && match(d ?? '', /^AT/))
+				t.data_cb("\r\nOK\r\n");
+			return true;
+		};
+		t.on_data = (cb) => { t.data_cb = cb; };
+		return t;
+	};
+
+	let m = { device: '/dev/cdc-wdm0', config: { at_mbim: '0' }, info: {}, _gen: 1 };
+	let logs = [];
+	let o = {
+		at_opts: {
+			fx: { ...fake_fx('2c7c:0800', [ { ifn: 2, tty: 'ttyUSB2' } ]), readlink: () => null },
+			open_transport: (tty) => mute_tr(),
+			probe_timeout: 20,
+			late_retry_s: [ 0.05, 0.05 ],
+		},
+		log: (level, msg) => push(logs, msg),
+		set_drain_timer: () => null,
+	};
+	let late = 0;
+
+	mc.open_at(m, { ...o, next: () => null });
+	uloop.timer(100, () => {
+		eq(m.at, null, 'late at: the bring-up went on without AT');
+		eq(m._at_mute_port, '/dev/ttyUSB2', 'late at: the mute port is remembered');
+
+		mc.at_late_retry(m, { ...o, next: () => late++ });
+		alive = true;   // the port wakes up before the first late try
+	});
+	uloop.timer(400, () => {
+		ok(m.at != null, 'late at: a later try opens the port');
+		eq(late, 1, 'late at: and runs the caller\'s next once');
+		ok(length(filter(logs, (l) => index(l, 'answers now') >= 0)) == 1, 'late at: and says so');
+
+		// a rebuilt modem object ends the tries of the old one
+		let m2 = { device: '/dev/cdc-wdm0', config: {}, info: {}, _gen: 1, _at_mute_port: '/dev/ttyUSB2' };
+		let tries = 0;
+
+		mc.at_late_retry(m2, { ...o, at_opts: { ...o.at_opts, open_transport: () => { tries++; return mute_tr(); } },
+			next: () => null });
+		m2._gen = 2;
+
+		// a late probe that times out never shows its engine: telemetry and
+		// ubus would queue behind it, and a close drops that queue silently
+		let m3 = { device: '/dev/cdc-wdm0', config: { at_mbim: '0' }, info: {}, _gen: 1,
+		           _at_mute_port: '/dev/ttyUSB2' };
+		let seen = [];
+
+		alive = false;
+		mc.at_late_retry(m3, { ...o, at_opts: { ...o.at_opts, late_retry_s: [ 0.01 ] }, next: () => null });
+		uloop.timer(20, () => push(seen, m3.at));    // probe in flight
+		uloop.timer(60, () => push(seen, m3.at));    // probe timed out
+
+		uloop.timer(200, () => {
+			eq(tries, 0, 'late at: no tries for a modem object that is gone');
+			eq(seen, [ null, null ], 'late at: a probing or failed late try never publishes its engine');
+			uloop.end();
+		});
+	});
+	uloop.run();
+}
+
 done('test_modem_common');

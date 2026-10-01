@@ -11,6 +11,7 @@ import * as apndb from 'wwand.apndb';
 import * as discovery from 'wwand.discovery';
 import * as netsel_ops from 'wwand.netsel_ops';
 import * as simops from 'wwand.simops';
+import * as simmod from 'wwand.sim';
 import * as hwops from 'wwand.hwops';
 import * as plugins from 'wwand.plugins';
 import * as siminventory from 'wwand.siminventory';
@@ -254,6 +255,18 @@ export function vanish_action(entry, now, timing)
 	return null;
 };
 
+// The callback for one eUICC read (daemon probe_euicc), built out here so it
+// closes over nothing but these four parameters. Built inline in create(), a
+// closure over the read's state object found it null when the callback ran
+// after another call had reused the stack, while other captured values
+// looked intact (host ucode, test_daemon, 2026-10-01). A small closure did
+// not reproduce it; create() is very large. Kept out here so the fix does
+// not depend on understanding that.
+function euicc_answer(fn, entry, m, st)
+{
+	return (info) => fn(entry, m, st, info);
+}
+
 export function create(opts)
 {
 	let deps = opts?.deps ?? {};
@@ -459,7 +472,7 @@ export function create(opts)
 	// KEYED BY INTERFACE, NOT CARRIED ON THE ENTRY. The marker is evidence
 	// about an interface, and the context entry lives SHORTER than the
 	// interface. A config reload that cannot resolve an interface's modem
-	// produces no entry for it at all (config.uc:884-887 warns "references
+	// produces no entry for it at all (config.uc:886-889 warns "references
 	// unknown modem" and skips it), so a marker on the entry would have nothing
 	// to be carried over from. Re-adding the modem would then build a fresh
 	// entry with no marker, the status poll would see netifd's cleared
@@ -1223,6 +1236,76 @@ export function create(opts)
 				data?.expected ?? '?', data?.found ?? '?');
 	};
 
+	// What the card's ISD-R says about itself (sim.card_euicc_info): SGP.32
+	// or not, which IPA runs it. Kept on the modem ENTRY, read per modem
+	// object — the eUICC is the same chip whichever profile it runs, and which
+	// IPA is active is settled when the card starts. Reported in status()
+	// (`euicc`) and used by modem_sim_refresh.
+	//
+	// A caller arriving while a read is in flight WAITS for it: answering it
+	// at once from the not-yet-filled entry let a profile change that landed
+	// mid-read go without its recovery hold. And an empty answer is not
+	// final — a plain SIM gives one, but so does a transport being rebuilt —
+	// so it is asked again, a minute apart, up to three times per modem
+	// object; a plain SIM then stops being asked.
+	let EUICC_TRIES = 3, EUICC_RETRY_S = 60;
+
+	// What a finished read does. Reached through euicc_answer (module level,
+	// below the imports): see the note there.
+	let euicc_read = (entry, m, st, info) => {
+		st.busy = false;
+
+		if (entry.modem !== m || entry._euicc_st !== st)
+			return;
+
+		entry.euicc = info;
+		st.done = (info != null);
+		st.next_at = time() + EUICC_RETRY_S;
+
+		if (info?.sgp32)
+			log('notice', sprintf('modem %s: SGP.32 IoT eUICC (SGP.22 %s), %s', m.id, info.svn ?? '?',
+				(info.ipa == 'ipae') ? 'its own IPA (IPAe) is in charge — ES10 from the router is refused by design'
+				: (info.ipa == 'ipad') ? 'served by the device IPA (IPAd)' : 'IPA mode unknown'));
+
+		let waiters = st.waiters;
+
+		st.waiters = [];
+
+		for (let w in waiters)
+			w();
+	};
+
+	let probe_euicc = (entry, m, done) => {
+		let st = (entry._euicc_for === m) ? entry._euicc_st : null;
+
+		if (st?.done || (st && !st.busy && st.tries >= EUICC_TRIES))
+			return done?.();
+
+		if (st?.busy) {
+			if (done)
+				push(st.waiters, done);
+			return;
+		}
+
+		if (st && time() < st.next_at && !done)
+			return;
+
+		if (!st) {
+			st = { tries: 0, busy: false, done: false, next_at: 0, waiters: [] };
+			entry._euicc_for = m;
+			entry._euicc_st = st;
+			entry.euicc = null;
+		}
+
+		st.busy = true;
+		st.tries++;
+
+		if (done)
+			push(st.waiters, done);
+
+		(deps.card_euicc_info ?? simmod.card_euicc_info)(m, euicc_answer(euicc_read, entry, m, st));
+	};
+
 	// THE SUBSCRIPTION CHANGED UNDER A RUNNING CONNECTION. An eSIM profile
 	// switch or a card swap leaves any established session on this modem
 	// belonging to the PREVIOUS subscription — one the new card has no claim
@@ -1279,8 +1362,8 @@ export function create(opts)
 	// whether anything started it.
 	//
 	// COMPARED HERE rather than trusted from the event. modem_mbim filters its
-	// own emit on a change (modem_mbim.uc:896-905) while the shared reapply
-	// tail emits on every re-read (modem_common.uc:553-559); one comparison, in
+	// own emit on a change (modem_mbim.uc:923-932) while the shared reapply
+	// tail emits on every re-read (modem_common.uc:556-562); one comparison, in
 	// the place that acts on it, cannot disagree with itself.
 	let modem_sim_refresh = (modem, data) => {
 		let entry = self.modems[modem.id];
@@ -1315,6 +1398,29 @@ export function create(opts)
 		// dropped the session that had just come up on it
 		if (pp[0] == (data?.iccid ?? '') && (pp[1] ?? '') == '')
 			return;
+
+		// A card whose OWN IPA (IPAe, SGP.32) switched the profile is now
+		// watching the new one and rolls back by itself if it brings no
+		// connectivity (HW-seen on an IoT eUICC behind an EG25-G, 2026-10-01:
+		// back on the previous profile 64 min after a switch to one that got
+		// no service): keep the recovery ladder from resetting it meanwhile
+		// (recovery.uc hold_for_card). Only then — a plain SIM or an SGP.22
+		// card has no rollback to protect, and with our own IPA (ipad) the
+		// rollback is ours, so holding recovery back would only delay it.
+		// Asked once per modem entry (probe_euicc): which IPA is
+		// active is settled when the card starts, not per profile. 35 min by
+		// default: a card's rollback timer plus the attempts around it.
+		let m = entry.modem;
+		let hold = () => m?.recovery?.hold_for_card?.(+(entry.cfg?.card_hold ?? 2100),
+			sprintf('the card\'s own IPA changed the subscription (%s -> %s)', prev, now));
+
+		if (entry.euicc?.ipa == 'ipae')
+			hold();
+		else if (m)
+			probe_euicc(entry, m, () => {
+				if (entry.euicc?.ipa == 'ipae')
+					hold();
+			});
 
 		for (let name, centry in self.contexts) {
 			// `wanted` is the one thing worth filtering on: a context nobody
@@ -2292,7 +2398,7 @@ export function create(opts)
 			};
 
 		// TELL THE CONTEXTS FIRST, then stop the modem — the order _device_gone
-		// uses (modem_common.uc:580). Dropping `centry.ctx` below only releases
+		// uses (modem_common.uc:583). Dropping `centry.ctx` below only releases
 		// the daemon's HANDLE: the context object itself lives on with its
 		// monitor timers armed and its WDS clients alive, polling a hub that
 		// entry.modem.stop() has just closed. One orphan per removal, and its
@@ -3336,6 +3442,14 @@ export function create(opts)
 				// from that hung state — only a reboot did. Hence both rungs, in
 				// that order; the cheap one first, and the expensive one still
 				// reachable, which is the whole point.
+				// once per modem object, as soon as its card has been read
+				for (let name, entry in self.modems) {
+					let m = entry.modem;
+
+					if (m && index([ 'CONFIGURE_NET', 'REGISTERING', 'READY', 'SIM_BLOCKED' ], m.state) >= 0)
+						probe_euicc(entry, m);
+				}
+
 				for (let name, entry in self.modems) {
 					let act = vanish_action(entry, now, self.timing);
 
@@ -3890,6 +4004,9 @@ export function create(opts)
 			return {
 				attempts: attempts,
 				fired: fired,
+				// seconds the card-resetting rungs are still held back after a
+				// subscription change (recovery.uc hold_for_card), null = none
+				card_hold: entry.modem?.recovery?.card_hold_left?.() || null,
 				// gated off until one exchange has succeeded in the selected
 				// protocol — a misdetected modem must never be repowered
 				armed: !!c.proto_ok,
@@ -4056,6 +4173,9 @@ export function create(opts)
 				iccid: entry.modem?.info?.iccid,
 				// the card's label from its wwand_sim (`option name`), or null
 				sim_name: entry.modem?.active_sim?.name ?? null,
+				// the card's ISD-R about itself, once read (probe_euicc):
+				// { sgp32, ipae_supported, svn, ipa: 'ipae' | 'ipad' | null }
+				euicc: (entry._euicc_for === entry.modem) ? (entry.euicc ?? null) : null,
 				msisdn: entry.modem?.info?.msisdn,
 				usb: entry.modem?.info?.usb,
 				identity_mismatch: entry.modem?.identity_mismatch,   // {expected,found} if the pinned IMEI didn't match

@@ -509,7 +509,15 @@ export function create(opts)
 			log: log,
 			drain_interval: self.timing.at_drain,
 			set_drain_timer: (t) => { at_drain_timer = t; },
-			next: step_at_ident,
+			next: () => {
+				// a mute port is asked again later (ddimension/wwand#47)
+				modem_common.at_late_retry(self, {
+					at_opts: at_opts, log: log, drain_interval: self.timing.at_drain,
+					set_drain_timer: (t) => { at_drain_timer = t; },
+					next: () => null,
+				});
+				step_at_ident();
+			},
 		});
 	};
 
@@ -881,9 +889,36 @@ export function create(opts)
 		// the MBIM counterpart of the QMI UIM CARD_STATUS_IND. Keep identity fresh
 		// and surface SIM removal instead of running stale. (Closes the one native
 		// MBIM indication gap vs the QMI backend.)
+		// A card re-initialising under a running modem (an eSIM profile enable
+		// by somebody else's LPA): the native ready-state leaves INITIALIZED.
+		// If it is not back within refresh_end, the card gets the eSIM
+		// switch's apply (sim.refresh_fallback). It is a BASIC CONNECT
+		// notification of the MBIM 1.0 command set (mbim-service-basic-
+		// connect.json:50-54, libmbim 1.32.0), so it needs neither the QMI
+		// passthrough nor the MS extensions.
+		// SLOT_INFO_STATUS below would announce it earlier, but names a slot
+		// index this backend cannot map to the card in use, and arming on
+		// another slot's card would power-cycle the one carrying the WAN.
+		let gen = self._gen;
+		let mc = self.mbim;
+
+		self._refresh_fb?.disarm();
+		self._refresh_fb = sim.refresh_fallback(self, {
+			log: log, reapply: () => self.reapply_sim(),
+			alive: () => self._gen == gen && self.mbim == mc,
+			end_ms: self.timing.refresh_end, apply_ms: self.timing.refresh_apply,
+		});
+
 		self.mbim.on(bc, 'SUBSCRIBER_READY_STATUS', (data) => {
 			let prev = self._ready_state;
 			self._ready_state = data.ready_state;
+
+			if (prev == bc.READY_STATE_INITIALIZED &&
+			    (data.ready_state == bc.READY_STATE_NOT_INITIALIZED ||
+			     data.ready_state == bc.READY_STATE_DEVICE_LOCKED))
+				self._refresh_fb.arm('card re-initialising (ready-state left initialized)');
+			else if (data.ready_state == bc.READY_STATE_INITIALIZED)
+				self._refresh_fb.end();
 
 			if (data.ready_state != prev)
 				log('notice', sprintf('sim ready-state: %s',
@@ -2155,16 +2190,17 @@ export function create(opts)
 	};
 
 	self.reset = function(cb) {
-		let at_reset = () => {
-			if (!self.at)
-				return cb({ error: 'unsupported_on_backend' });
+		// also the way out when MBIM or its passthrough is what hangs: the
+		// AT port is opened for the one write if it is not open yet
+		// (modem_common.at_reset)
+		let at_reset = (why) => modem_common.at_reset(self, at_opts, log,
+			why ?? 'no QMI passthrough to reset with', (sent) => {
+				if (!sent)
+					return cb({ error: 'unsupported_on_backend' });
 
-			log('warn', 'admin modem reset (AT+CFUN=1,1)');
-			self.at.send('AT+CFUN=1,1', () => {
 				notify_contexts('lost');
-				cb(null, { resetting: true });
-			}, { timeout: 8000 });
-		};
+				cb(null, { resetting: true, via: 'at' });
+			});
 
 		self._ensure_pt((up) => {
 			if (!up)
@@ -2196,6 +2232,9 @@ export function create(opts)
 						// to LuCI and to the caller exactly like a reset under
 						// way — and they then waited for a modem that was never
 						// going anywhere.
+						if (rerr?.error == 'timeout')
+							return at_reset('the QMI passthrough does not answer');
+
 						if (rerr)
 							return cb({ error: 'qmi', detail: rerr });
 
@@ -2542,7 +2581,7 @@ export function create(opts)
 			// — closing the HOST's MBIM session is not shown to reset the
 			// modem's embedded QMI client table, so every daemon reload leaked
 			// a NAS, a DSD and (once used) a UIM and a WMS. The E182E-class
-			// table has room for a handful. Same burst modem.uc:1632 does for
+			// table has room for a handful. Same burst modem.uc:1583 does for
 			// the native side, which the passthrough never had. ctl is NOT in this list: it is the
 			// implicit client (cid 0) and it is what carries RELEASE_CID for
 			// all the others, so it has to outlive them.
@@ -2607,7 +2646,7 @@ export function create(opts)
 		// refuses every future retry, which is worse than whatever the callback
 		// was complaining about. The QMI teardown wraps its equivalent call for
 		// the same reason; NCM needs none, close_at() discards its queue without
-		// paying it (atcmd.uc:1017). Review follow-up, 2026-09-19.
+		// paying it (atcmd.uc:1029). Review follow-up, 2026-09-19.
 		drop_pt();
 		self._pt_failed = false;
 		self._pt_built = false;
@@ -2643,6 +2682,8 @@ export function create(opts)
 			}
 
 			self.mbim = null;
+			self._refresh_fb?.disarm();
+			self._refresh_fb = null;
 			self.mbim_uicc = null;
 			self.mbim_sms = null;
 			self.mbim_slots = null;

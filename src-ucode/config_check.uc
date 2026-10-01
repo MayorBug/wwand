@@ -144,7 +144,7 @@ export function validate(self, log, cb)
 				}
 
 			finish();
-		});
+		}, { probe: true });   // not every Quectel has the setting (RG50xQ)
 	};
 
 	// A LOCK THE CONFIG NO LONGER ASKS FOR IS RELEASED.
@@ -168,6 +168,7 @@ export function validate(self, log, cb)
 		if (!self.at)
 			return cb();
 
+		// a probe: a modem without that RAT has no such lock to read
 		self.at.send(sprintf('AT+QNWLOCK="common/%s"', which), (e, r) => {
 			let lk = e ? null : atcmd.parse_qnwlock(r?.lines);
 
@@ -188,7 +189,7 @@ export function validate(self, log, cb)
 				// persist the RELEASE, in case the lock was saved to NV
 				self.at.send('AT+QNWLOCK="save_ctrl",1,1', () => cb());
 			});
-		});
+		}, { probe: true });
 	};
 
 	// cell locks: if config sets lock_4g/lock_5g, read them back (best-effort

@@ -260,12 +260,33 @@ export function reg_text(m)
 // The cadence floor, and the reason for it. `modem_signal` keeps wwand's
 // adaptive fast-telemetry loop warm (daemon.uc calls modem.watch()); that loop
 // polls the modem at 1 Hz and decays 6 s after the last request
-// (modem_common.uc:704-705). One sample therefore costs ~6 s of 1 Hz modem
+// (modem_common.uc:707-708). One sample therefore costs ~6 s of 1 Hz modem
 // traffic, so the duty cycle is 6/interval: 10 % at 60 s, 20 % at 30 s, 60 % at
 // 10 s — and at 6 s or below the loop NEVER decays and the modem is polled
 // around the clock. A global `Interval 10` in collectd.conf would do exactly
 // that without anyone noticing, so it is raised rather than obeyed.
 export const COLLECTD_MIN_INTERVAL = 30;
+
+// The card's ISD-R about itself (status `euicc`, daemon probe_euicc) in one
+// line, or null when nothing was read. Which IPA runs an SGP.32 card is the
+// part worth a line: with its own (IPAe) in charge the router has no ES10
+// access, and `esim profiles` failing with 6985 is then expected, not a fault.
+export function euicc_text(e)
+{
+	if (type(e) != 'object' || (!e.sgp32 && !e.svn))
+		return null;
+
+	let base = e.svn ? sprintf('SGP.22 %s', e.svn) : null;
+
+	if (!e.sgp32)
+		return base;
+
+	let ipa = (e.ipa == 'ipae') ? 'IPA in the card (IPAe) — no ES10 from the router'
+		: (e.ipa == 'ipad') ? 'IPA on the device (IPAd)'
+		: 'IPA unknown';
+
+	return sprintf('SGP.32 IoT%s · %s', base ? sprintf(' (on %s)', base) : '', ipa);
+};
 
 // The recovery ladder in one line, or null when there is nothing to say (armed
 // and no failed attempts). `ubus call wwand status` has carried this since the
@@ -283,15 +304,21 @@ export function recovery_text(r)
 
 	let n = +(r.attempts ?? 0);
 
+	// a subscription change holds the card-resetting rungs back; without
+	// saying so, "next: modem_reset at 16 (in 0)" reads as overdue
+	let hold = (+(r.card_hold ?? 0) > 0)
+		? sprintf(' · card-resetting steps held for %d min (subscription changed)',
+			int((+r.card_hold + 59) / 60)) : '';
+
 	if (r.armed) {
 		if (!n)
-			return null;
+			return length(hold) ? sprintf('armed%s', hold) : null;
 
 		let nx = r.next;
 
-		return sprintf('armed · %d failed attempt%s%s', n, (n == 1) ? '' : 's',
+		return sprintf('armed · %d failed attempt%s%s%s', n, (n == 1) ? '' : 's',
 			nx ? sprintf(' · next: %s at %d%s', nx.action, nx.at,
-			             nx.in ? sprintf(' (in %d)', nx.in) : '') : '');
+			             nx.in ? sprintf(' (in %d)', nx.in) : '') : '', hold);
 	}
 
 	let tail = (r.unarmed_reset == 'available')

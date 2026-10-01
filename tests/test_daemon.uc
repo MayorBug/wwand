@@ -1025,6 +1025,107 @@ ok(rld.contexts.wanC.ctx == ctxC_obj, 'reload mux: wanC ctx preserved');
 
 rld.shutdown();
 
+// --- the recovery hold after an IPAe card changed its subscription ----------
+// Only a card whose own IPA (IPAe) is in charge gets it — and a profile change
+// that lands while the card is still being asked must not lose it.
+(function() {
+	let on_event = null;
+	let holds = [];
+	let pending = [];
+	let answer = { sgp32: true, ipae_supported: true, svn: '2.5.0', ipa: 'ipae' };
+
+	let hd = daemon_mod.create({
+		timing: TIMING,
+		deps: {
+			transport_open: () => null,
+			load_qmi: () => ({
+				modem: { create: (o) => {
+					on_event = o.deps.on_event;
+					// still initialising: the status tick does not ask yet,
+					// so the profile change below is what asks
+					return { start: () => null, stop: () => null, state: 'INIT_SERVICES',
+					         recovery: { hold_for_card: (secs, why) => push(holds, secs) } };
+				} },
+				context: { create: (o) => ({ state: 'IDLE', up: (cb) => cb?.(null, {}),
+				                             down: (cb) => cb?.(), attach: () => null,
+				                             detach: () => null }) },
+			}),
+			// the card is asked asynchronously; the answer is held back here
+			card_euicc_info: (m, cb) => push(pending, cb),
+			log: () => null, emit_event: () => null,
+			kick_interface: () => null, renew_interface: () => null, down_interface: () => null,
+			iface_status: (iface, cb) => cb({ up: false }),
+			datapath_fx: dpfx, read_config: () => ({}),
+			resolve_modem_device: (cfg) => cfg.device, resolve_netdev: () => 'wwan0',
+			learn_device: () => null, learn_modem_path: () => null,
+		},
+	});
+
+	hd.apply_config(config.parse({ network: {
+		m0: { '.type': 'wwand_modem', device: '/dev/mock0', card_hold: '900' },
+	} }));
+
+	let m0 = { id: 'm0' };
+
+	on_event(m0, 'sim_refresh', { iccid: '8988228000019215531', imsi: '901405004427899' });
+	eq(length(pending), 0, 'card hold: the first identity asks nothing');
+
+	// the profile changes; the card is asked, and its answer is still out
+	on_event(m0, 'sim_refresh', { iccid: '8988239000159847435', imsi: '901289028893951' });
+	eq(length(pending), 1, 'card hold: a change asks the card which IPA runs it');
+	eq(holds, [], 'card hold: nothing held before the card has answered');
+
+	// a second change while the same read is in flight joins it, no second read
+	on_event(m0, 'sim_refresh', { iccid: '8988228000019215531', imsi: '901405004427899' });
+	eq(length(pending), 1, 'card hold: a change during the read waits for it');
+
+	pending[0](answer);
+	eq(holds, [ 900, 900 ], 'card hold: both waiting changes get the hold once the card says IPAe');
+
+	// known now: the next change holds at once, without asking again
+	on_event(m0, 'sim_refresh', { iccid: '8988239000159847435', imsi: '901289028893951' });
+	eq(length(pending), 1, 'card hold: the answer is kept for the modem');
+	eq(length(holds), 3, 'card hold: ...and used straight away');
+	eq(hd.status().modems.m0.euicc?.ipa, 'ipae', 'card hold: status reports what the card said');
+})();
+
+// ...and a card that is NOT run by its own IPA gets no hold
+(function() {
+	let on_event = null, holds = [];
+
+	let hd = daemon_mod.create({
+		timing: TIMING,
+		deps: {
+			transport_open: () => null,
+			load_qmi: () => ({
+				modem: { create: (o) => {
+					on_event = o.deps.on_event;
+					return { start: () => null, stop: () => null, state: 'REGISTERING',
+					         recovery: { hold_for_card: (secs, why) => push(holds, secs) } };
+				} },
+				context: { create: (o) => ({ state: 'IDLE', up: (cb) => cb?.(null, {}),
+				                             down: (cb) => cb?.(), attach: () => null,
+				                             detach: () => null }) },
+			}),
+			card_euicc_info: (m, cb) => cb({ sgp32: true, ipae_supported: true, svn: '2.5.0', ipa: 'ipad' }),
+			log: () => null, emit_event: () => null,
+			kick_interface: () => null, renew_interface: () => null, down_interface: () => null,
+			iface_status: (iface, cb) => cb({ up: false }),
+			datapath_fx: dpfx, read_config: () => ({}),
+			resolve_modem_device: (cfg) => cfg.device, resolve_netdev: () => 'wwan0',
+			learn_device: () => null, learn_modem_path: () => null,
+		},
+	});
+
+	hd.apply_config(config.parse({ network: { m0: { '.type': 'wwand_modem', device: '/dev/mock0' } } }));
+
+	let m0 = { id: 'm0' };
+
+	on_event(m0, 'sim_refresh', { iccid: '8988228000019215531', imsi: '901405004427899' });
+	on_event(m0, 'sim_refresh', { iccid: '8988239000159847435', imsi: '901289028893951' });
+	eq(holds, [], 'card hold: a card served by the device IPA (IPAd) gets none');
+})();
+
 // --- sim_refresh: a changed subscription drops the stale session --------------
 //
 // An eSIM profile switch or a card swap leaves the running context dialled with

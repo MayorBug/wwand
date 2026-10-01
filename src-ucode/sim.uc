@@ -93,7 +93,7 @@ export function pin_block_reason(retries, force)
 
 // A CARD POLL MUST NOT OUTLIVE ITS SESSION. The retries below re-enter
 // unlock_uim/unlock_dms, which re-read modem.uim / modem.dms at entry — and
-// teardown nulls those (modem.uc:1656). An anonymous timer firing after an
+// teardown nulls those (modem.uc:1607). An anonymous timer firing after an
 // unplug or a config reload inside the up-to-10 s poll window therefore
 // dereferenced null, and a throw inside a uloop callback ends the program: the
 // next timer never runs and uloop.run() does not return (measured 2026-09-19).
@@ -132,7 +132,7 @@ function watch_card_ready(modem, uim, on_ready)
 {
 	// THE WAITER LIVES ON THE CLIENT, and carries an owner token. A single
 	// modem-wide slot let two unlocks steal from each other: init calls
-	// sim.unlock (modem_init_qmi.uc:563) while the eSIM path schedules its own
+	// sim.unlock (modem_init_qmi.uc:573) while the eSIM path schedules its own
 	// (esim_bridge.uc:646), and nothing serialises them — the second overwrote
 	// the first, and whichever finished first cleared the OTHER's waiter.
 	let mine = {};
@@ -1140,9 +1140,19 @@ export function power_cycle(modem, slot, cb)
 {
 	slot = (+slot >= 1) ? +slot : 1;
 
+	// when the card was last reset from here: the refresh fallback reads it
+	// to tell a refresh somebody already applied (the eSIM bridge
+	// power-cycles right after its own enable) and the echo of a reset from
+	// an unapplied one — without it each reset would arm the next. Stamped
+	// where a reset is actually sent, not on entry: a call that finds no
+	// reset path must not count, and one that first waits for the
+	// passthrough (_ensure_uim) must not have its echo fall outside the window.
+	let mark = () => { modem._sim_power_cycled_at = time(); };
+
 	let via_uim = () => {
 		let uim = modem.uim;
 
+		mark();
 		uim.request('POWER_OFF_SIM', { slot: slot }, (offerr) => {
 			// Power on regardless: if off failed because the card was already
 			// down, on still brings it back. That intent is right for a real
@@ -1163,6 +1173,7 @@ export function power_cycle(modem, slot, cb)
 		if (!modem.at)
 			return cb({ error: 'no_sim_reset_path' });
 
+		mark();
 		modem.at.send('AT+CFUN=0', (e1) => {
 			if (e1)
 				return cb(e1);
@@ -1172,8 +1183,10 @@ export function power_cycle(modem, slot, cb)
 	};
 
 	let via_mbim_or_at = () => {
-		if (modem.mbim_uicc?.reset)
+		if (modem.mbim_uicc?.reset) {
+			mark();
 			return modem.mbim_uicc.reset((err) => err ? via_at() : cb(null));
+		}
 
 		via_at();
 	};
@@ -1187,6 +1200,192 @@ export function power_cycle(modem, slot, cb)
 		return modem._ensure_uim(() => modem.uim ? via_uim() : via_mbim_or_at());
 
 	via_mbim_or_at();
+};
+
+// --- a card that re-initialised itself ---------------------------------------
+
+// A REFRESH THAT NEVER ENDS. A card that re-initialises itself — what an eSIM
+// profile enable by somebody else's LPA does, an SGP.32 IPA on the card or on
+// the router — announces it and then goes quiet: the END a re-read would wait
+// for never arrives, and the modem goes on running the previous profile's
+// identity into limited service. HW-observed on an EG25-G after an IPAe
+// profile enable (EG25GGBR07A08M2G, 2026-10-01: UIM refresh stage 1, then
+// `uim session closed: refresh`, nothing more; the status kept the old ICCID
+// until wwand was restarted). It is the RG650E's behaviour after lpac's enable
+// too, which is why the eSIM bridge never trusts the refresh and power-cycles
+// the card itself (esim_bridge.uc apply_sim_reset).
+//
+// So an announced re-initialisation that has not ended after `end_ms` gets
+// that same apply: power-cycle the card, unlock it, opts.reapply() — whose
+// `sim_refresh` sends the daemon to drop the old subscription's session and
+// re-dial. The ANNOUNCEMENT is the backend's business (QMI: UIM REFRESH
+// START, install_refresh below; MBIM: the native ready-state leaving
+// INITIALIZED, modem_mbim.uc), the apply is the same for all of them.
+//
+// Two guards keep this from becoming a second bridge. A re-initialisation
+// somebody else applied — the bridge power-cycles within a second of its own
+// enable — has a power-cycle after its start and is left to them. And one that
+// follows a power-cycle within the window is that reset's own echo: arming on
+// it would make every reset arm the next.
+//
+// opts: { log, reapply(), alive() → bool, end_ms, apply_ms }.
+// Returns { arm(why), end(), fire(), disarm() }: end() is the announced END
+// (the caller re-reads itself), fire() applies now if armed (an END that
+// reported failure), disarm() is teardown.
+export function refresh_fallback(modem, opts)
+{
+	let log = opts.log;
+	let fb = null;
+
+	let disarm = () => {
+		fb?.timer?.cancel();
+		fb = null;
+	};
+
+	let apply = (why, started) => {
+		if (!opts.alive())
+			return;
+
+		if ((modem._sim_power_cycled_at ?? 0) >= started)
+			return;   // applied by whoever started it
+
+		log('notice', sprintf('sim %s and did not complete — power-cycling the card and re-reading it, as after an eSIM switch',
+			why));
+
+		let slot = +(modem.active_slot ?? modem.config?.sim_slot ?? 1) || 1;
+
+		power_cycle(modem, slot, (perr) => {
+			if (!opts.alive())
+				return;
+
+			// a failed reset still leaves a re-read worth doing: the card
+			// may have come back on its own
+			if (perr)
+				log('warn', sprintf('sim: card power-cycle failed (%s) — re-reading it as it is',
+					perr.error ?? '?'));
+
+			uloop.timer(opts.apply_ms, () => {
+				if (opts.alive())
+					unlock(modem, () => opts.reapply());
+			});
+		});
+	};
+
+	let fire = () => {
+		if (!fb)
+			return;
+
+		let f = fb;
+
+		disarm();
+		apply(f.why, f.started);
+	};
+
+	let arm = (why) => {
+		if (fb)
+			return;
+
+		let started = time();
+		let window = int(opts.end_ms / 1000) + 1;
+
+		if (started - (modem._sim_power_cycled_at ?? 0) < window)
+			return;
+
+		fb = { why: why, started: started };
+		fb.timer = uloop.timer(opts.end_ms, fire);
+	};
+
+	return { arm: arm, end: disarm, fire: fire, disarm: disarm };
+};
+
+// QMI UIM REFRESH: registration, the WAIT_FOR_OK answer, and the fallback
+// above armed on START. Installed per UIM client (the handlers live on it).
+// Returns the teardown (cancels a pending fallback).
+export function install_refresh(modem, uim, opts)
+{
+	let log = opts.log;
+	let gen = modem._gen;
+
+	let fb = refresh_fallback(modem, {
+		...opts,
+		alive: () => modem._gen == gen && modem.uim == uim,
+	});
+
+	let session = () => ({
+		session_type: uimmod.SESSION_TYPE_PRIMARY_GW_PROVISIONING, aid: '',
+	});
+
+	uim.on('REFRESH_IND', (data) => {
+		let stage = data?.event?.stage;
+		let mode = data?.event?.mode;
+		let enf = data?.enforcement;
+
+		// What the card is prepared to interrupt to get this through. Worth
+		// logging because DATA_CALL means our WAN is about to be pulled and
+		// nothing else would explain it.
+		let forced = (enf != null && (enf & uimmod.REFRESH_ENFORCE_DATA_CALL))
+			? ' (will interrupt an active data call)' : '';
+
+		log('info', sprintf('sim refresh (stage %d, mode %d)%s', stage ?? -1, mode ?? -1, forced));
+
+		// WAIT_FOR_OK: the card is ASKING and is now waiting for an answer.
+		// wwand does not ASK to be asked (see the registration below), but a
+		// card can reach this stage for its own reasons, and then the only
+		// safe thing is to answer — a card waiting on a terminal response is
+		// a card that can stall.
+		if (stage == uimmod.REFRESH_STAGE_WAIT_FOR_OK) {
+			uim.request('REFRESH_OK', {
+				session: session(), ok: { ok_to_refresh: 1 },
+			}, (e) => {
+				if (e)
+					log('warn', sprintf('refresh-ok refused (%s) — the card may stall until its own timeout',
+						e.error ?? '?'));
+			}, { no_recovery: true });
+
+			return;
+		}
+
+		// FCN rewrites files under running applications and does send its
+		// END; every other mode re-initialises them (REFRESH_MODE_*)
+		if (stage == uimmod.REFRESH_STAGE_START) {
+			if (mode != null && mode != uimmod.REFRESH_MODE_FCN)
+				fb.arm(sprintf('refresh (mode %d) started', mode));
+
+			return;
+		}
+
+		// full reapply only once the refresh completed successfully
+		if (stage == uimmod.REFRESH_STAGE_END_SUCCESS) {
+			fb.end();
+			opts.reapply();
+		}
+
+		// a re-initialisation that failed has still left the card in an
+		// unknown state: apply it now rather than at the timeout
+		else if (stage == uimmod.REFRESH_STAGE_END_FAILURE)
+			fb.fire();
+	});
+
+	uim.request('REFRESH_REGISTER_ALL', {
+		session:  session(),
+		register: { register_flag: 1 },
+		// vote_for_init is DELIBERATELY not sent. Voting asks the card to
+		// consult us before it refreshes, which sounds strictly better —
+		// until the reply does not happen. Then the card waits out its own
+		// timeout instead of refreshing immediately, and every way the reply
+		// can be lost (the request failing, the client being torn down and
+		// rebuilt mid-refresh) turns a brief session interruption into a
+		// stall. Not voting is the status quo: the card refreshes at once
+		// and may pull the session, which is worse in one narrow case and
+		// better in every failure case. The TLV stays modelled, and the
+		// WAIT_FOR_OK handler above stays, so a card that asks anyway still
+		// gets an answer.
+	}, (e) => {
+		if (e)
+			log('debug', 'uim refresh register failed (sim-refresh notifications unavailable)');
+	}, { no_recovery: true });
+
+	return fb.disarm;
 };
 
 // --- raw APDU channel (eSIM/ES10 foundation) ---------------------------------
@@ -1295,11 +1494,118 @@ function apdu_backend(modem, slot, cb)
 	], cb);
 }
 
+// IS THE CARD'S OWN IPA IN CHARGE? An SGP.32 IoT eUICC says what it is in its
+// ISD-R's SELECT answer: the FCI carries ISDRProprietaryApplicationTemplateIoT,
+// tag E1, which only SGP.32 defines (SGP32Definitions, sgp32v1), with the
+// BIT STRING euiccConfiguration { ipaeSupported(0), enabledProfile(1) }. An
+// SGP.22 card stops at E0. HW-seen on an IoT eUICC behind an EG25-G,
+// 2026-10-01: `… E0 05 82 03 020500 E1 04 80 02 06C0` — ipaeSupported set.
+// E0 (ISDRProprietaryApplicationTemplate, SGP.22) carries the SGP.22 version
+// the card implements, `svn [2]` — 2.5.0 on that card.
+// Returns { iot, ipae_supported, svn }, null when there is no FCI to read.
+export function fci_iot_info(fci_hex)
+{
+	let b = hex_to_arr(fci_hex ?? '');
+
+	// walk a BER-TLV list in b[from..to), call fn(tag, vstart, vend)
+	let walk = (from, to, fn) => {
+		let i = from;
+
+		while (i < to) {
+			let tag = b[i++];
+
+			if ((tag & 0x1f) == 0x1f)
+				tag = (tag << 8) | b[i++];
+
+			let len = b[i++];
+
+			if (len == 0x81)
+				len = b[i++];
+			else if (len == 0x82) {
+				len = (b[i] << 8) | b[i + 1];
+				i += 2;
+			}
+
+			if (len == null || i + len > to)
+				return;
+
+			fn(tag, i, i + len);
+			i += len;
+		}
+	};
+
+	if (length(b) < 2 || b[0] != 0x6f)
+		return null;
+
+	let out = { iot: false, ipae_supported: false, svn: null };
+
+	let svn = (vs, ve) => walk(vs, ve, (t, s0, e0) => {
+		if (t == 0x82 && e0 - s0 == 3)
+			out.svn = sprintf('%d.%d.%d', b[s0], b[s0 + 1], b[s0 + 2]);
+	});
+
+	// the BIT STRING: first content byte is the unused-bit count, bit 0 of
+	// the ASN.1 named bits is the MSB of the byte after it
+	let template = (vs, ve) => {
+		out.iot = true;
+		walk(vs, ve, (t, s0, e0) => {
+			if (t == 0x80 && e0 - s0 >= 2)
+				out.ipae_supported = !!(b[s0 + 1] & 0x80);
+		});
+	};
+
+	walk(0, length(b), (tag, vs, ve) => {
+		if (tag != 0x6f)
+			return;
+
+		// E1 sits next to E0 in the FCI on the card seen; also accepted one
+		// level down, inside the proprietary A5 template
+		walk(vs, ve, (t2, s2, e2) => {
+			if (t2 == 0xe1)
+				template(s2, e2);
+			else if (t2 == 0xe0)
+				svn(s2, e2);
+			else if (t2 == 0xa5)
+				walk(s2, e2, (t3, s3, e3) => {
+					if (t3 == 0xe1)
+						template(s3, e3);
+					else if (t3 == 0xe0)
+						svn(s3, e3);
+				});
+		});
+	});
+
+	return out;
+};
+
+// THE CHOSEN TRANSPORT CAN BE GONE. `_apdu_be` is a cache, and it outlives
+// the client it names: a modem that dropped off and is re-initialising has
+// torn its clients down while the choice still says `qmi`, and the init
+// resets the cache only once it gets that far. An eSIM session in that window
+// (an IPA polling its eIM does not know the modem is restarting) dereferenced
+// the missing client and took the daemon down — HW-hit on an EG25-G, 2026-10-01,
+// `modem.uim.request` on null in apdu_open during INIT_TRANSPORT. The answer
+// is an error the session can report; the next init re-probes.
+// Returns that error, or null when the transport is there.
+function apdu_transport_gone(modem, be)
+{
+	let there = (be == 'mbim') ? modem.mbim_uicc
+		: (be == 'at') ? modem.at
+		: (be == 'qmi') ? modem.uim : true;
+
+	return there ? null : { error: 'no_apdu_channel', detail: sprintf('%s transport not available (modem re-initialising?)', be) };
+}
+
 // open a logical channel to `aid_hex` on physical slot `slot` (1-based);
 // cb(err, { channel, select_response })
 export function apdu_open(modem, slot, aid_hex, cb)
 {
 	apdu_backend(modem, slot, (be) => {
+		let gone = apdu_transport_gone(modem, be);
+
+		if (gone)
+			return cb(gone, null);
+
 		if (be == 'mbim')
 			return modem.mbim_uicc.open(aid_hex, (err, d) =>
 				cb(err, d ? { channel: d.channel, select_response: d.select_response } : null));
@@ -1407,6 +1713,11 @@ export function install_apdu_reassembly(modem)
 
 export function apdu_send(modem, slot, channel, apdu_hex, cb)
 {
+	let gone = apdu_transport_gone(modem, modem._apdu_be);
+
+	if (gone)
+		return cb(gone, null);
+
 	if (modem._apdu_be == 'mbim')
 		return modem.mbim_uicc.apdu(channel, apdu_hex, cb);
 
@@ -1481,6 +1792,11 @@ export function apdu_send(modem, slot, channel, apdu_hex, cb)
 
 export function apdu_close(modem, slot, channel, cb)
 {
+	let gone = apdu_transport_gone(modem, modem._apdu_be);
+
+	if (gone)
+		return cb(gone);
+
 	if (modem._apdu_be == 'mbim')
 		return modem.mbim_uicc.close(channel, cb);
 
@@ -1493,6 +1809,61 @@ export function apdu_close(modem, slot, channel, cb)
 	modem.uim.request('LOGICAL_CHANNEL', {
 		slot: slot, channel_id: channel, terminate: 1,
 	}, (err) => cb(err ?? null));
+};
+
+// card_euicc_info(modem, cb): what the card's ISD-R says about it, and which
+// IPA is in charge. cb(info | null), null = no ISD-R reached (a plain SIM, no
+// APDU channel, an AT transport without the FCI) — unknown, not "no".
+// info: { sgp32: bool, ipae_supported: bool, svn: '2.5.0' | null,
+//         ipa: 'ipae' | 'ipad' | null } — ipa only for an SGP.32 card.
+//
+// The FCI only says the card SUPPORTS an IPAe. Which IPA is active is decided
+// when the card starts, and a card running its IPAe refuses ES10 from the
+// device altogether, since ES10 is then internal to it: SGP.32 has the
+// device's IPA (IPAd) ask by sending ES10 at all. So GetEUICCInfo1 — which an
+// eUICC that serves a device IPA always answers — tells the two apart:
+// 6985 (conditions of use not satisfied) is IPAe, an answer is IPAd. HW-seen
+// on the card above: every ES10 command, GetEUICCInfo1 included, 6985.
+export function card_euicc_info(modem, cb)
+{
+	let slot = +(modem.active_slot ?? modem.config?.sim_slot ?? 1) || 1;
+
+	apdu_open(modem, slot, ISDR_AID, (err, ch) => {
+		if (err || ch?.channel == null)
+			return cb(null);
+
+		let fin = (v) => {
+			apdu_close(modem, slot, ch.channel, () => null);
+			cb(v);
+		};
+
+		let f = length(ch.select_response ?? '') ? fci_iot_info(ch.select_response) : null;
+
+		if (f == null)
+			return fin(null);
+
+		let info = { sgp32: f.iot, ipae_supported: f.ipae_supported, svn: f.svn, ipa: null };
+
+		if (!f.iot)
+			return fin(info);
+
+		// a card without an IPAe has only the device's IPA to serve
+		if (!f.ipae_supported) {
+			info.ipa = 'ipad';
+			return fin(info);
+		}
+
+		// STORE DATA, GetEUICCInfo1 (BF20), on this logical channel
+		let cla = (ch.channel < 4) ? (0x80 | ch.channel) : (0xc0 | (ch.channel - 4));
+
+		apdu_send(modem, slot, ch.channel, sprintf('%02XE2910003BF2000', cla), (e2, resp) => {
+			let sw = (!e2 && length(resp ?? '') >= 4) ? uc(substr(resp, -4)) : null;
+
+			info.ipa = (sw == '6985') ? 'ipae'
+				: (sw == '9000' || substr(sw ?? '', 0, 2) == '61') ? 'ipad' : null;
+			fin(info);
+		});
+	});
 };
 
 // --- PLMN selector lists (settings editor) -----------------------------------

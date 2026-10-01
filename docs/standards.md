@@ -11,6 +11,7 @@ A **check** means the standard's text was read next to the code. *Basis* is what
 |---|---|---|---|---|---|
 | <a id="r1"></a>R1 | 2026-09-29 | reference read next to the code (libqmi 1.38.0 WDA json/enums, linux 6.18.41 rmnet) | Claude (audit agent), findings verified and fixed by Claude | `wwand c5ea7d0` | `wwand de04662` |
 | <a id="r2"></a>R2 | 2026-09-29 | reference read next to the code (uhttpd 2026.06.16~7b1bec45, rpcd 2026.07.19~e37ed9d8, ucode 2026.07.09~b885dd0f, luci-base rpc.js 4b6dda1a); every LuCI call site and ACL | Claude (audit agent), findings verified and fixed by Claude | `wwand c5ea7d0, luci-app-wwand 5064320` | `wwand de04662, luci-app-wwand ff40b7c` |
+| <a id="r3"></a>R3 | 2026-10-01 | reference read next to the code (libqmi 1.38.0 data/qmi-service-loc.json) | Claude | `wwand fcab7f9` | `wwand v1.6.9` |
 
 ## Components
 
@@ -68,7 +69,8 @@ A **check** means the standard's text was read next to the code. *Basis* is what
 <tr><td rowspan="1"><b>IPv6 on the WAN</b><br><code>src-ucode/context_common.uc, deps.uc (ensure_wan6), files/wwand-proto.sh</code></td><td rowspan="1">RFC 7278 (extending a 3GPP /64), RFC 4861/4862, RFC 6877</td><td rowspan="1"></td><td rowspan="1">prefix sharing without delegation, SLAAC on the WAN, interface identifier</td><td>tbd</td><td></td><td></td></tr>
 </tbody>
 <tbody>
-<tr><td rowspan="1"><b>GNSS</b><br><code>src-ucode/{gps,nmea}.uc, codec/schema/loc.uc</code></td><td rowspan="1">NMEA 0183</td><td rowspan="1"></td><td rowspan="1">GGA, RMC, GSA, GSV; talker ids; checksum</td><td>tbd</td><td></td><td></td></tr>
+<tr><td rowspan="2"><b>GNSS</b><br><code>src-ucode/{gps,nmea}.uc, codec/schema/loc.uc</code></td><td rowspan="1">Qualcomm QMI LOC, as documented by libqmi</td><td rowspan="1">libqmi 1.38.0 data/qmi-service-loc.json</td><td rowspan="1">Register Events 0x21, Start 0x22, Stop 0x23, Position Report 0x24</td><td><a href="#r3">R3</a> 2026-10-01</td><td>ids and TLVs of Register Events, Start and Position Report match; Stop was not modelled and never sent, so a session outlived its client (added, sent before RELEASE_CID)</td><td>Start's optional Fix Recurrence Type TLV not sent (modem default); Stop not HW-proven to prevent the EG25-G QMI hang</td></tr>
+<tr><td rowspan="1">NMEA 0183</td><td rowspan="1"></td><td rowspan="1">GGA, RMC, GSA, GSV; talker ids; checksum</td><td>tbd</td><td></td><td></td></tr>
 </tbody>
 <tbody>
 <tr><td rowspan="1"><b>ubus / LuCI interface</b><br><code>src-ucode/ubus.uc, wwandctl.uc</code></td><td rowspan="1">OpenWrt rpcd / ubus conventions</td><td rowspan="1">uhttpd-mod-ubus (ubus_rpc_session injection), rpcd session.access (ACL), ucode lib/ubus.c (argument policy)</td><td rowspan="1">every LuCI-called method accepts ubus_rpc_session</td><td><a href="#r2">R2</a> 2026-09-29</td><td>all 49 methods declare it as a string (now a test); every LuCI call granted, every grant exists; wwandctl select and the LuCI MNC width fixed</td><td></td></tr>

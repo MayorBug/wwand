@@ -32,6 +32,15 @@ export default {
 			resp: {},
 		},
 
+		// libqmi 1.38 qmi-service-loc.json "Stop": the session START opened,
+		// by its id. A session is the modem's, not the client's: releasing
+		// the client does not end it (see modem.uc teardown).
+		STOP: {
+			id: 0x0023,
+			req: { session_id: { t: 0x01, f: 'u8' } },
+			resp: {},
+		},
+
 		POSITION_REPORT_IND: {
 			id: 0x0024,
 			ind: {

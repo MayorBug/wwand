@@ -197,7 +197,17 @@ export function install(self, o)
 		log: log,
 		drain_interval: self.timing.at_drain,
 		set_drain_timer: (t) => { tm.at_drain = t; },
-		next: () => { _ati_info(); step_esim_quirk(); },
+		next: () => {
+			_ati_info();
+			// a port that was mute is asked again later; AT is optional here,
+			// so the bring-up does not wait for it (ddimension/wwand#47)
+			modem_common.at_late_retry(self, {
+				at_opts: at_opts, log: log, drain_interval: self.timing.at_drain,
+				set_drain_timer: (t) => { tm.at_drain = t; },
+				next: () => _ati_info(),
+			});
+			step_esim_quirk();
+		},
 		// preserved: when AT is already open (defensive re-entry), skip straight
 		// to the datapath rather than re-running the eSIM quirk
 		reopen_next: step_datapath,
@@ -293,7 +303,7 @@ export function install(self, o)
 				why, join('; ', reasons)));
 
 			// Deliberately NOT cleared on a later init pass. The object is
-			// created once per device attach (daemon.uc:2904), so a modem that
+			// created once per device attach (daemon.uc:2928), so a modem that
 			// really did reset comes back as a NEW instance with no debt — and
 			// a re-init of THIS instance means it did not, so the debt still
 			// holds. Deduplicated because a re-init re-derives the same reason

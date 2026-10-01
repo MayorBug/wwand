@@ -405,6 +405,11 @@ function at_download(modem, activation_code, confirmation, cb)
 	if (length(confirmation ?? ''))
 		cmd += sprintf(',"%s"', confirmation);
 
+	// the port is gone while the modem re-initialises (see sim.uc
+	// apdu_transport_gone)
+	if (!modem.at)
+		return cb({ error: 'no_at_port' });
+
 	// the download is a full network transaction; give it a long window and
 	// read the +QESIM:"download",<ret> result line
 	modem.at.send(cmd, (err, res) => {

@@ -120,6 +120,13 @@ modem identity, serving cell, SIM slots, the active connection (IP/DNS/MTU,
 uptime, data), datapath and muxing, carrier aggregation and neighbour cells.
 Refreshes about once a second.
 
+The active slot's card shows ICCID, IMSI, PIN state and, for an eUICC, what
+its ISD-R says about itself: **eUICC** (SGP.32 IoT or SGP.22, with the SGP.22
+version) and **IPA** — in the card (IPAe) or on the device (IPAd). A card run
+by its own IPA keeps its profiles to itself (ES10 is closed to the router), so
+the panel says so instead of trying to read the list. The Recovery row says
+when the card-resetting steps are held after such a card changed profile.
+
 The graphs keep the last few minutes **in the browser** — nothing is stored on
 the router, so the window starts empty and a reload clears it. That is the job
 they are for: watching what turning an antenna does, while turning it.

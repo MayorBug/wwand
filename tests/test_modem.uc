@@ -909,6 +909,55 @@ scenario('e182e_exhaust', {
 		eq(length(mock.calls_for('RELEASE_CID')), 0, 'exhaust: nothing was allocated, nothing to release');
 	});
 
+// --- 5c2: the modem reset when QMI is what hangs ----------------------------
+// QMI's reset is a DMS request. With no DMS client (a bring-up that failed
+// before allocating it — EG25-G, 2026-10-01: QMI hung, AT fine) the ladder's
+// reset and the admin reset both go out over AT instead of doing nothing.
+let hang_at_writes = [];
+let hang_at_tr = {
+	write: (d) => push(hang_at_writes, d ?? ''),
+	on_data: (cb) => null,
+	close: () => null,
+	drain: () => null,
+};
+
+scenario('reset_via_at', {
+	handlers: base_handlers(),
+	at: { fx: fakefx.create(), open_transport: () => hang_at_tr },
+}, 'registered',
+	(modem, mock, events) => {
+		let dms = modem.dms, at = modem.at;
+
+		// the port the raw write goes to (set only now: an AT engine opened
+		// during the bring-up would wait on a transport that never answers)
+		modem.config.tty = '/dev/ttyUSB2';
+
+		modem.dms = null;
+		modem.at = null;
+		hang_at_writes = [];
+
+		// the ladder at its modem-reset rung
+		modem.counters.attempts = 15;
+		modem.counters.rung = 1;
+		modem.counters.proto_ok = 1;
+
+		let act = null;
+		modem.note_connect_failure((a) => { act = a; });
+		eq(act, 'modem_reset', 'reset via at: the ladder reached its reset rung');
+		ok(length(hang_at_writes) == 1 && index(hang_at_writes[0], 'AT+CFUN=1,1') == 0,
+			'reset via at: no DMS client -> AT+CFUN=1,1 on the AT port');
+
+		// and the admin reset
+		hang_at_writes = [];
+		let res = null;
+		modem.reset((e, r) => { res = e ?? r; });
+		eq(res, { resetting: true, via: 'at' }, 'reset via at: the admin reset says how it went out');
+		ok(length(hang_at_writes) == 1, 'reset via at: ...and sends it');
+
+		modem.dms = dms;
+		modem.at = at;
+	});
+
 // --- 5d: teardown releases the lazy WMS client too ---------------------------
 scenario('wms_release', {
 	// the same minimal stack as e182e, plus WMS (service 5) — that is the whole
@@ -1670,7 +1719,7 @@ scenario('ladder', {
 		// escalate. A modem that never answered gets 0 here and nothing physical
 		// happens — see the gate tests in test_recovery.
 		eq(ladder_fx.files['/state/ladder.json'],
-			'{ "attempts": 8, "proto_errors": 0, "rung": 1, "proto_hw": 0, "proto_hw_base": 0, "proto_ok": 1, "proto_name": "qmi", "unarmed_reset": 0, "outage_since": 5000 }',
+			'{ "attempts": 8, "proto_errors": 0, "rung": 1, "proto_hw": 0, "proto_hw_base": 0, "proto_ok": 1, "proto_name": "qmi", "unarmed_reset": 0, "outage_since": 5000, "card_hold_until": 0 }',
 			'ladder: state persisted (rung 1 = opmode_cycle fired, arming recorded)');
 	});
 
@@ -2124,6 +2173,7 @@ scenario('loc', {
 		] },
 		'16:REGISTER_EVENTS': {},
 		START: {},
+		STOP: {},
 	}),
 	config: { location: true },
 	setup: (mock, modem) => {
@@ -2152,6 +2202,19 @@ scenario('loc', {
 		let starts = mock.calls_for('START');
 		eq(starts[0].args.session_id, 1, 'loc: session id');
 		eq(starts[0].args.min_interval_ms, 1000, 'loc: report interval');
+
+		// the session is ended before its client is released: releasing the
+		// client alone leaves the modem's location engine running
+		let loc_cid = modem.loc.cid;
+
+		modem.stop();
+
+		let names = map(filter(mock.calls, (c) => c.name == 'STOP' ||
+			(c.name == 'RELEASE_CID' && c.args?.release?.service == 16)), (c) => c.name);
+
+		eq(names, [ 'STOP', 'RELEASE_CID' ], 'loc: STOP goes out before the client is released');
+		eq(mock.calls_for('STOP')[0]?.args?.session_id, 1, 'loc: ...for the session START opened');
+		ok(loc_cid != null, 'loc: the session had a client');
 	});
 
 // --- 12: telemetry collector --------------------------------------------------
@@ -2413,6 +2476,32 @@ scenario('sim-refresh', {
 		ok(length(ev) >= 1, 'sim-refresh: sim_refresh event emitted after re-read');
 		eq(modem.info.iccid, '89490200001022832490', 'sim-refresh: iccid re-read');
 		eq(modem.info.imsi, '262011234567890', 'sim-refresh: imsi re-read');
+	});
+
+// --- 15b: a refresh that STARTS and never ends -------------------------------
+// An eSIM enable by somebody else's LPA: stage START (mode RESET), then the
+// session closes and no END follows (HW: EG25-G, IPAe enable, 2026-10-01).
+// The modem must apply it as after its own eSIM switch — card power-cycle, then
+// the re-read whose sim_refresh puts the daemon on the re-dial.
+scenario('sim-refresh-no-end', {
+	handlers: base_handlers({ POWER_OFF_SIM: {}, POWER_ON_SIM: {} }),
+	timing: { refresh_end: 20, refresh_apply: 1 },
+	setup: (mock, modem) => {
+		let poll = null;
+		poll = uloop.timer(15, () => {
+			if (modem.state == 'READY' && modem.uim) {
+				mock.indicate(11, modem.uim.cid, 'REFRESH_IND',
+					{ event: { stage: 1, mode: 0, session_type: 0 } });
+				return;
+			}
+			poll.set(15);
+		});
+	},
+}, 'sim_refresh',
+	(modem, mock, events) => {
+		eq(length(mock.calls_for('POWER_OFF_SIM')), 1, 'refresh-no-end: card powered off');
+		eq(length(mock.calls_for('POWER_ON_SIM')), 1, 'refresh-no-end: and on again');
+		eq(modem.info.iccid, '89490200001022832490', 'refresh-no-end: identity re-read');
 	});
 
 run_next();

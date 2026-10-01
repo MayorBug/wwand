@@ -663,6 +663,61 @@ r = recovery.create({ id: 'm4', failreboot: 100, fx: fx, state_dir: '/state', lo
 r.on_proto_success();   /* control channel answered */
 eq(r.usb_repower(), false, 'repower: missing tool tolerated');
 
+// --- an IPAe card sorting out its own profile change ------------------------
+// After the card's own IPA switched profile it rolls back by itself; the
+// rungs that reset the card wait, the opmode cycle and the counting do not.
+{
+	let t = 1000;
+	let hf = fakefx.create();
+	let rh = recovery.create({ id: 'hold', failreboot: 20, fx: hf, state_dir: '/state',
+		log: silent, now: () => t });
+	rh.on_proto_success();
+	rh.hold_for_card(600, 'test');
+
+	let acts = [];
+
+	for (let i = 1; i <= 24; i++)
+		push(acts, rh.on_attempt());
+
+	eq(acts[7], 'opmode_cycle', 'card hold: the opmode cycle still runs (it leaves the card powered)');
+	eq(length(filter(acts, (a) => a == 'modem_reset' || a == 'usb_repower' || a == 'reboot')), 0,
+		'card hold: no modem reset, repower or reboot inside the hold');
+	eq(rh.counters.attempts, 24, 'card hold: the ladder keeps counting');
+	eq(rh.card_hold_left(), 600, 'card hold: time left reported');
+
+	// a restart inside the window keeps it
+	let rh2 = recovery.create({ id: 'hold', failreboot: 20, fx: hf, state_dir: '/state',
+		log: silent, now: () => t });
+	rh2.load();
+	eq(rh2.card_hold_left(), 600, 'card hold: survives a daemon restart');
+
+	// after the window the due rungs fire, one per failure, in order
+	t += 601;
+	eq(rh2.on_attempt(), 'modem_reset', 'card hold: past it, the due modem reset fires first');
+	eq(rh2.on_attempt(), 'usb_repower', 'card hold: then the repower');
+	eq(rh2.on_attempt(), 'reboot', 'card hold: then the reboot (past failreboot)');
+
+	// a later, shorter hold does not cut a running one short
+	rh2.hold_for_card(1000, 'a');
+	rh2.hold_for_card(10, 'b');
+	eq(rh2.card_hold_left(), 1000, 'card hold: only ever extended');
+
+	// protocol errors: no hardware reset inside the hold either
+	let rp = recovery.create({ id: 'holdp', failreboot: 100, proto_error_limit: 3, fx: hf,
+		state_dir: '/state', log: silent, now: () => t });
+	rp.on_proto_success();
+	rp.hold_for_card(60, 'test');
+	let pacts = [];
+	for (let i = 1; i <= 10; i++)
+		push(pacts, rp.on_proto_error());
+	eq(length(filter(pacts, (a) => a != 'retry')), 0, 'card hold: protocol errors reset nothing either');
+
+	// 0 means off
+	let r0 = recovery.create({ id: 'hold0', failreboot: 100, fx: hf, state_dir: '/state', log: silent, now: () => t });
+	r0.hold_for_card(0, 'off');
+	eq(r0.card_hold_left(), 0, 'card hold: 0 sets no hold');
+}
+
 // reboot is deferred and deduplicated
 fx = fakefx.create();
 r = recovery.create({ id: 'm5', failreboot: 100, fx: fx, state_dir: '/state', log: silent, reboot_delay: 10 });

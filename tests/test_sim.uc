@@ -1573,6 +1573,241 @@ scenario('puk: no transport -> clean error', (next) => {
 	});
 });
 
+// --- the cached APDU transport outlives its client ---------------------------
+// A modem re-initialising has torn its clients down while `_apdu_be` still
+// names one. An eSIM session in that window (an IPA's poll) dereferenced the
+// missing client and killed the daemon (EG25-G, 2026-10-01). Every entry point
+// must answer an error instead.
+scenario('apdu: a cached transport whose client is gone is an error, not a crash', (next) => {
+	for (let be in [ 'qmi', 'mbim', 'at' ]) {
+		let m = { timing: T, config: {}, _apdu_be: be, uim: null, mbim_uicc: null, at: null };
+		let r = {};
+
+		sim.apdu_open(m, 1, sim.ISDR_AID, (err, ch) => { r.open = err?.error; });
+		sim.apdu_send(m, 1, 1, '80E2910003BF2000', (err, v) => { r.send = err?.error; });
+		sim.apdu_close(m, 1, 1, (err) => { r.close = err?.error; });
+
+		eq(r, { open: 'no_apdu_channel', send: 'no_apdu_channel', close: 'no_apdu_channel' },
+			sprintf('apdu: cached %s without its client -> no_apdu_channel everywhere', be));
+	}
+
+	next();
+});
+
+// --- which IPA runs the card (sim.fci_iot_info / card_euicc_info) -----------
+// The FCI of the ISD-R as an SGP.32 IoT eUICC with an IPAe answered it
+// (EG25-G, 2026-10-01), and the same without the IoT template (SGP.22).
+const FCI_IOT = '6f648410a0000005591010ffffffff8900000100a543733d06072a864886fc6b01600b06092a864886fc6b020202630906072a864886fc6b036400650a06082a864886fc6b0504660c060a2b060104012a026e01039f6501ffe0058203020500e104800206c0';
+const FCI_22  = '6f5e8410a0000005591010ffffffff8900000100a543733d06072a864886fc6b01600b06092a864886fc6b020202630906072a864886fc6b036400650a06082a864886fc6b0504660c060a2b060104012a026e01039f6501ffe0058203020500';
+
+eq(sim.fci_iot_info(FCI_IOT), { iot: true, ipae_supported: true, svn: '2.5.0' }, 'fci: SGP.32 template, IPAe supported, SGP.22 2.5.0');
+eq(sim.fci_iot_info(FCI_22), { iot: false, ipae_supported: false, svn: '2.5.0' }, 'fci: an SGP.22 ISD-R has no IoT template');
+eq(sim.fci_iot_info(''), null, 'fci: none to read');
+eq(sim.fci_iot_info('6f0be104800206400000000000')?.ipae_supported, false,
+	'fci: IoT template without the ipaeSupported bit');
+
+function hex_to_bytes(h)
+{
+	let out = [];
+	for (let i = 0; i < length(h); i += 2)
+		push(out, hex(substr(h, i, 2)));
+	return out;
+}
+
+function ipae_modem(fci, store_sw, sent)
+{
+	let m = { timing: T, config: {}, _gen: 1 };
+
+	m.uim = mkclient({
+		OPEN_LOGICAL_CHANNEL: { channel_id: 1, select_response: hex_to_bytes(fci) },
+		SEND_APDU: (args, cb) => cb(null, { response: hex_to_bytes(store_sw) }),
+		LOGICAL_CHANNEL: {},
+	}, sent);
+
+	return m;
+}
+
+scenario('ipae: ES10 refused on an IPAe-capable card -> its IPAe is in charge', (next) => {
+	let sent = [], got = {};
+
+	sim.card_euicc_info(ipae_modem(FCI_IOT, '6985', sent), (v) => { got.refused = v?.ipa; });
+	sim.card_euicc_info(ipae_modem(FCI_IOT, 'bf20039000', []), (v) => { got.answered = v?.ipa; });
+	sim.card_euicc_info(ipae_modem(FCI_22, '9000', []), (v) => { got.sgp22 = v?.sgp32; });
+
+	eq(got, { refused: 'ipae', answered: 'ipad', sgp22: false },
+		'ipae: 6985 = IPAe, an answer = IPAd, no IoT template = not SGP.32');
+
+	let info = null;
+	sim.card_euicc_info(ipae_modem(FCI_IOT, '6985', []), (v) => { info = v; });
+	eq(info, { sgp32: true, ipae_supported: true, svn: '2.5.0', ipa: 'ipae' },
+		'ipae: the whole answer for the status page');
+	ok(index(sent, 'LOGICAL_CHANNEL') >= 0, 'ipae: the channel is closed again');
+	next();
+});
+
+// --- a card re-initialisation that never ends (sim.refresh_fallback) --------
+// An eSIM profile enable by somebody else's LPA: the card announces it and goes
+// quiet. The fallback applies what the eSIM bridge applies after its own
+// enable — power-cycle, unlock, reapply — and nothing when the bridge (or the
+// END) got there first.
+
+function refresh_modem(sent)
+{
+	let m = { timing: T, config: {}, _gen: 1 };
+
+	m.uim = mkclient({
+		GET_CARD_STATUS: { card_status: card(uimmod.APP_STATE_READY, 3) },
+	}, sent);
+
+	return m;
+}
+
+function refresh_fb(m, reapplied, logs)
+{
+	return sim.refresh_fallback(m, {
+		log: (lvl, msg) => push(logs ?? [], msg),
+		reapply: () => push(reapplied, true),
+		alive: () => m._gen == 1,
+		end_ms: 5, apply_ms: 1,
+	});
+}
+
+scenario('refresh fallback: an announcement with no end is applied like an eSIM switch', (next) => {
+	let sent = [], reapplied = [], logs = [];
+	let m = refresh_modem(sent);
+	let fb = refresh_fb(m, reapplied, logs);
+
+	fb.arm('refresh (mode 0) started');
+
+	uloop.timer(40, () => {
+		eq(slice(sent, 0, 2), [ 'POWER_OFF_SIM', 'POWER_ON_SIM' ],
+			'refresh fallback: the card is power-cycled');
+		ok(index(sent, 'GET_CARD_STATUS') > 1, 'refresh fallback: then unlocked (card status read after power-on)');
+		eq(length(reapplied), 1, 'refresh fallback: and re-read once');
+		ok(length(filter(logs, (l) => index(l, 'did not complete') >= 0)) == 1,
+			'refresh fallback: the log says why the card was reset');
+		next();
+	});
+});
+
+scenario('refresh fallback: an END in time leaves the card alone', (next) => {
+	let sent = [], reapplied = [];
+	let m = refresh_modem(sent);
+	let fb = refresh_fb(m, reapplied);
+
+	fb.arm('refresh (mode 0) started');
+	fb.end();
+
+	uloop.timer(20, () => {
+		eq(sent, [], 'refresh fallback: no reset after the END arrived');
+		eq(length(reapplied), 0, 'refresh fallback: the END path re-reads, not the fallback');
+		next();
+	});
+});
+
+// the eSIM bridge power-cycles right after its own enable: the refresh is
+// theirs, and a second reset would only cut the new session again
+scenario('refresh fallback: a reset by somebody else after the start wins', (next) => {
+	let sent = [], reapplied = [];
+	let m = refresh_modem(sent);
+	let fb = refresh_fb(m, reapplied);
+
+	fb.arm('refresh (mode 0) started');
+	m._sim_power_cycled_at = time() + 1;   // "after the start", whole seconds
+
+	uloop.timer(20, () => {
+		eq(sent, [], 'refresh fallback: nothing applied over the bridge');
+		eq(length(reapplied), 0, 'refresh fallback: no second re-read');
+		next();
+	});
+});
+
+// a power-cycle re-initialises the card, which announces itself again: arming
+// on that echo would make every reset arm the next one
+scenario('refresh fallback: the echo of a recent reset does not arm', (next) => {
+	let sent = [], reapplied = [];
+	let m = refresh_modem(sent);
+	let fb = refresh_fb(m, reapplied);
+
+	m._sim_power_cycled_at = time();
+	fb.arm('refresh (mode 0) started');
+
+	uloop.timer(20, () => {
+		eq(sent, [], 'refresh fallback: no reset on the echo');
+		next();
+	});
+});
+
+scenario('refresh fallback: an END with failure applies at once', (next) => {
+	let sent = [], reapplied = [];
+	let m = refresh_modem(sent);
+	let fb = sim.refresh_fallback(m, {
+		log: (lvl, msg) => null, reapply: () => push(reapplied, true),
+		alive: () => true, end_ms: 60000, apply_ms: 1,
+	});
+
+	fb.arm('refresh (mode 0) started');
+	fb.fire();
+
+	uloop.timer(20, () => {
+		eq(slice(sent, 0, 2), [ 'POWER_OFF_SIM', 'POWER_ON_SIM' ],
+			'refresh fallback: applied without waiting out end_ms');
+		eq(length(reapplied), 1, 'refresh fallback: and re-read');
+		fb.disarm();
+		next();
+	});
+});
+
+scenario('refresh fallback: a modem torn down meanwhile is left alone', (next) => {
+	let sent = [], reapplied = [];
+	let m = refresh_modem(sent);
+	let fb = refresh_fb(m, reapplied);
+
+	fb.arm('refresh (mode 0) started');
+	m._gen = 2;
+
+	uloop.timer(20, () => {
+		eq(sent, [], 'refresh fallback: no reset for a modem that went away');
+		next();
+	});
+});
+
+// QMI: what arms it. FCN rewrites files under running applications and sends
+// its END; only the re-initialising modes arm.
+scenario('refresh: QMI START arms for a reset mode, not for FCN', (next) => {
+	let sent = [], reapplied = [];
+	let m = refresh_modem(sent);
+	let disarm = sim.install_refresh(m, m.uim, {
+		log: (lvl, msg) => null, reapply: () => push(reapplied, true),
+		end_ms: 5, apply_ms: 1,
+	});
+
+	eq(sent, [ 'REFRESH_REGISTER_ALL' ], 'refresh: registered for refresh indications');
+
+	m.uim._ind.REFRESH_IND({ event: { stage: uimmod.REFRESH_STAGE_START,
+		mode: uimmod.REFRESH_MODE_FCN, session_type: 0 } });
+
+	uloop.timer(20, () => {
+		eq(sent, [ 'REFRESH_REGISTER_ALL' ], 'refresh: FCN start arms nothing');
+
+		m.uim._ind.REFRESH_IND({ event: { stage: uimmod.REFRESH_STAGE_START,
+			mode: uimmod.REFRESH_MODE_RESET, session_type: 0 } });
+
+		uloop.timer(40, () => {
+			eq(slice(sent, 1, 3), [ 'POWER_OFF_SIM', 'POWER_ON_SIM' ],
+				'refresh: a RESET start with no end power-cycles the card');
+			eq(length(reapplied), 1, 'refresh: and re-reads it');
+
+			// END_SUCCESS keeps its own direct re-read
+			m.uim._ind.REFRESH_IND({ event: { stage: uimmod.REFRESH_STAGE_END_SUCCESS,
+				mode: uimmod.REFRESH_MODE_RESET, session_type: 0 } });
+			eq(length(reapplied), 2, 'refresh: END_SUCCESS re-reads directly');
+			disarm();
+			next();
+		});
+	});
+});
+
 // --- drive -------------------------------------------------------------------
 
 uloop.timer(1, run_next);

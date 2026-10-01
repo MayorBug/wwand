@@ -34,6 +34,14 @@ by = "Claude (audit agent), findings verified and fixed by Claude"
 reviewed = "wwand c5ea7d0, luci-app-wwand 5064320"
 fixed = "wwand de04662, luci-app-wwand ff40b7c"
 
+[[reviews]]
+id = "R3"
+date = "2026-10-01"
+kind = "reference read next to the code (libqmi 1.38.0 data/qmi-service-loc.json)"
+by = "Claude"
+reviewed = "wwand fcab7f9"
+fixed = "wwand v1.6.9"
+
 [[component]]
 name = "QMI codec and service schemas"
 code = "src-ucode/codec/{qmux,tlv,hex}.uc, codec/schema/*.uc"
@@ -241,6 +249,14 @@ code = "src-ucode/context_common.uc, deps.uc (ensure_wan6), files/wwand-proto.sh
 [[component]]
 name = "GNSS"
 code = "src-ucode/{gps,nmea}.uc, codec/schema/loc.uc"
+  [[component.standard]]
+  name = "Qualcomm QMI LOC, as documented by libqmi"
+  basis = "libqmi 1.38.0 data/qmi-service-loc.json"
+  sections = "Register Events 0x21, Start 0x22, Stop 0x23, Position Report 0x24"
+    [[component.standard.review]]
+    review = "R3"
+    result = "ids and TLVs of Register Events, Start and Position Report match; Stop was not modelled and never sent, so a session outlived its client (added, sent before RELEASE_CID)"
+    open = "Start's optional Fix Recurrence Type TLV not sent (modem default); Stop not HW-proven to prevent the EG25-G QMI hang"
   [[component.standard]]
   name = "NMEA 0183"
   basis = ""

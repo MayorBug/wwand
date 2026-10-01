@@ -493,6 +493,9 @@ config wwand_modem 'm0'
 	option delay '0'                 # seconds to wait before the first init
 	option failreboot '100'          # attempts before the final reboot rung (0 = never reboot)
 	option unarmed_reset_after '300' # s: pulse THIS modem's reset_gpio once if it never answered (0 = never)
+	option card_hold '2100'          # s: after the card's own IPA (SGP.32 IPAe) changed the
+	                                 #    subscription, no modem reset / power-cycle / reboot
+	                                 #    for this long (0 = off); see "Recovery and IPAe cards"
 	option proto_error_limit '25'    # protocol-error ceiling before a reboot (gated by failreboot)
 	option zero_rx_timeout '21600'   # no-rx watchdog in seconds (0 = off)
 	option bearer_poll_count '3'     # NCM only: consecutive dial-status answers that
@@ -744,7 +747,10 @@ gnss`.
 
 Note `option location` is a DIFFERENT path: the QMI LOC service, QMI-only and
 documented as broken on Quectel. On those modems `option gnss` is the one that
-works.
+works. The LOC session is ended (LOC Stop) before its client is released on
+every teardown: releasing the client alone left the modem's location engine
+reporting every second, and an EG25-G with `option location` set hung its
+QMI side after such teardowns (2026-10-01).
 
 **Datapath plugins.** `option mux` also accepts the name of an add-on datapath
 package: `option mux 'vendorx'` makes the daemon load `wwand.datapath_vendorx`
@@ -1498,7 +1504,7 @@ every method to it.
 | `modem_get_settings` / `modem_set_settings` | `modem`, `settings?` | NAS system-selection prefs (modes/bands) — the settings editor. Sets are **idempotent**: values the modem already carries are dropped; nothing left → `unchanged: true`, no NV write, no radio disturbance. On a Fibocom FM350/FM150 (NCM) the same calls speak `+GTACT` instead: the get adds `settable` (the keys a set may carry — band lists only, none on a tuple bands cannot be written for), `supported` (the module's own band catalogue), `nr_bands_shared: true` and `persistent: false`; a set refuses any other key, and an accepted band edit is also written to the modem's `band_*` options (see *Band allow-lists*) |
 | `modem_scan` / `modem_scan_start` / `modem_scan_status` | `modem` | visible-operator scan (sync, or async start+poll — a scan takes up to ~90 s) |
 | `modem_set_network_selection` | `modem`, `mode`, `mcc?`, `mnc?` | `auto` or `manual` PLMN selection (QMI NAS / MBIM passthrough / AT+COPS). Idempotent (`unchanged: true` when the modem already runs the requested selection); on deferred-apply models the result carries `deferred: true` + `apply: 'modem_reset'` |
-| `modem_reset` | `modem` | generic admin modem reset — the apply step for `deferred` results (write ACL). Priority: dedicated reset GPIO (per-modem `reset_gpio`, or the board default when only one modem is managed), then the backend soft reset (QMI: DMS offline→reset, MBIM: passthrough-DMS or `AT+CFUN=1,1`, NCM: `AT+CFUN=1,1`). Result reports `action: 'gpio'\|'backend'`. The modem re-enumerates and every `auto` interface comes back up on its own |
+| `modem_reset` | `modem` | generic admin modem reset — the apply step for `deferred` results (write ACL). Priority: dedicated reset GPIO (per-modem `reset_gpio`, or the board default when only one modem is managed), then the backend soft reset (QMI: DMS offline→reset, MBIM: passthrough-DMS or `AT+CFUN=1,1`, NCM: `AT+CFUN=1,1`). When the QMI side or the MBIM passthrough is what hangs — no DMS client, or the request times out — QMI and MBIM reset over AT instead (`AT+CFUN=1,1`, opening the AT port for the one write if it is not open yet); the result then carries `via: 'at'`. The recovery ladder's modem-reset rung takes the same way. Result reports `action: 'gpio'\|'backend'`. The modem re-enumerates and every `auto` interface comes back up on its own |
 | `modem_plmn_lists` | `modem` | read the PLMN selector lists: `user` (EF 6F60), `nas` (QMI preferred networks), `operator`/`home` (read-only) and `fplmn` (EF 6F7B forbidden) |
 | `modem_plmn_set` | `modem`, `list_type`, `entries` | write a PLMN list to the SIM/modem; `list_type` = `user`\|`nas`\|`fplmn`; `entries` = `[{mcc,mnc[,gsm,utran,eutran,ngran]}]` (fplmn carries no AcT). Reads back for cross-verification (write ACL) |
 | `modem_plmn_restore` | `modem` | re-apply the modem's effective configured list (per-SIM `plmn_list` wins over the modem's) — the same list restored before every radio-on (write ACL) |
@@ -1651,6 +1657,18 @@ to 1):
    ```
    The eUICC issues a REFRESH; the SIM stack re-initialises and the existing
    recovery/registration path re-establishes the connection.
+
+**A profile switched by somebody else** — an SGP.32 IPA on the card or on the
+router, a remote SIM OTA — is handled the same way. wwand watches for the card
+re-initialising: on QMI the UIM REFRESH indication (any mode but FCN), on MBIM
+the native Basic Connect ready-state leaving `initialized`, which every MBIM
+modem sends (no QMI passthrough, no MS extensions needed). A refresh that ends
+re-reads the identity. One that has not ended after 10 s (`refresh_end`) — the
+common case, the card closes the session and goes quiet — gets the apply of an
+eSIM switch: SIM power-cycle (QMI UIM, else the native MBIM UICC reset, else
+AT CFUN), unlock, identity re-read and `wwand_sim` re-match. The new ICCID then
+drops the old subscription's session and re-dials (`sim.uc refresh_fallback`).
+A refresh that wwand's own eSIM operation already applied is left alone.
 
 **Dual-SIM modems (e.g. Fibocom FM350-GL):** the eUICC is a separate physical
 slot — `AT+GTDUALSIM=<0|1>` parks the active slot on the eSIM before eSIM
@@ -1906,6 +1924,30 @@ answer after the upgrade re-arms it.
   pulse is enabled. The clock is monotonic (an NTP step after boot
   neither fires nor postpones it), and it also runs on a control channel that
   produces only protocol errors and never completes an attempt.
+- **Recovery and IPAe cards.** An SGP.32 IoT eUICC whose own IPA (IPAe)
+  switches the profile watches the new one and rolls back — or falls back —
+  by itself when it brings no connectivity within the card's own timer, and it
+  counts card resets to protect itself from reboot loops. Every attempt that
+  fails on the new profile climbs the ladder meanwhile, and every rung above
+  the opmode cycle resets the card (HW, 2026-10-01: the opmode cycle came 27 min
+  after the card's switch). So when the identity changes on a card whose IPAe
+  is in charge, the modem reset, the power-cycle / reset-line pulse and the
+  reboot (attempt ladder and protocol-error ceiling alike) are held back for
+  `card_hold` seconds (default **2100**, 35 min; `0` = off). The ladder keeps
+  counting and the opmode cycle still runs; a rung that fell due fires on the
+  first failure after the hold. The hold is persisted with the counters.
+  Which IPA is in charge is read from the card, not configured: the ISD-R's
+  SELECT answer carries the SGP.32 IoT template (tag `E1`) with
+  `ipaeSupported`, and a card running its IPAe refuses ES10 from the device —
+  GetEUICCInfo1 answers `6985`. A plain SIM, an SGP.22 card, or an SGP.32 card
+  served by our own IPA (wwand-ipa) gets no hold. `status()` reports
+  `recovery.card_hold` (seconds left), `wwandctl status` prints it.
+  The card reading itself is reported per modem as `euicc` —
+  `{ sgp32, ipae_supported, svn, ipa: 'ipae' | 'ipad' | null }`, read once per
+  modem as soon as its card has been read, `null` when no ISD-R answered —
+  and shown in `wwandctl status` (`euicc` line) and in the SIM slot panel of
+  the status page (eUICC, IPA). With the IPAe in charge the page does not try
+  to read the profile list, which the card would refuse.
 - **Status LEDs** — driven from the modem's registration + signal: a **5-bar
   signal graph** (e.g. MikroTik Chateau `green:mobile-1..5`) or a **mobile / LTE**
   set (e.g. Zyxel `…:red/green:mobile`, `…:lte`).

@@ -428,6 +428,13 @@ eq(fmt.reg_text({ state: 'READY', rat: 'LTE',
    'reg_text: the modem says ENDC where the cell environment says LTE');
 
 
+// --- euicc_text: what the card's ISD-R says ----------------------------------
+eq(fmt.euicc_text({ sgp32: true, ipae_supported: true, svn: '2.5.0', ipa: 'ipae' }),
+   'SGP.32 IoT (on SGP.22 2.5.0) · IPA in the card (IPAe) — no ES10 from the router',
+   'euicc: an IPAe card says why ES10 fails');
+eq(fmt.euicc_text({ sgp32: false, svn: '2.2.2' }), 'SGP.22 2.2.2', 'euicc: an SGP.22 card');
+eq(fmt.euicc_text(null), null, 'euicc: nothing read');
+
 // --- recovery_text: the ladder in the CLI (evidence: ddimension/wwand#40) -----
 {
 	let rungs = [ { at: 8, action: 'opmode_cycle' }, { at: 16, action: 'modem_reset' },
@@ -439,6 +446,13 @@ eq(fmt.reg_text({ state: 'READY', rat: 'LTE',
 	                       next: { at: 8, action: 'opmode_cycle', in: 5 } }),
 	   'armed · 3 failed attempts · next: opmode_cycle at 8 (in 5)',
 	   'recovery: armed names the next rung and the distance to it');
+	eq(fmt.recovery_text({ armed: true, attempts: 16, rungs: rungs, card_hold: 600,
+	                       next: { at: 16, action: 'modem_reset', in: 0 } }),
+	   'armed · 16 failed attempts · next: modem_reset at 16 · card-resetting steps held for 10 min (subscription changed)',
+	   'recovery: a held rung says why it has not fired');
+	eq(fmt.recovery_text({ armed: true, attempts: 0, rungs: rungs, card_hold: 61 }),
+	   'armed · card-resetting steps held for 2 min (subscription changed)',
+	   'recovery: a hold is shown even before the first failure');
 	eq(fmt.recovery_text({ armed: false, attempts: 4, rungs: rungs, unarmed_reset: 'available',
 	                       unarmed_reset_in: 240 }),
 	   'NOT armed (never answered in this protocol) · 4 failed attempts · reset-line pulse in 240 s',

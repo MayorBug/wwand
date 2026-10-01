@@ -116,9 +116,11 @@ export function create(opts)
 		// `outage_since` is when the first failure of this outage was counted
 		// (monotonic seconds, 0 when none): the unarmed pulse is due by elapsed
 		// time, and a restart mid-outage must not start that clock again.
+		// `card_hold_until` (monotonic seconds, 0 = none): until then no step
+		// that resets the CARD may fire — see hold_for_card() below.
 		counters: { attempts: 0, proto_errors: 0, rung: 0, proto_hw: 0,
 		            proto_hw_base: 0, proto_ok: 0, proto_name: null,
-		            unarmed_reset: 0, outage_since: 0 },
+		            unarmed_reset: 0, outage_since: 0, card_hold_until: 0 },
 		// set by revoke_arming(): no path may grant the permission any more.
 		// Not persisted — it is re-derived from the config on every build.
 		arm_blocked: false,
@@ -132,6 +134,12 @@ export function create(opts)
 
 		if (data == null)
 			return;
+
+		// outside the counter block below: a hold is set on a card change,
+		// usually before any attempt has failed
+		let ch = match(data, /"card_hold_until": *([0-9]+)/);
+
+		self.counters.card_hold_until = ch ? +ch[1] : 0;
 
 		// we write this file ourselves; extract via match() because ucode's
 		// json() throws uncatchably on corrupt input
@@ -271,6 +279,65 @@ export function create(opts)
 		return (g != null && g != '') ? g : null;
 	};
 
+	// A CARD THAT IS SORTING OUT ITS OWN PROFILE CHANGE. An IoT eUICC that
+	// switched profile by itself (its IPA, on the eIM's order) watches the new
+	// profile and rolls back — or falls back to another — if it brings no
+	// connectivity within its own timer, and it counts the card resets on the
+	// way so that a reboot loop cannot keep it switching (SGP.32 rollback /
+	// fallback; the timer is the card's configuration, 30 min is a common
+	// default). Every attempt that fails on the new profile climbs this
+	// ladder meanwhile — on 3.123 the opmode cycle came 27 min after the card's
+	// switch (EG25-G, 2026-10-01), the modem reset would have come inside the
+	// card's window — and every rung above the opmode cycle resets the card:
+	// a modem reset, a power-cycle or reset-line pulse, a reboot. Each of those
+	// restarts the card's own recovery under it or uses up its loop guard.
+	//
+	// So for `secs` after a subscription change those steps are held back.
+	// The ladder keeps COUNTING — a due rung fires on the first failure after
+	// the hold, because rungs fire on a threshold crossing — and the opmode
+	// cycle still runs: it re-registers without powering the card down.
+	// Persisted with the counters, so a daemon restart inside the window does
+	// not end it. Only ever extended, never shortened, by a second change.
+	let held_noted = {};
+
+	self.hold_for_card = function(secs, why) {
+		secs = +secs;
+
+		if (!(secs > 0))
+			return;
+
+		let until = now() + secs;
+
+		if (until <= (self.counters.card_hold_until ?? 0))
+			return;
+
+		self.counters.card_hold_until = until;
+		held_noted = {};
+		log('notice', sprintf('recovery: no modem reset, power-cycle or reboot for the next %d s — %s', secs, why ?? 'the card changed its subscription'));
+		self.persist();
+	};
+
+	// seconds the hold still runs, 0 when there is none
+	self.card_hold_left = function() {
+		let left = (self.counters.card_hold_until ?? 0) - now();
+
+		return (left > 0) ? left : 0;
+	};
+
+	// true (and logged once per action) when `action` must wait for the card
+	let held_for_card = (action) => {
+		if (action == 'retry' || action == 'opmode_cycle' || !self.card_hold_left())
+			return false;
+
+		if (!held_noted[action]) {
+			held_noted[action] = true;
+			log('notice', sprintf('recovery: %s due, held back for another %d s while the card settles its profile change',
+				action, self.card_hold_left()));
+		}
+
+		return true;
+	};
+
 	let note_outage = () => {
 		if (!self.counters.outage_since) {
 			self.counters.outage_since = now();
@@ -329,7 +396,7 @@ export function create(opts)
 		// branch is skipped for being exhausted, not for being unarmed, and
 		// execution fell through to the reboot.
 		if (!self.counters.proto_ok) {
-			let act = take_unarmed_reset(n, 'failed attempts');
+			let act = held_for_card('usb_repower') ? null : take_unarmed_reset(n, 'failed attempts');
 
 			if (act)
 				return act;
@@ -360,6 +427,13 @@ export function create(opts)
 		// must not disable the cheaper hardware recovery below it.
 		if (self.counters.rung < length(RUNGS) && n >= RUNGS[self.counters.rung].at) {
 			let action = RUNGS[self.counters.rung].action;
+
+			// not advanced: the rung is still due when the hold ends
+			if (held_for_card(action)) {
+				self.persist();
+				return 'retry';
+			}
+
 			self.counters.rung++;
 			self.persist();
 			return action;
@@ -370,7 +444,7 @@ export function create(opts)
 		// logging/debugging); >0 reboots once the count passes it.
 		if (self.failreboot > 0 && n > self.failreboot) {
 			self.persist();
-			return 'reboot';
+			return held_for_card('reboot') ? 'retry' : 'reboot';
 		}
 
 		self.persist();
@@ -515,7 +589,7 @@ export function create(opts)
 		if (!self.counters.proto_ok) {
 			note_outage();
 
-			let act = take_unarmed_reset(n, 'protocol errors');
+			let act = held_for_card('usb_repower') ? null : take_unarmed_reset(n, 'protocol errors');
 
 			if (act)
 				return act;
@@ -530,6 +604,9 @@ export function create(opts)
 		}
 
 		if (n > self.proto_error_limit && !self.counters.proto_hw) {
+			if (held_for_card('usb_repower'))
+				return 'retry';
+
 			self.counters.proto_hw = 1;
 			// WHERE THE REBOOT WINDOW STARTS. Without this the gate below reads
 			// the ABSOLUTE count, and the count does not start climbing when the
@@ -558,7 +635,7 @@ export function create(opts)
 		if (self.counters.proto_hw && self.counters.proto_ok &&
 		    n - self.counters.proto_hw_base >= self.proto_error_limit) {
 			self.persist();
-			return (self.failreboot > 0) ? 'reboot' : 'retry';
+			return (self.failreboot > 0 && !held_for_card('reboot')) ? 'reboot' : 'retry';
 		}
 
 		return 'retry';

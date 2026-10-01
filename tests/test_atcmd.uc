@@ -1215,6 +1215,26 @@ eq(goth?.lines, [ '^NDISSTATQRY: 1,,,,IPV4' ],
 	'urc-merge: ^NDISSTATQRY answer survives while ^NDISSTAT is taken as a URC');
 eq(urcs9, [ '^NDISSTAT: 1,,,,IPV4' ], 'urc-merge: the ^-sigil URC is dispatched');
 
+// a PROBE's bare ERROR is an answer ("not in this firmware"), not a warning —
+// printed on every modem start otherwise (ddimension/wwand#47); a +CME ERROR
+// or a plain command's ERROR still warns
+{
+	let lv = [];
+	let trp = fake_transport();
+	let atp = atcmd.create(trp, { log: (level, msg) => push(lv, [ level, msg ]) });
+
+	atp.send('AT+QCFG="autoconnect"', () => null, { probe: true });
+	trp.reply('\r\nERROR\r\n');
+	atp.send('AT+QCFG="iotopmode"', () => null, { probe: true });
+	trp.reply('\r\n+CME ERROR: 3\r\n');
+	atp.send('AT+QSINR?', () => null);
+	trp.reply('\r\nERROR\r\n');
+
+	eq(map(lv, (x) => x[0]), [ 'info', 'warn', 'warn' ],
+		'probe: bare ERROR to a probe is info; +CME and a plain ERROR stay warnings');
+	ok(index(lv[0][1], 'declined by the modem') >= 0, 'probe: and says only what was seen');
+}
+
 // auth commands never log credentials
 let auth_logs = [];
 let tr4 = fake_transport();

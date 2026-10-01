@@ -387,6 +387,9 @@ export const TIMING_BASE = {
 	reg_timeout: 240000,   // registration guard
 	backoff_min: 5000,     // retry backoff after failures
 	backoff_max: 30000,
+	refresh_end: 10000,    // an announced card re-initialisation not ended by
+	                       // then is applied by hand (sim.refresh_fallback)
+	refresh_apply: 2000,   // card power-on -> unlock, as the eSIM bridge does
 };
 
 // match a configured wwand_sim list against a card identity: ICCID first
@@ -912,7 +915,8 @@ export function telemetry_at(self)
 		};
 
 	return {
-		send: (cmd, cb) => {
+		// o: passed through to atcmd.send (timeout, probe)
+		send: (cmd, cb, o) => {
 			if (self._at_retired?.[cmd])
 				return cb ? cb({ error: 'unsupported', detail: 'retired after repeated ERROR' }, null) : null;
 
@@ -939,7 +943,7 @@ export function telemetry_at(self)
 
 				if (cb)
 					cb(err, res);
-			});
+			}, o);
 		},
 		run_sequence: (cmds, cb) => at.run_sequence(cmds, cb),
 		close: () => at.close(),
@@ -956,20 +960,23 @@ export function telemetry_at(self)
 // expected (the modem resets itself regardless; HW-verified on the Huawei
 // E182E, 2026-08-31: CFUN re-enumerates the device and the table comes back
 // fresh).
-export function reset_stack_at(self, at_opts, log)
+// `why` names the reason in the log. Returns true when the write went out.
+export function reset_stack_at(self, at_opts, log, why)
 {
+	why ??= 'client table exhausted';
+
 	let fxi = at_opts?.fx;
 
 	if (!fxi) {
 		log('warn', 'modem reset (CFUN) impossible — no sysfs/at accessor');
-		return;
+		return false;
 	}
 
 	let ch = atcmd.find_at_channels(fxi, self.device, self.config?.tty);
 
 	if (!ch.primary) {
 		log('warn', 'modem reset (CFUN) impossible — no AT port');
-		return;
+		return false;
 	}
 
 	let open_transport = at_opts?.open_transport ?? atcmd.open_transport;
@@ -977,12 +984,55 @@ export function reset_stack_at(self, at_opts, log)
 
 	if (!tr) {
 		log('warn', sprintf('modem reset (CFUN) impossible — AT port %s will not open', ch.primary));
-		return;
+		return false;
 	}
 
 	tr.write('AT+CFUN=1,1\r');
 	tr.close();
-	log('notice', 'modem reset (CFUN) sent — client table exhausted');
+	log('notice', sprintf('modem reset (CFUN) sent — %s', why));
+	return true;
+};
+
+// THE MODEM RESET WHEN THE CONTROL CHANNEL IS THE THING THAT HANGS. QMI's
+// reset is a DMS request, MBIM's goes over the QMI passthrough — both need the
+// very channel that stopped answering. An EG25-G hung its QMI side three times
+// in one afternoon while its AT port answered normally (EG25GGBR07A08M2G,
+// 2026-10-01: CTL SYNC and GET_VERSION_INFO time out on every bring-up, ATI /
+// +CPIN / +COPS fine); the ladder's opmode cycle and modem reset were no-ops
+// for want of a DMS client, a Pi has no reset GPIO, and the only rung left
+// was rebooting the router. AT+CFUN=1,1 resets the modem from the side that
+// still works. Through the open AT engine when there is one (the answer is
+// read and the queue respected), else a raw one-shot write on the port
+// (reset_stack_at) — during a failed bring-up the engine is not open yet.
+// NOT through AT-over-MBIM (`at_over_mbim`): that engine rides the MBIM
+// channel, which is the one that hangs, so it is no way out.
+// cb(sent: bool), exactly once. Sent = the modem answered, or the request
+// timed out after it was written (a modem that resets drops the answer). An
+// engine closed under the request never calls back at all (atcmd.close drops
+// its queue), so a timer of our own answers false for it — otherwise the
+// ladder's done() and an admin reset's ubus reply would wait forever.
+export function at_reset(self, at_opts, log, why, cb)
+{
+	cb ??= (sent) => null;
+
+	if (self.at && !self.at_over_mbim) {
+		let answered = false;
+		let once = (v) => {
+			if (answered)
+				return;
+
+			answered = true;
+			guard?.cancel();
+			cb(v);
+		};
+		let guard = uloop.timer(10000, () => once(false));
+
+		log('warn', sprintf('modem reset over AT (AT+CFUN=1,1) — %s', why));
+		self.at.send('AT+CFUN=1,1', (err) => once(!err || err.error == 'timeout'), { timeout: 8000 });
+		return;
+	}
+
+	cb(reset_stack_at(self, at_opts, log, why));
 };
 
 // +CSQ: <rssi>,<ber> — rssi 0..31 coded (99 = unknown) -> dBm. The shared CSQ
@@ -1109,7 +1159,7 @@ export function collect_caps(self, cb)
 	telemetry_at(self).send('AT+QCFG="iotopmode"', (err, res) => {
 		self._iot_modes = err ? null : atcmd.parse_qcfg_iotopmode(res?.lines);
 		build();
-	});
+	}, { probe: true });   // only the IoT-capable modules have it
 };
 
 // coarse current RAT from the always-present NAS radio_ifs (highest-tech wins):
@@ -1537,6 +1587,9 @@ export function open_at(self, o)
 	if (self.at)
 		return (o.reopen_next ?? o.next)();
 
+	// set below when a real port opened but did not answer (at_late_retry)
+	self._at_mute_port = null;
+
 	let fxi = o.at_opts?.fx ?? netlink.default_fx((level, msg) => log(level, msg));
 
 	// huawei_cdc_ncm: the cdc-wdm IS the embedded AT channel (the driver
@@ -1613,7 +1666,16 @@ open_at_tty = function(self, o, fxi, log, ch, tried)
 
 	self._at_log = (level, msg) => log(level, sprintf('at: %s', msg));
 
-	self.at = atcmd.create(tr, {
+	// A LATE try (at_late_retry, recognisable by its `alive`) runs beside
+	// live telemetry and ubus calls, so its engine is NOT published as
+	// self.at until the probe below has an answer: visible earlier, it let
+	// them queue commands behind the probe, and closing it on a timeout drops
+	// that queue without a single callback (atcmd close) — a telemetry round
+	// waiting on one stays "running" for good. A bring-up publishes at once,
+	// as it always did: its own steps queue behind the probe by design (the
+	// NCM chain sends its first commands right after start()).
+	let late = (o.alive != null);
+	let candidate = atcmd.create(tr, {
 		log: (level, msg) => log(level, sprintf('at: %s', msg)),
 		on_urc: dispatch_urc('at'),
 		// only the CONTROL engine, and only where the caller asks for it: on an
@@ -1623,7 +1685,11 @@ open_at_tty = function(self, o, fxi, log, ch, tried)
 		// which is why this is passed down rather than wired in here.
 		on_answer: o.on_answer,
 	});
-	self.at_tty = tty;
+
+	if (!late) {
+		self.at = candidate;
+		self.at_tty = tty;
+	}
 
 	// A port that OPENS is not necessarily a port that answers. On a PCIe/MHI
 	// modem the DUN channel can accept writes and then go silent: seen on an
@@ -1637,6 +1703,14 @@ open_at_tty = function(self, o, fxi, log, ch, tried)
 	// Only silence disqualifies a port. A modem that answers ERROR (or a CME
 	// error) to a bare AT has answered, and stays the control channel.
 	let at_ready = () => {
+		// a late try whose modem object went away meanwhile publishes nothing
+		if (o.alive && !o.alive()) {
+			candidate.close();
+			return;
+		}
+
+		self.at = candidate;
+		self.at_tty = tty;
 
 		// dedicated telemetry channel ('at2'): telemetry polls run over a separate
 		// engine so they don't serialize behind control/dial commands. It is opened
@@ -1726,7 +1800,7 @@ open_at_tty = function(self, o, fxi, log, ch, tried)
 		self.at.run_sequence(cmds, init_done(self, o));
 	};
 
-	self.at.send('AT', (perr) => {
+	candidate.send('AT', (perr) => {
 		if (perr?.error != 'timeout' && perr?.error != 'closed') {
 			log('notice', sprintf('AT port: %s', tty));
 			return at_ready();
@@ -1734,10 +1808,14 @@ open_at_tty = function(self, o, fxi, log, ch, tried)
 
 		log('warn', sprintf('AT port %s opens but does not answer (%s) — trying the next channel',
 			tty, perr.error));
-		self.at.close();
-		self.at = null;
-		self.at_tty = null;
-		self.at_telemetry = null;
+		self._at_mute_port ??= tty;
+		candidate.close();
+
+		if (!late) {
+			self.at = null;
+			self.at_tty = null;
+			self.at_telemetry = null;
+		}
 
 		// "the next channel" used to mean only the cdc-wdm and MBIM fallbacks,
 		// so on a modem with several ttys and no port-table entry the search
@@ -1756,6 +1834,58 @@ open_at_tty = function(self, o, fxi, log, ch, tried)
 
 		open_at_over_wdm(self, o, fxi, log, () => open_at_over_mbim(self, o, fxi, log));
 	}, { timeout: o.at_opts?.probe_timeout ?? 10000 });
+};
+
+// A PORT THAT WAS ONLY NOT READY YET. A modem's AT port can open and stay
+// silent for a while after a cold boot, longer than the bring-up probe waits;
+// the bring-up then carries on without AT, and nothing asked again until the
+// modem object was rebuilt by a reset — so the port worked after every modem
+// reset and never after a power-on. Seen on a Zyxel NR7101's RG502Q-EA
+// (RG502QEAACR13A02M4G_ZYXEL): /dev/ttyUSB2 silent for the 10 s probe after
+// power-on, answering at once after a GPIO reset (evidence:
+// ddimension/wwand#47). For backends where AT is optional (QMI, MBIM), ask
+// again later, a few times, on the same modem object. `o` is what the
+// bring-up passed to open_at, with its own `next` — called after a late
+// success, never on failure. The tries end with the modem object (_gen).
+const AT_LATE_RETRY_S = [ 30, 60, 120 ];
+
+export function at_late_retry(self, o)
+{
+	if (self.at || !self._at_mute_port)
+		return;
+
+	let gen = self._gen;
+	let log = o.log;
+	let waits = o.at_opts?.late_retry_s ?? AT_LATE_RETRY_S;   // seconds; tests shorten it
+	let i = 0;
+	let again;
+
+	log('info', sprintf('AT port %s did not answer during bring-up — asking again in %d s',
+		self._at_mute_port, waits[0]));
+
+	again = () => {
+		if (self._gen != gen || self.at)
+			return;
+
+		let port = self._at_mute_port;
+
+		open_at(self, { ...o, alive: () => self._gen == gen, next: () => {
+			if (self._gen != gen)
+				return;
+
+			if (self.at) {
+				log('notice', sprintf('AT port %s answers now (try %d after bring-up)', self.at_tty ?? port, i));
+				return o.next?.();
+			}
+
+			if (i < length(waits))
+				uloop.timer(waits[i++] * 1000, again);
+			else
+				log('warn', sprintf('AT port %s never answered — no AT side channel until the modem is reset', port ?? '?'));
+		} });
+	};
+
+	uloop.timer(waits[i++] * 1000, again);
 };
 
 // A decoded QMI signal reply carries the TLVs as they sit on the wire, and ONE

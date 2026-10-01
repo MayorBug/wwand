@@ -2375,4 +2375,86 @@ assert_attach_cause_from_ceer(null, null, null, 'ceer/silent');
 	   'remote card on MBIM: its identity read from the card when MBIM names none');
 }
 
+// A CARD RE-INITIALISING UNDER A RUNNING MODEM, seen NATIVELY: an eSIM
+// enable by somebody else's LPA takes the ready-state out of INITIALIZED. Back
+// in time -> nothing; not back -> the eSIM switch's apply (card reset, re-read)
+// — on the Basic Connect indication alone, no passthrough, no AT.
+function assert_ready_state_reinit(comes_back, label) {
+	uloop.init();
+
+	let mock = mbim_mockhub.create({ schemas: [ bc, ext ], handlers: handlers() });
+	let resets = 0, refreshed = 0, finished_ = false;
+	let m;
+
+	m = modem_mbim.create({
+		id: 'm_reinit', device: '/dev/mockreinit', config: { apn: 'internet' },
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1,
+		          refresh_end: 30, refresh_apply: 1 },
+		at: { fx: { read: () => null, glob: () => [] } },
+		deps: { transport_open: mock.transport_open, log: () => null,
+			on_event: (mm, event, data) => {
+				if (event == 'sim_refresh')
+					refreshed++;
+				if (event != 'registered' || finished_)
+					return;
+
+				finished_ = true;
+				// a modem with neither the passthrough nor an AT port: the
+				// native UICC reset is the only one there is
+				m._ensure_uim = (cb) => cb(null);
+				m.mbim_uicc = { reset: (cb) => { resets++; cb(null); } };
+
+				mock.indicate('SUBSCRIBER_READY_STATUS', {
+					ready_state: bc.READY_STATE_NOT_INITIALIZED,
+					subscriber_id: '', sim_iccid: '', ready_info: 0, telephone_numbers_count: 0,
+				});
+
+				if (comes_back)
+					uloop.timer(5, () => mock.indicate('SUBSCRIBER_READY_STATUS', {
+						ready_state: bc.READY_STATE_INITIALIZED,
+						subscriber_id: '262011234567890', sim_iccid: '89490200001022832490',
+						ready_info: 0, telephone_numbers_count: 0,
+					}));
+
+				uloop.timer(150, () => { m.stop(); uloop.timer(20, () => uloop.end()); });
+			},
+		},
+	});
+
+	m.start();
+	uloop.timer(3000, () => uloop.end());
+	uloop.run();
+
+	ok(finished_, sprintf('%s: the modem came up', label));
+	eq(resets, comes_back ? 0 : 1, sprintf('%s: card reset %s', label,
+		comes_back ? 'not needed — the card came back on its own' : 'applied natively'));
+	ok(comes_back || refreshed >= 1, sprintf('%s: identity re-read after the reset', label));
+}
+
+assert_ready_state_reinit(true, 'ready-state reinit/back');
+assert_ready_state_reinit(false, 'ready-state reinit/stuck');
+
+// THE RESET WHEN MBIM ITSELF IS WHAT HANGS: no passthrough to send the DMS
+// reset over, and no AT engine open yet — the AT port is opened for the one
+// write (modem_common.at_reset) instead of answering unsupported_on_backend.
+{
+	let writes = [];
+	let tr = { write: (d) => push(writes, d ?? ''), on_data: (cb) => null,
+	           close: () => null, drain: () => null };
+	let m10 = modem_mbim.create({
+		id: 'hung-mbim', device: '/dev/mock10', config: { tty: '/dev/ttyUSB2' },
+		timing: { settle: 1, reg_timeout: 500, backoff_min: 1, backoff_max: 5, at_drain: 1 },
+		at: { fx: fakefx.create(), open_transport: () => tr },
+		recovery: { fx: fakefx.create(), state_dir: '/state' },
+		deps: { log: () => null, on_event: () => null },
+	});
+	let res = null;
+
+	m10.mbim = null;   // the channel that hangs: no passthrough can come up
+	m10.reset((e, r) => { res = e ?? r; });
+
+	eq(res, { resetting: true, via: 'at' }, 'hung mbim: the reset goes out over AT');
+	ok(length(writes) == 1 && index(writes[0], 'AT+CFUN=1,1') == 0, 'hung mbim: AT+CFUN=1,1 written');
+}
+
 done('test_modem_mbim');

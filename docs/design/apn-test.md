@@ -316,6 +316,12 @@ production box — but nothing is built for that case now.
 1. **Sweep skeleton.** Package, config model, the group-by-SIM plan, slot
    switching, `context_up`/`down` per test, the ping check, the NSCA sink. This
    already replaces the current tool for the non-accounting cases.
+   **Built (2026-10-03):** `apntest/runner.uc` + `wwand-apntest` CLI + the
+   cron-keeping init script — see reference.md "APN test box". The dial goes
+   through netifd (`ifup` of the test interface with the test's APN as an
+   uncommitted uci change) rather than `context_up` directly, so addressing and
+   routes come from the production path; ubus methods are not built yet (the
+   CLI and `/tmp/wwand-apntest/last.json` are the interface for now).
 2. **eSIM groups.** Profile enable as a selection step, with the `wwand-esim`
    dependency surfaced as a plan error rather than a silent skip.
 3. **Accounting.** The plugin contract, modem-side counters, credentials out of

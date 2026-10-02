@@ -1051,6 +1051,16 @@ power-cycles the card after lpac's enable rather than trusting the refresh.
   (`atcmd.send` option `probe`: QCFG autoconnect/iotopmode, QNWLOCK reads)
   logs at info as "not implemented by this firmware" instead of a warning on
   every start.
+- **Zyxel LTE3301-M209/-Q222** (`board.uc`): the rest of the vendor helper
+  `/usr/sbin/lte3301` taken over — both boards bind both modem ids
+  (`1435 d181`, `2020 2033`), and the LTE LED lights only on LTE (daemon
+  `led_state.lte`). Not HW-verified (no unit here).
+- **wwand-apntest phase 1** (`apntest/runner.uc`, `apntest_cli.uc` ->
+  `/usr/sbin/wwand-apntest`, `files/wwand-apntest.init`, `files/apntest.config`):
+  sweep, slot groups, dial via netifd with uncommitted uci, pool/DNS regex,
+  ping, NSCA, cron. First target: apntester-gdsp-lte-m (LTE3301-M209, BG96
+  Cat-M); its plan is in /vol/release/lte3301/wwand-apntester. Accounting and
+  eUICC profiles report UNKNOWN until phases 2/3. Not HW-run yet.
 - **Open:** NCM (AT-only) has no card-reinitialisation signal wired; a
   `+QSIMSTAT`/`+CPIN` URC would be the hook. Not HW-verified yet (the
   QMI path is the case seen on 3.123).

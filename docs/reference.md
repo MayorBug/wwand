@@ -1959,7 +1959,10 @@ answer after the upgrade re-arms it.
 
 Built-in profiles: MikroTik Chateau 5G (`modem-power` + `modem-reset` + 5 signal
 LEDs), Zyxel LTE3301-plus / -m209 / -q222 (`power_modem`/`usbpower` + mobile/LTE
-LEDs), Zyxel LTE5398-M904 (`lte_power` + red/green/orange mobile LEDs), Cudy
+LEDs — the mobile LED green when registered, red blinking while searching; the
+LTE LED only on LTE, dark on a 2G/3G fallback; -m209/-q222 bind both shipped
+modem ids `1435:d181` and `2020:2033` to `option`, as Zyxel's `lte3301` helper
+did, which wwand replaces), Zyxel LTE5398-M904 (`lte_power` + red/green/orange mobile LEDs), Cudy
 LT300 (MeiG SLM770A, reset GPIO `4g`; the autosetup HW-verify platform), Zyxel
 NR7101 (the RG502Q's RESET line as `gpio515`, held for 30 s on recovery; GPIO 18
 is not used even where an image exports it as `lte_power`, because switching it
@@ -2250,6 +2253,59 @@ eSIM changes and remote cards. Rules it follows:
 
 The cards in inactive slots come from the slot list, read once when a modem
 registers and whenever the status page reads it.
+
+## APN test box (`wwand-apntest`)
+
+A dedicated test box runs scheduled end-to-end tests of APNs: per test it
+dials the APN through wwand, checks the address pool and resolvers, pings, and
+reports one verdict per check to an NSCA monitor. The plan is
+`/etc/config/apntest` (example and every option in the shipped file;
+`wwand-apntest check` validates it and REFUSES unknown options — the tool this
+replaces silently ignored a mistyped `ip_regext` for years).
+
+    wwand-apntest check | list | run [test] | last | cron-sync [off] | recover
+
+- **Schedule:** `globals.schedule`, exactly five cron fields; the init script
+  keeps one managed line in `/etc/crontabs/root` (boot, `reload_config`,
+  stop). A plan with errors or a malformed schedule leaves the existing line
+  as it was (the box keeps testing on the last good plan).
+- **One sweep at a time** (lock in `/tmp/wwand-apntest/`), bounded by
+  `run_budget` — registration and slot waits and the checks included; a test
+  it no longer reaches reports UNKNOWN. Restoring the starting SIM slot runs
+  even past the budget.
+- **Nothing outlives a test:** the interface is brought down and the test's
+  uci change reverted whatever happened in between (an exception is the
+  test's UNKNOWN). A run that was killed leaves a marker
+  (`/tmp/wwand-apntest/dirty`); the next run and the init script
+  (`wwand-apntest recover`) bring that interface down and drop its pending
+  changes. If netifd does not finish the teardown within 30 s the sweep stops
+  — later tests report UNKNOWN rather than dial into it.
+- **Exit status of `run`:** the worst verdict (0 OK … 3 UNKNOWN), and 3 when
+  any verdict could not be delivered to the monitor. `check` also refuses a
+  `monitor` without `/usr/bin/send_nsca` installed.
+- **Per test:** wait for registration (120 s; WARNING otherwise) -> write the
+  test's apn/auth/username/password/pdp_type to the test interface as an
+  UNCOMMITTED uci change (never flash; wwand re-reads it on the up) -> `ifup`
+  via netifd -> wait for an IPv4 address (the test's `budget`) -> `ip_regex`,
+  DNS present, `dns_regex` -> the checks -> `ifdown`, revert the change ->
+  `detach_after` = `modem_reattach` (IMSI off the network and back).
+- **The interface:** `globals.interface`, else the only `proto wwand`
+  interface of `globals.modem`; keep it `option auto '0'` so only the tests
+  bring it up.
+- **SIM groups:** tests are grouped by `apntest_sim`; a physical `slot` is
+  switched once per group and, with `restore_sim`, back afterwards. A
+  `wwand_sim` entry that overrides the card's APN makes its tests UNKNOWN
+  (the test APN would not be dialled).
+- **Checks:** the first check reports under the test's `service`, the others
+  as `<service>_<label|plugin>`. `ping:<host>` — 5 priming pings, then 10;
+  loss > 50 % CRITICAL, > 20 % WARNING (the old tool's thresholds), perfdata
+  `percent_packet_loss`, `rta`, `duration`. `accounting` and eUICC `profile`
+  SIMs are not in this version and report **UNKNOWN**, never OK. A
+  `wwand_sim` that overrides any connection field of the card (apn, auth,
+  username, password, pdp_type) makes the test UNKNOWN.
+- **Reporting:** `send_nsca -H <monitor> [-p <nsca_port>] -c <nsca_cfg>`, host
+  `nsca_host`; the last verdict per service is kept in
+  `/tmp/wwand-apntest/last.json` (`wwand-apntest last`).
 
 ## Plugins
 

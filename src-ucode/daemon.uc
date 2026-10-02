@@ -3395,10 +3395,17 @@ export function create(opts)
 				let m = entry?.modem, reg = m?.reg;
 				let radio_ifs = reg?.radio_ifs;
 				let on_rat = (type(radio_ifs) == 'array' && length(radio_ifs) > 0);
+				// on LTE right now, for an LTE-labelled panel LED: NAS radio
+				// interface 8 where the backend has radio_ifs (QMI, MBIM over
+				// the passthrough), else the RAT it named (rat_label, NCM's
+				// reg.mode/tech). 5G NSA keeps its LTE anchor in radio_ifs.
+				let rat_txt = lc(sprintf('%s', m?.rat_label ?? reg?.mode ?? reg?.tech ?? ''));
+				let lte = (on_rat && index(radio_ifs, 8) >= 0) || (index(rat_txt, 'lte') >= 0);
 				return {
 					present: !!m && m.state != 'ABSENT',
 					registered: is_registered(reg),
 					radio: on_rat ? radio_ifs[0] : null,
+					lte: lte,
 					roaming: reg?.roaming ?? false,
 					bars: deps.board ? deps.board.bars(m?.signal) : 0,
 				};

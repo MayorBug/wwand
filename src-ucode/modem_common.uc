@@ -245,6 +245,20 @@ export function dsd_from_serving(serving)
 	return mode ? { mode: mode, lte: lte, nr: nr } : null;
 };
 
+// how far the system clock may be from the network's time before NITZ steps
+// it (modem option nitz_time; deps.uc set_clock). Generous on purpose: NITZ
+// is second-granular at best and some networks send it late, while a clock
+// that is minutes off is wrong rather than drifting.
+export const NITZ_TOLERANCE_S = 120;
+
+// hand a network time to the daemon's clock policy, unless this modem's
+// config switched it off (`option nitz_time '0'`)
+export function nitz_apply(self, deps, epoch, tz_min)
+{
+	if (deps?.set_clock && self.config?.nitz_time !== false)
+		deps.set_clock(epoch, tz_min, 'NITZ', { tolerance: NITZ_TOLERANCE_S });
+};
+
 // convert a QMI NAS Network-Time "Universal Time" struct (already UTC) to a Unix
 // epoch, or null if absent/implausible. QMI months are 1-based (as timegm()
 // expects). Guards against a modem pushing a zeroed NITZ frame before it has a
@@ -311,17 +325,14 @@ export function urc_common(self, o)
 			}
 		}
 
-		// NITZ (network identity/time, pushed at attach). The daemon applies it
-		// only when the system clock is clearly unset (RTC-less router before
-		// NTP), so recording it is always safe.
+		// NITZ (network identity/time, pushed at attach): recorded always,
+		// applied to the clock per nitz_apply
 		let tz = nitz_ctzv(line);
 
 		if (tz) {
 			self.network_time = { epoch: tz.epoch, tz_offset_min: tz.tz_offset_min };
 			log('info', sprintf('network time (NITZ): %d utc, tz %+d min', tz.epoch, tz.tz_offset_min));
-
-			if (deps.set_clock)
-				deps.set_clock(tz.epoch, tz.tz_offset_min);
+			nitz_apply(self, deps, tz.epoch, tz.tz_offset_min);
 		}
 
 		// +CGEV PDN events are the modem's own session notifications: DEACT pokes

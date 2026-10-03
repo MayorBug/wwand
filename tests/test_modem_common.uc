@@ -1069,6 +1069,18 @@ uc_h('+CTZV: "26/08/22,10:15:00+08"');
 eq(length(uc_clock), 1, 'urc_common: NITZ reaches set_clock');
 eq(uc_self.network_time?.tz_offset_min, 120, 'urc_common: NITZ tz offset decoded (8 quarters)');
 
+// nitz_apply: the NITZ rule's tolerance goes along, and `option nitz_time '0'`
+// keeps the clock out of it (the time is still recorded for status)
+let na_calls = [];
+let na_deps = { set_clock: (e, tz, src, opts) => push(na_calls, [ e, src, opts?.tolerance ]) };
+mc.nitz_apply({ config: {} }, na_deps, 1789978872, 0);
+eq(na_calls, [ [ 1789978872, 'NITZ', mc.NITZ_TOLERANCE_S ] ],
+	'nitz_apply: on by default, with the NITZ tolerance');
+mc.nitz_apply({ config: { nitz_time: false } }, na_deps, 1789978872, 0);
+eq(length(na_calls), 1, 'nitz_apply: nitz_time false leaves the clock alone');
+mc.nitz_apply({ config: {} }, {}, 1789978872, 0);
+eq(length(na_calls), 1, 'nitz_apply: no set_clock dep is not an error');
+
 uc_h('+CGEV: ME PDN DEACT 1');
 eq(uc_liveness, 1, 'urc_common: PDN DEACT pokes only the matching cid');
 eq(uc_settings, 0, 'urc_common: PDN DEACT does not poke settings');

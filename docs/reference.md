@@ -448,6 +448,16 @@ config wwand_modem 'm0'
 	                                 #    time — but only when the clock is plainly unset
 	                                 #    (pre-2021), so it never fights sysntpd. Off by
 	                                 #    default — the router has NTP; for RTC-less installs
+	option nitz_time '1'             # the network's time (NITZ) steps the system clock
+	                                 #    when it is more than 120 s off; smaller
+	                                 #    differences stay NTP's. ON by default: an
+	                                 #    RTC-less box boots with its image's build date,
+	                                 #    which the gnss rule above takes for a set clock.
+	                                 #    The time zone is not touched. '0' = record only
+	                                 #    (status `network_time`), never set the clock.
+	                                 #    Sources: QMI NAS network time, MBIM MS Voice
+	                                 #    Extensions NITZ (only when the firmware answers
+	                                 #    the query), and +CTZV on any modem's AT port
 	option diag_port '/dev/ttyUSB0'  # explicit DM/DIAG node for the wwand-qlog add-on.
 	                                 #    wwand NEVER opens it; it is REPORTED as
 	                                 #    `diag_port` in `ubus call wwand status`.
@@ -731,9 +741,10 @@ satellites in view and their SNR, the fix type and the DOP values.
 port is only ever read once: a second modem naming a tty that is already being
 read is refused and told whose it is, because opening the same tty twice gives
 both readers a torn stream rather than two of them. `option gnss_set_time`
-hands the receiver's own time to the same `set_clock` NITZ uses, which steps
-the clock only when it is plainly unset (pre-2021) and so never fights
-sysntpd. The LuCI status page shows the same as a GNSS panel, with a map link
+hands the receiver's own time to the same `set_clock` NITZ uses; for the
+receiver it steps the clock only when it is plainly unset (pre-2021) and so
+never fights sysntpd. NITZ (`option nitz_time`, default on) uses a tolerance
+instead: more than 120 s off and the clock is stepped, either direction. The LuCI status page shows the same as a GNSS panel, with a map link
 rather than an embedded tile layer: a tile would have the router's own web
 interface fetch from a third party, and send it this router's position to do
 so, the moment anyone opened the page.

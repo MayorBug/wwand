@@ -229,6 +229,7 @@ export function modem_defaults(over)
 		at_init: [], location: false, delay: 0,
 		at2_external: false,   // release the secondary AT port for external tools
 		gnss: false,           // switch the modem's GNSS receiver on (NMEA port)
+		nitz_time: true,       // step the system clock from NITZ (see deps set_clock)
 		fcc_auth: null,        // RF unlock for laptop-SKU modems (see reference.md)
 		failreboot: 100, proto_error_limit: 25, zero_rx_timeout: 21600,
 		unarmed_reset_after: 300,   // s: first reset-line pulse of a never-answering modem
@@ -308,7 +309,7 @@ function apply_globals(s, result)
 // required but none configured" and safety-blocked the SIM).
 const MODEM_KNOWN_OPTS = [ 'protocol', 'device', 'netdev', 'path', 'usb_path', 'serial',
 	'imei', 'repower_time', 'reset_gpio', 'pincode', 'modes', 'mcc', 'mnc',
-	'mux', 'dl_datagram_max_size', 'tty', 'diag_port', 'at2_external', 'gnss', 'gnss_set_time', 'fcc_auth',
+	'mux', 'dl_datagram_max_size', 'tty', 'diag_port', 'at2_external', 'gnss', 'gnss_set_time', 'nitz_time', 'fcc_auth',
 	'at_init', 'location', 'delay', 'failreboot', 'proto_error_limit',
 	'unarmed_reset_after', 'card_hold',
 	'zero_rx_timeout', 'bearer_poll_count', 'lock_4g', 'lock_5g', 'lock_persist', 'sim_slot',
@@ -450,6 +451,13 @@ function modem_from_section(s, warnings)
 		// than any box needs. For the RTC-less installs where the modem is the
 		// only time source there is.
 		gnss_set_time: bool_opt(s.gnss_set_time, false),
+		// the network's time (NITZ) steps the system clock when it is more
+		// than a couple of minutes off — ON by default. An RTC-less box boots
+		// with the image's build date, which the gnss rule above ("plainly
+		// unset, pre-2021") reads as a sane clock, so without this a router
+		// with no NTP reachable keeps that date for good (seen on a Raspberry
+		// Pi 4 booting into 2026-06-29, 2026-10-01). '0' leaves the clock alone.
+		nitz_time: bool_opt(s.nitz_time, true),
 		// '' / unset = automatic (a tty when there is one, else the MBIM pipe);
 		// 'fibocom' | 'compal' | '1' forces the pipe and picks the vendor CID
 		at_over_mbim: s.at_over_mbim,

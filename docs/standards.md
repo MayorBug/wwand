@@ -26,7 +26,7 @@ A **check** means the standard's text was read next to the code. *Basis* is what
 </tbody>
 <tbody>
 <tr><td rowspan="2"><b>MBIM codec and backend</b><br><code>src-ucode/codec/mbim.uc, codec/mbim_schema/*.uc, {mbim_backend,mbim_client,modem_mbim,context_mbim,telemetry_mbim}.uc</code></td><td rowspan="1">USB-IF MBIM 1.0</td><td rowspan="1">libmbim 1.32</td><td rowspan="1">message framing, OPEN/CLOSE, fragments, Basic Connect CIDs, status codes</td><td>tbd</td><td></td><td></td></tr>
-<tr><td rowspan="1">Microsoft MBIM extensions (MBIMEx v2/v3, MS Basic Connect Extensions, MS UICC Low Level Access)</td><td rowspan="1">libmbim 1.32</td><td rowspan="1">version exchange, registration/packet service v2/v3, base stations info, UICC APDU/open channel/reset</td><td>tbd</td><td></td><td></td></tr>
+<tr><td rowspan="1">Microsoft MBIM extensions (MBIMEx v2/v3, MS Basic Connect Extensions, MS UICC Low Level Access, MS Voice Extensions NITZ)</td><td rowspan="1">libmbim 1.32</td><td rowspan="1">version exchange, registration/packet service v2/v3, base stations info, UICC APDU/open channel/reset, NITZ (voice extensions CID 10)</td><td>tbd</td><td></td><td></td></tr>
 </tbody>
 <tbody>
 <tr><td rowspan="1"><b>QMI-over-MBIM passthrough</b><br><code>src-ucode/{qmi_over_mbim,atcmd_mbim}.uc, codec/mbim_schema/qmi_passthrough.uc</code></td><td rowspan="1">Qualcomm QMI service over MBIM (QMI passthrough UUID)</td><td rowspan="1">libmbim 1.32, libqmi 1.38.0 (qmi-device over MBIM)</td><td rowspan="1">QMI message CID, indications per service, no CTL SYNC</td><td>tbd</td><td></td><td></td></tr>

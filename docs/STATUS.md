@@ -1070,6 +1070,26 @@ power-cycles the card after lpac's enable rather than trusting the refresh.
   `+QSIMSTAT`/`+CPIN` URC would be the hook. Not HW-verified yet (the
   QMI path is the case seen on 3.123).
 
+## The network sets the clock (2026-10-03)
+
+`option nitz_time` on the `wwand_modem`, **default on**, LuCI flag *Set the
+clock from the network* in the modem settings. A NITZ time (QMI NAS network
+time indication, or `+CTZV` on any modem's AT port) steps the system clock when
+it is more than 120 s off (`modem_common.NITZ_TOLERANCE_S`), in either
+direction; within that NTP's finer time stands. Before, NITZ stepped the clock
+only when it was "plainly unset" (pre-2021) — the GNSS rule, which it still
+shares. An RTC-less box boots with its image's build date, which that rule
+takes for a set clock, so a router without reachable NTP kept it: a Raspberry
+Pi 4 ran on 2026-06-29 a week later (2026-10-01). The time zone is not touched.
+`'0'` records the time (`network_time` in status) and leaves the clock alone.
+Native MBIM reads it too, over the MS Voice Extensions service (NITZ, CID 10;
+`codec/mbim_schema/ms_voice_ext.uc`, layout from libmbim 1.32.0): queried once
+per registration, and its indication subscribed only after the query was
+answered, because the subscribe list is one SET for every service and a
+service the firmware lacks must not put the mandatory ones at risk. The
+zone is a guint32 on the wire, read as signed; `0xFFFFFFFF` means no zone.
+Host-tested against hand-built buffers; not yet seen on hardware.
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

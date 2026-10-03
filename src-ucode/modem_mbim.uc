@@ -26,6 +26,7 @@ import * as bc from 'wwand.codec.mbim_schema.basic_connect';
 import * as ext from 'wwand.codec.mbim_schema.ms_basic_connect_ext';
 import * as context_common from 'wwand.context_common';
 import * as quectel_svc from 'wwand.codec.mbim_schema.quectel';
+import * as voice_svc from 'wwand.codec.mbim_schema.ms_voice_ext';
 // rich telemetry: native-MBIM backend + the QMI-over-MBIM passthrough (the whole
 // QMI client stack tunnelled over the open MBIM channel) + AT, chosen per
 // capability like modem.uc does over qmux.
@@ -870,6 +871,50 @@ export function create(opts)
 		});
 	};
 
+	// Network time (NITZ) over the MS Voice Extensions service — the native
+	// path, so an MBIM modem without a usable AT port gets it too.
+	self._on_nitz = function(d) {
+		// all-zero until the network has sent one; nitz_epoch refuses it
+		let epoch = modem_common.nitz_epoch(d);
+
+		if (epoch == null)
+			return;
+
+		let tz_min = voice_svc.tz_minutes(d.tz_offset_min);
+
+		self.network_time = { epoch: epoch, tz_offset_min: tz_min,
+			dst: voice_svc.tz_minutes(d.dst_offset_min) };
+		log('info', sprintf('network time (NITZ): %d utc, tz %s',
+			epoch, tz_min != null ? sprintf('%+d min', tz_min) : '?'));
+		modem_common.nitz_apply(self, deps, epoch, tz_min);
+	};
+
+	// QUERY FIRST, SUBSCRIBE ONLY ON AN ANSWER. The subscribe list is one SET
+	// carrying every service; putting a service in it that the firmware does
+	// not implement risks the whole list being refused, and with it the
+	// subscriptions that are not optional (REGISTER_STATE, CONNECT, ...). A
+	// successful query is the proof that the service exists. no_recovery: a
+	// firmware without it answers a refusal, which says nothing about the
+	// channel.
+	self._query_nitz = function() {
+		let mc = self.mbim;
+
+		mc.command(voice_svc, 'NITZ', 'query', {}, (err, d) => {
+			if (err || self.mbim != mc)
+				return;
+
+			// once per client: on() appends, and a re-registration would
+			// otherwise stack a second handler for the same indication
+			if (!mc._nitz_on) {
+				mc._nitz_on = true;
+				mc.on(voice_svc, 'NITZ', self._on_nitz);
+				mc.subscribe_events();
+			}
+
+			self._on_nitz(d);
+		}, { no_recovery: true });
+	};
+
 	self._install_indications = function() {
 		self.mbim.on(bc, 'REGISTER_STATE', (data) => self._update_register(data));
 		// v1 RSSI floor: only fill in when no richer per-RAT signal is in place
@@ -1526,6 +1571,7 @@ export function create(opts)
 			// from the handlers just installed, and a modem that refuses it is
 			// no worse off than before.
 			self.mbim.subscribe_events();
+			self._query_nitz();
 
 			let reg_timeout;
 
@@ -2581,7 +2627,7 @@ export function create(opts)
 			// — closing the HOST's MBIM session is not shown to reset the
 			// modem's embedded QMI client table, so every daemon reload leaked
 			// a NAS, a DSD and (once used) a UIM and a WMS. The E182E-class
-			// table has room for a handful. Same burst modem.uc:1583 does for
+			// table has room for a handful. Same burst modem.uc:1582 does for
 			// the native side, which the passthrough never had. ctl is NOT in this list: it is the
 			// implicit client (cid 0) and it is what carries RELEASE_CID for
 			// all the others, so it has to outlive them.

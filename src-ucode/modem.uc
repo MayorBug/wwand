@@ -188,9 +188,9 @@ export function create(opts)
 	// clients, which delivers a synchronous `cancelled` to everything in flight —
 	// so an outer set_opmode callback that ignores its error re-arms tm.settle
 	// AFTER the cancel pass. The new timer fires with self.dms already null
-	// (modem.uc:1607) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
+	// (modem.uc:1606) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
 	// which in ucode is a throw inside a uloop callback: the daemon dies and procd
-	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1276), and
+	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:1321), and
 	// every QMI site that re-arms tm.settle needs it too.
 	//
 	// `gen` is captured where the OPERATION begins, not read here — by the time a
@@ -1260,8 +1260,8 @@ export function create(opts)
 				modem_common.normalise_qmi_signal(data), self._serving_meas);
 		});
 		// Network Time / NITZ (operator-pushed UTC clock): store for status and
-		// hand epoch+tz to the daemon, which decides whether to apply it (only
-		// when the system clock is clearly unset). tz offset is signed 15-min units.
+		// hand epoch+tz to the daemon's clock policy (modem_common.nitz_apply).
+		// tz offset is signed 15-min units.
 		self.nas.on('NETWORK_TIME_IND', (data) => {
 			let epoch = modem_common.nitz_epoch(data?.universal_time);
 			if (epoch == null)
@@ -1270,8 +1270,7 @@ export function create(opts)
 			self.network_time = { epoch: epoch, tz_offset_min: tz_min, dst: data.dst_adjustment };
 			log('info', sprintf('network time (NITZ): %d utc, tz %s',
 				epoch, tz_min != null ? sprintf('%+d min', tz_min) : '?'));
-			if (deps.set_clock)
-				deps.set_clock(epoch, tz_min);
+			modem_common.nitz_apply(self, deps, epoch, tz_min);
 		});
 		// NAS event report — live RF band changes (band-steer / CA reshuffle)
 		// pushed instead of waiting for the next cell poll. Stored on self.rf_bands.

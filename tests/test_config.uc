@@ -328,6 +328,17 @@ r = padopt({
 	},
 });
 eq(r.modems.m0.diag_port, null, 'diag_port: unset stays null (discovery decides)');
+eq(r.modems.m0.nitz_time, true, 'nitz_time: unset means ON (the network sets the clock)');
+
+r = padopt({
+	network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/cdc-wdm0', nitz_time: '0' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', apn: 'i' },
+	},
+});
+eq(r.modems.m0.nitz_time, false, "nitz_time: '0' switches it off");
+eq(length(filter(r.warnings, (w) => match(w, /unknown option 'nitz_time'/))), 0,
+	'nitz_time: and is not reported as dead config');
 
 // SIM toolkit routing. Unset must mean "leave the modem alone" — this changes
 // how the card and the network talk to each other, and a default would break a

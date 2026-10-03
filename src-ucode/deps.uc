@@ -71,12 +71,32 @@ export function create(o)
 	// builds deps without it (main.uc:294), so `option gnss_set_time` was a
 	// silent no-op and the test that "proved" it passed only because it
 	// injected the property the production path does not have.
-	let set_clock = (epoch, tz_min, source) => {
-		if (!epoch || now_s() >= 1609459200)   // 2021-01-01: clock already sane
+	//
+	// opts.tolerance (seconds) is the NITZ rule instead (modem option
+	// nitz_time): step whenever the clock is further off than that. A box
+	// without an RTC boots with its image's BUILD DATE, which the "plainly
+	// unset" rule takes for a sane clock — so a router whose NTP servers are
+	// out of reach kept that date (a Raspberry Pi 4 on 2026-06-29 a week after
+	// the fact, 2026-10-01). The tolerance is what keeps NITZ from fighting
+	// sysntpd: within it NTP's finer time stands, beyond it the clock is not
+	// merely drifting but wrong.
+	let set_clock = (epoch, tz_min, source, opts) => {
+		if (!epoch)
+			return false;
+
+		let now = now_s();
+
+		if (opts?.tolerance != null) {
+			let off = (epoch > now) ? epoch - now : now - epoch;
+
+			if (off <= opts.tolerance)
+				return false;
+		}
+		else if (now >= 1609459200)   // 2021-01-01: clock already sane
 			return false;
 
 		run(sprintf('date -u -s @%d >/dev/null 2>&1', epoch));
-		logmod.log('notice', 'set system clock from %s: %d utc', source ?? 'NITZ', epoch);
+		logmod.log('notice', 'set system clock from %s: %d utc (was %d)', source ?? 'NITZ', epoch, now);
 
 		return true;
 	};

@@ -21,6 +21,7 @@ row. That is the whole maintenance rule.
 |---|---|
 | Which value wins for this connection — the card's, the interface's? | `context_common.uc conn_cfg` — per-ICCID `wwand_sim` first, interface second — except the login, which follows the APN: a `wwand_sim` with its own APN never takes the interface's credentials. The overridable set is one shared list, `context_common.uc SIM_OVERRIDABLE`. |
 | Which IP family is the PDP actually using? | `context_common.uc effective_pdp` — reads the CONFIG, never the modem's read-back. |
+| Who sets the system clock, and when does it leave it alone? | `deps.uc set_clock` — one policy for both sources: NITZ (`modem_common.uc nitz_apply` — fed by QMI NAS, `modem_mbim.uc _query_nitz` and `+CTZV`; `option nitz_time`, default on) steps when the clock is more than `NITZ_TOLERANCE_S` off; GNSS (`option gnss_set_time`) only when it is pre-2021. The time zone is never set. |
 | Which mux channel is really used (`auto` resolved)? | `config.uc effective_mux_id` |
 | Which `wwand_sim` section matches the card in the slot? | `modem_common.uc match_sim_override` |
 | What does a `proto qmi/mbim/ncm` interface become when migrated? | `config.uc migrate_plan` |

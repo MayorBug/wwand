@@ -78,9 +78,9 @@ code = "src-ucode/codec/mbim.uc, codec/mbim_schema/*.uc, {mbim_backend,mbim_clie
     [[component.standard.review]]
     review = "tbd"
   [[component.standard]]
-  name = "Microsoft MBIM extensions (MBIMEx v2/v3, MS Basic Connect Extensions, MS UICC Low Level Access)"
+  name = "Microsoft MBIM extensions (MBIMEx v2/v3, MS Basic Connect Extensions, MS UICC Low Level Access, MS Voice Extensions NITZ)"
   basis = "libmbim 1.32"
-  sections = "version exchange, registration/packet service v2/v3, base stations info, UICC APDU/open channel/reset"
+  sections = "version exchange, registration/packet service v2/v3, base stations info, UICC APDU/open channel/reset, NITZ (voice extensions CID 10)"
     [[component.standard.review]]
     review = "tbd"
 

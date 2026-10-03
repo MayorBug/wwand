@@ -508,6 +508,25 @@ function mkdeps(u, extra) {
 	ran = [];
 	d.set_clock(1789978872, null);
 	eq(length(ran), 1, 'gps clock: NITZ goes through the very same set_clock');
+
+	// THE NITZ RULE (opts.tolerance): an RTC-less box boots with its image's
+	// build date, which the "plainly unset" rule takes for sane — so NITZ
+	// steps whenever the clock is further off than the tolerance, either way
+	fake_now = 1782691200;   // 2026-06-29: a build date, a week stale
+	ran = [];
+	eq(d.set_clock(1789978872, 0, 'NITZ', { tolerance: 120 }), true,
+		'nitz clock: a clock days off is stepped although it looks sane');
+	eq(length(ran), 1, 'nitz clock: ...by one date call');
+
+	fake_now = 1789978872 + 60;
+	ran = [];
+	eq(d.set_clock(1789978872, 0, 'NITZ', { tolerance: 120 }), false,
+		'nitz clock: within the tolerance NTP\'s time stands');
+	eq(ran, [], 'nitz clock: ...and nothing runs');
+
+	fake_now = 1789978872 + 600;
+	eq(d.set_clock(1789978872, 0, 'NITZ', { tolerance: 120 }), true,
+		'nitz clock: a clock AHEAD by more than the tolerance is stepped back');
 })();
 
 

@@ -87,6 +87,7 @@ set(WWAND_UCODE_MODULES
   codec/arfcn_bands.uc codec/hex.uc codec/mbim.uc codec/qmux.uc codec/tlv.uc
   codec/mbim_schema/basic_connect.uc codec/mbim_schema/compal.uc
   codec/mbim_schema/fibocom.uc codec/mbim_schema/ms_basic_connect_ext.uc
+  codec/mbim_schema/ms_voice_ext.uc
   codec/mbim_schema/qmi_passthrough.uc codec/mbim_schema/quectel.uc
   codec/schema/cat.uc codec/schema/ctl.uc codec/schema/dms.uc codec/schema/dsd.uc
   codec/schema/loc.uc codec/schema/merge.uc codec/schema/nas.uc codec/schema/pdc.uc

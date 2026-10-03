@@ -43,8 +43,12 @@ function fake(o)
 
 	let dirty = null;
 	let down_at = null;
+	let rx = 1000, tx = 2000;
+	let api_calls = 0;
 	let ops = {
 		mark_dirty: (i) => { dirty = i; return !o.no_marker; },
+		secret_file: (content) => { o.secret = content; o.secret_live = true; return '/tmp/auth'; },
+		unlink: (path) => { o.secret_live = false; },
 		clear_dirty: () => { dirty = null; },
 		now: () => clock,
 		sleep: (ms) => { clock += ms / 1000; },
@@ -56,10 +60,28 @@ function fake(o)
 			delta[opt] = v;
 		},
 		uci_revert: (c, s) => { delta = {}; },
+		read: (path) => match(path, /rx_bytes$/) ? sprintf('%d\n', rx)
+			: match(path, /tx_bytes$/) ? sprintf('%d\n', tx) : null,
 		exec: (argv) => {
 			if (o.throw_exec)
 				die('exec exploded');
 			push(execs, join(' ', argv));
+
+			// the operator's status API (basic auth) and the test download
+			if (argv[0] == 'curl' && index(argv, '-K') >= 0) {
+				api_calls++;
+				if (o.api_down)
+					return { code: 7, out: '' };
+				return { code: 0, out: o.api_xml ? o.api_xml(clock, api_calls) : '' };
+			}
+
+			if (argv[0] == 'curl') {
+				if (o.dl_fail)
+					return { code: 22, out: '' };
+				rx += o.dl_bytes ?? 100000;
+				return { code: 0, out: '' };
+			}
+
 			return { code: 0, out: (index(argv, '10') >= 0) ? (o.ping ?? PING_OK) : '' };
 		},
 		pipe: (argv, input) => { push(piped, { argv: argv, input: input }); return 0; },
@@ -120,7 +142,7 @@ function fake(o)
 
 	return { ops: ops, calls: calls, execs: execs, piped: piped, logs: logs,
 	         delta: () => delta, slot: () => active_slot, clock: () => clock, o: o,
-	         dirty: () => dirty };
+	         dirty: () => dirty, api_calls: () => api_calls };
 }
 
 function plan_of(extra)
@@ -223,7 +245,8 @@ let by_service = (vs) => {
 	let vs = by_service(runner.create(p, f.ops).run());
 
 	eq(vs['apn-gdsp-lte-m']?.state, runner.OK, 'checks: the ping still reports');
-	eq(vs['apn-gdsp-lte-m_accounting']?.state, runner.UNKNOWN, 'checks: accounting (not in this phase) is UNKNOWN, not OK');
+	// the fake API answers nothing usable: never OK
+	ok(vs['apn-gdsp-lte-m_accounting']?.state != runner.OK, 'checks: an accounting without a record is never OK');
 }
 
 // --- a card whose wwand_sim would override the test apn -----------------------
@@ -356,6 +379,176 @@ ok(runner.resolve_interface({ modem: 'm' }, {
 	a: { '.type': 'interface', proto: 'wwand', modem: 'm' },
 	b: { '.type': 'interface', proto: 'wwand', modem: 'm' } }).error != null,
 	'iface: two candidates need `option interface`');
+
+// --- accounting: the operator's record of THIS session -------------------------
+
+// the shape of a real api-ng.m-ccp.de answer for a globalsim card
+// (application/vnd.mccp.api-v2+xml, 2026-10-03), identifiers replaced
+function mccp_xml(sessions)
+{
+	let body = '';
+
+	for (let x in sessions)
+		body += sprintf(`      <session xmlns="http://schema.m-ccp.de/api/2013/" id="%d">
+        <startTime>%s</startTime>
+        <endTime>%s</endTime>
+        <ipv4Address>%s</ipv4Address>
+        <apn>%s</apn>
+        <imei>860000000000001</imei>
+        <ratType>2</ratType>
+        <bytesIn>%d</bytesIn>
+        <bytesOut>%d</bytesOut>
+        <roundingBytes>%d</roundingBytes>
+        <bytesTotal>%d</bytesTotal>
+      </session>
+`, x.id ?? 1, x.start, x.end ?? x.start, x.ip ?? '172.20.1.5', x.apn, x.bin, x.bout, x.round ?? 0,
+		   x.bin + x.bout + (x.round ?? 0));
+
+	return sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<simcard xmlns="http://schema.m-ccp.de/api/2013/">
+  <imsi>901280000000000</imsi>
+  <name><![CDATA[test]]></name>
+  <status xmlns="http://schema.m-ccp.de/api/2013/" type="mobile_dialin">
+    <isOnline>false</isOnline>
+    <lastSessions>
+%s    </lastSessions>
+  </status>
+</simcard>
+`, body);
+}
+
+eq(runner.iso_epoch('2025-07-17T16:50:21+02:00'), 1752763821, 'iso: offset applied');
+eq(runner.iso_epoch('2026-10-03T00:00:00Z'), 1790985600, 'iso: Z');
+eq(runner.iso_epoch('17.07.2025'), null, 'iso: not a timestamp');
+
+{
+	let ss = runner.mccp_sessions(mccp_xml([
+		{ id: 2, start: '2025-07-17T16:50:21+02:00', apn: 'nbiot.global-m2m.net', bin: 1723, bout: 2331, round: 42 },
+		{ id: 1, start: '2025-07-17T16:40:21+02:00', apn: 'nbiot.global-m2m.net', bin: 10, bout: 20, round: 994 },
+	]));
+
+	eq(length(ss), 2, 'sessions: every <session> record');
+	eq([ ss[0].start, ss[0].apn, ss[0].bytes_in, ss[0].bytes_out, ss[0].bytes_total ],
+	   [ 1752763821, 'nbiot.global-m2m.net', 1723, 2331, 4096 ], 'sessions: the fields of one');
+}
+
+eq(runner.acct_state(100000, 100500)[0], runner.OK, 'acct bands: within 10% is OK');
+eq(runner.acct_state(100000, 150000)[0], runner.WARNING, 'acct bands: over 10% a warning');
+eq(runner.acct_state(100000, 250000)[0], runner.CRITICAL, 'acct bands: over 2x critical');
+eq(runner.acct_state(100000, 50000)[0], runner.CRITICAL, 'acct bands: under 90% critical');
+
+function acct_plan(acct_type)
+{
+	return plan_of({
+		mccp: { '.type': 'apntest_account', type: acct_type ?? 'mccp', base_url: 'https://api.example',
+		        username: 'acctuser', password: 'se"cret\\pw',
+		        ...(acct_type == 'iec' ? { client_id: 'c', client_secret: 's' } : {}) },
+		gdsp_cda: { '.type': 'apntest', sim: 'gdsp', apn: 'nbiot.global-m2m.net',
+			service: 'apn-gdsp-lte-m', account: 'mccp', sim_id: '901288003920645',
+			sim_type: 'globalsim', check: [ 'ping:8.8.8.8', 'accounting' ] } });
+}
+
+// a session record that starts while the test runs, with what the operator counted
+let session_at = (bin, bout) => (now) => mccp_xml([
+	{ id: 9, start: '1970-01-01T00:16:45Z', apn: 'nbiot.global-m2m.net', bin: bin, bout: bout, round: 0 },
+	{ id: 8, start: '1970-01-01T00:00:10Z', apn: 'nbiot.global-m2m.net', bin: 1, bout: 1 } ]);
+
+{
+	let f = fake({ dl_bytes: 100000, api_xml: session_at(60000, 40000) });
+	let vs = by_service(runner.create(acct_plan(), f.ops).run());
+	let v = vs['apn-gdsp-lte-m_accounting'];
+
+	eq(v?.state, runner.OK, 'accounting: the session the operator counted matches the interface');
+	ok(index(v.message, 'Interface: 100000B, operator: 100000B') >= 0, 'accounting: and says both numbers');
+	ok(index(v.perfdata, 'bytes_interface=100000') >= 0 && index(v.perfdata, 'bytes_mccp=100000') >= 0,
+		'accounting: perfdata for the monitor');
+	ok(index(join('|', f.execs), '--interface wwand0 http://217.14.168.5/mccp-accounting') >= 0,
+		'accounting: the download goes through the test interface');
+	ok(index(join('|', f.execs), 'https://api.example/globalsim/901288003920645/status') >= 0,
+		'accounting: the status of this card is asked');
+	eq(vs['apn-gdsp-lte-m']?.state, runner.OK, 'accounting: the ping still reports under the test service');
+	ok(index(join('|', f.execs), 'acctuser') < 0 && index(join('|', f.execs), 'cret') < 0,
+		'accounting: the credentials never appear in a command line');
+	eq(f.o.secret, 'user = "acctuser:se\\"cret\\\\pw"\n', 'accounting: ...they go into a curl config, quoted');
+	eq(f.o.secret_live, false, 'accounting: and the file is removed afterwards');
+}
+{
+	// the previous test's session on the same APN (ended before this dial)
+	// is listed first; this session appears on the second poll
+	let f = fake({ dl_bytes: 100000, api_xml: (now, n) => mccp_xml([
+		...(n >= 2 ? [ { id: 10, start: '1970-01-01T00:16:45Z', end: '1970-01-01T00:20:00Z',
+		                 apn: 'nbiot.global-m2m.net', bin: 60000, bout: 40000 } ] : []),
+		{ id: 9, start: '1970-01-01T00:14:00Z', end: '1970-01-01T00:15:00Z',
+		  apn: 'nbiot.global-m2m.net', bin: 5, bout: 5 } ]) });
+	let v = by_service(runner.create(acct_plan(), f.ops).run())['apn-gdsp-lte-m_accounting'];
+
+	eq(v?.state, runner.OK, 'accounting: a previous session that ended before the dial is not taken for this one');
+	eq(f.api_calls(), 2, 'accounting: it waited for the right record instead');
+}
+{
+	// same APN and time, another address: another card's or another box's
+	let f = fake({ dl_bytes: 100000, api_xml: (now) => mccp_xml([
+		{ id: 11, start: '1970-01-01T00:16:45Z', ip: '100.82.0.9', apn: 'nbiot.global-m2m.net', bin: 60000, bout: 40000 } ]) });
+	let v = by_service(runner.create(acct_plan(), f.ops).run())['apn-gdsp-lte-m_accounting'];
+
+	eq(v?.state, runner.CRITICAL, 'accounting: a record with another address is not this session');
+}
+{
+	let f = fake({ dl_fail: true, api_xml: session_at(1, 1) });
+	let v = by_service(runner.create(acct_plan(), f.ops).run())['apn-gdsp-lte-m_accounting'];
+
+	eq(v?.state, runner.UNKNOWN, 'accounting: no download, no verdict on the billing');
+}
+{
+	let f = fake({ api_xml: (now) => replace(session_at(100000, 0)(now), '<bytesIn>100000</bytesIn>', '<bytesIn>n/a</bytesIn>') });
+	let v = by_service(runner.create(acct_plan(), f.ops).run())['apn-gdsp-lte-m_accounting'];
+
+	eq(v?.state, runner.UNKNOWN, 'accounting: a malformed byte field is UNKNOWN, never OK');
+}
+{
+	// a record without an end is a session still open: not judged
+	let f = fake({ dl_bytes: 100000, api_xml: (now) => replace(session_at(60000, 40000)(now),
+		/<endTime>[^<]*<\/endTime>/g, '') });
+	let v = by_service(runner.create(acct_plan(), f.ops).run())['apn-gdsp-lte-m_accounting'];
+
+	eq(v?.state, runner.CRITICAL, 'accounting: a record without an end time is not taken');
+}
+{
+	let f = fake({ dl_bytes: 100000, api_xml: (now) => replace(session_at(60000, 40000)(now),
+		'<bytesTotal>100000</bytesTotal>', '<bytesTotal>x</bytesTotal>') });
+	let v = by_service(runner.create(acct_plan(), f.ops).run())['apn-gdsp-lte-m_accounting'];
+
+	eq(v?.state, runner.UNKNOWN, 'accounting: a malformed billed total is UNKNOWN');
+}
+eq(length(runner.mccp_sessions('<lastSessions><session><startTime>2025-07-17T16:50:21+02:00</startTime><endTime>2025-07-17T16:56:54+02:00</endTime><apn>a</apn><bytesIn>1</bytesIn><bytesOut>2</bytesOut></session><sessionList/></lastSessions>')),
+	1, 'sessions: a bare <session> counts, <sessionList> does not');
+{
+	let f = fake({ dl_bytes: 100000, api_xml: session_at(200000, 100000) });
+	let v = by_service(runner.create(acct_plan(), f.ops).run())['apn-gdsp-lte-m_accounting'];
+
+	eq(v?.state, runner.CRITICAL, 'accounting: three times the traffic billed is critical');
+}
+{
+	// only an OLD session listed — the one the old tool's tail -n1 read
+	let f = fake({ dl_bytes: 100000, api_xml: (now) => mccp_xml([
+		{ id: 8, start: '1970-01-01T00:00:10Z', apn: 'nbiot.global-m2m.net', bin: 50000, bout: 50000 } ]) });
+	let v = by_service(runner.create(acct_plan(), f.ops).run())['apn-gdsp-lte-m_accounting'];
+
+	eq(v?.state, runner.CRITICAL, 'accounting: no record of THIS session is critical, an old one does not count');
+	eq(f.api_calls(), 3, 'accounting: asked once and retried twice before saying so');
+}
+{
+	let f = fake({ api_down: true });
+	let v = by_service(runner.create(acct_plan(), f.ops).run())['apn-gdsp-lte-m_accounting'];
+
+	eq(v?.state, runner.UNKNOWN, 'accounting: an unreachable API is UNKNOWN, not a billing error');
+}
+{
+	let f = fake();
+	let v = by_service(runner.create(acct_plan('iec'), f.ops).run())['apn-gdsp-lte-m_accounting'];
+
+	eq(v?.state, runner.UNKNOWN, 'accounting: an iec account (not built yet) is UNKNOWN');
+}
 
 // --- the parsers ----------------------------------------------------------------
 eq(runner.parse_ping(PING_OK), { loss: 0, rta: 52.3 }, 'parse_ping: busybox statistics');

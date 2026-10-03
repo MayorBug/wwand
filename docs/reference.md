@@ -2299,8 +2299,22 @@ replaces silently ignored a mistyped `ip_regext` for years).
 - **Checks:** the first check reports under the test's `service`, the others
   as `<service>_<label|plugin>`. `ping:<host>` — 5 priming pings, then 10;
   loss > 50 % CRITICAL, > 20 % WARNING (the old tool's thresholds), perfdata
-  `percent_packet_loss`, `rta`, `duration`. `accounting` and eUICC `profile`
-  SIMs are not in this version and report **UNKNOWN**, never OK. A
+  `percent_packet_loss`, `rta`, `duration`.
+  `accounting[:<url>]` — compares what the operator billed for THIS session
+  with what the interface carried: during the session it downloads `<url>`
+  (default `http://217.14.168.5/mccp-accounting`) through the test interface
+  and counts rx+tx of its netdev from up to down; after the down it waits
+  180 s for the operator to account the session, then reads the card's status
+  from the test's `account` (`<base_url>/<sim_type>/<sim_id>/status`, basic
+  auth from a 0600 curl config, never in a command line; up to two more tries
+  a minute apart) and takes the session record of THIS dial: the test's APN,
+  ended after the dial started, the interface's address when the operator
+  names one, the start nearest the dial. Operator in+out within
+  90–110 % of the interface is OK, up to 2x a WARNING, beyond that or below
+  90 % CRITICAL; no record of the session is CRITICAL, an unreachable API
+  UNKNOWN. Perfdata `bytes_interface`, `bytes_mccp`, `bytes_mccp_billed`.
+  Needs curl. Account type `mccp` only — `iec` reports UNKNOWN for now, as
+  do eUICC `profile` SIMs. A
   `wwand_sim` that overrides any connection field of the card (apn, auth,
   username, password, pdp_type) makes the test UNKNOWN.
 - **Reporting:** `send_nsca -H <monitor> [-p <nsca_port>] -c <nsca_cfg>`, host

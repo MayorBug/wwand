@@ -326,5 +326,14 @@ production box — but nothing is built for that case now.
    dependency surfaced as a plan error rather than a silent skip.
 3. **Accounting.** The plugin contract, modem-side counters, credentials out of
    the package and into configuration.
+   **Built for m-ccp (2026-10-03),** inside the runner rather than as an
+   external plugin: the m-ccp answer for a globalsim card has no traffic
+   counter, only the card's last sessions (XML, `application/vnd.mccp.api-v2
+   +xml`), so the check compares THE TEST'S SESSION — found by start time and
+   APN after it ended — with the netdev's rx+tx from up to down. The old
+   `grep bytesTotal | tail -n1` read the oldest listed session and measured
+   nothing; on the gdsp box curl also failed TLS verification (exit 60)
+   without anybody noticing. `iec` still open: its answer has not been looked
+   at yet.
 4. **LuCI.** Last verdicts, a manual run button. Only once 1-3 are stable —
    a test box that reports correctly matters more than one that looks good.

@@ -105,6 +105,22 @@ function real_ops()
 			p.write(input);
 			return p.close();
 		},
+		read: (path) => fs.readfile(path),
+		// 0600 from the first byte: created with that mode, not chmod'ed after
+		secret_file: (content) => {
+			fs.mkdir(STATE_DIR);
+
+			let path = sprintf('%s/curl-auth.%d', STATE_DIR, time());
+			let f = fs.open(path, 'w', 384);   // 0600
+
+			if (!f)
+				return null;
+
+			f.write(content);
+			f.close();
+			return path;
+		},
+		unlink: (path) => fs.unlink(path),
 		sleep: (ms) => sleep(ms),
 		now: () => time(),
 		log: syslog_log,
@@ -124,6 +140,12 @@ function runtime_errors(p)
 
 	if (p.globals?.monitor && !fs.access(SEND_NSCA, 'x'))
 		push(errs, sprintf('globals: monitor is set but %s is not installed — no verdict would reach it', SEND_NSCA));
+
+	// the accounting check downloads and asks the operator's API with curl
+	let acct = filter(p.tests ?? [], (t) => length(filter(t.checks, (c) => c.name == 'accounting')));
+
+	if (length(acct) && !fs.access('/usr/bin/curl', 'x'))
+		push(errs, sprintf('test %s: the accounting check needs curl (/usr/bin/curl), which is not installed', acct[0].name));
 
 	return errs;
 }

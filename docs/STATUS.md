@@ -1061,6 +1061,11 @@ power-cycles the card after lpac's enable rather than trusting the refresh.
   ping, NSCA, cron. First target: apntester-gdsp-lte-m (LTE3301-M209, BG96
   Cat-M); its plan is in /vol/release/lte3301/wwand-apntester. Accounting and
   eUICC profiles report UNKNOWN until phases 2/3. Not HW-run yet.
+- **wwand-apntest accounting (m-ccp)**: per-session comparison of the
+  operator's record (bytesIn+bytesOut of the session that started after the
+  dial, same APN) with the netdev's rx+tx; 90–110 % OK. Verified against a
+  real api-ng.m-ccp.de answer (globalsim, 2026-10-03). `iec` accounts:
+  UNKNOWN until their answer has been looked at.
 - **Open:** NCM (AT-only) has no card-reinitialisation signal wired; a
   `+QSIMSTAT`/`+CPIN` URC would be the hook. Not HW-verified yet (the
   QMI path is the case seen on 3.123).

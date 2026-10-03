@@ -2293,7 +2293,10 @@ replaces silently ignored a mistyped `ip_regext` for years).
   — later tests report UNKNOWN rather than dial into it.
 - **Exit status of `run`:** the worst verdict (0 OK … 3 UNKNOWN), and 3 when
   any verdict could not be delivered to the monitor. `check` also refuses a
-  `monitor` without `/usr/bin/send_nsca` installed.
+  `monitor` without `/usr/bin/send_nsca` installed. That is the NSCA-ng client
+  (TLS with a per-client pre-shared key, `identity`/`password` in `nsca_cfg`),
+  package `nsca-ng` from the ddimension feed; classic NSCA's `send_nsca`
+  speaks another protocol and config format.
 - **Per test:** wait for registration (120 s; WARNING otherwise) -> write the
   test's apn/auth/username/password/pdp_type to the test interface as an
   UNCOMMITTED uci change (never flash; wwand re-reads it on the up) -> `ifup`
@@ -2328,7 +2331,7 @@ replaces silently ignored a mistyped `ip_regext` for years).
   do eUICC `profile` SIMs. A
   `wwand_sim` that overrides any connection field of the card (apn, auth,
   username, password, pdp_type) makes the test UNKNOWN.
-- **Reporting:** `send_nsca -H <monitor> [-p <nsca_port>] -c <nsca_cfg>`, host
+- **Reporting:** `send_nsca -H <monitor> [-p <nsca_port>] -c <nsca_cfg>` (NSCA-ng, default port 5668), host
   `nsca_host`; the last verdict per service is kept in
   `/tmp/wwand-apntest/last.json` (`wwand-apntest last`).
 

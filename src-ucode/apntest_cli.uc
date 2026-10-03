@@ -139,7 +139,7 @@ function runtime_errors(p)
 	let errs = [];
 
 	if (p.globals?.monitor && !fs.access(SEND_NSCA, 'x'))
-		push(errs, sprintf('globals: monitor is set but %s is not installed — no verdict would reach it', SEND_NSCA));
+		push(errs, sprintf('globals: monitor is set but %s is not installed (package nsca-ng) — no verdict would reach it', SEND_NSCA));
 
 	// the accounting check downloads and asks the operator's API with curl
 	let acct = filter(p.tests ?? [], (t) => length(filter(t.checks, (c) => c.name == 'accounting')));

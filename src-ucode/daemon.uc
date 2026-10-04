@@ -478,7 +478,7 @@ export function create(opts)
 	// KEYED BY INTERFACE, NOT CARRIED ON THE ENTRY. The marker is evidence
 	// about an interface, and the context entry lives SHORTER than the
 	// interface. A config reload that cannot resolve an interface's modem
-	// produces no entry for it at all (config.uc:897-900 warns "references
+	// produces no entry for it at all (config.uc:920-923 warns "references
 	// unknown modem" and skips it), so a marker on the entry would have nothing
 	// to be carried over from. Re-adding the modem would then build a fresh
 	// entry with no marker, the status poll would see netifd's cleared
@@ -2310,6 +2310,11 @@ export function create(opts)
 	};
 
 	let try_modeswitch = (name, entry, tty) => {
+		if (self.startup_pcie) {
+			if (entry)
+				entry.control_note = 'waiting for configured PCIe transport';
+			return;
+		}
 		log('warn', sprintf('modem %s: only a serial port present (ppp), no rich control interface', name));
 
 		if (modeswitch_tried[name]) {
@@ -2401,7 +2406,7 @@ export function create(opts)
 		if (!deps.board)
 			return null;
 
-		let rg = cfg?.reset_gpio ?? (board_gpio_ok() ? deps.board.profile?.reset_gpio : null);
+		let rg = cfg?.reset_gpio ?? (board_gpio_ok() && !deps.board.profile?.repower_uses_power ? deps.board.profile?.reset_gpio : null);
 
 		// AN OPTION THAT IS PRESENT BUT EMPTY IS NOT A LINE. uci keeps
 		// `option reset_gpio ''` as an empty string, which `??` passes straight
@@ -3234,6 +3239,7 @@ export function create(opts)
 
 		// zero-config autosetup gate (default on; wwand_globals option autosetup)
 		self.autosetup = parsed.globals?.autosetup ?? true;
+		self.startup_pcie = parsed.globals?.startup_pcie ?? false;
 
 		// context_failed's rate limit, live on reload. Read HERE and not through
 		// a daemon.set_* the reload path has to remember (the way hold_max is
@@ -4469,6 +4475,7 @@ export function create(opts)
 			profile: deps.board.profile != null,
 			has_power: deps.board.has_power,
 			reset_gpio: deps.board.profile?.reset_gpio,
+			gpio_candidates: filter(deps.board.gpio_candidates?.() ?? [], (g) => g != null),
 		} : null;
 
 		return { modems: modems, contexts: contexts,

@@ -103,6 +103,15 @@ function wwan_port_protocol(name, fx)
 	return (type == 'QMI') ? 'qmi' : (type == 'MBIM') ? 'mbim' : null;
 }
 
+// Quectel's vendor pcie_mhi driver predates the kernel wwan class. It exposes
+// control character devices through /sys/class/mhi_uci_q instead, with names
+// such as mhi_QMI0 and mhi_MBIM0.
+function legacy_mhi_protocol(name)
+{
+	return match(name ?? '', /^mhi_.*QMI[0-9]*$/i) ? 'qmi'
+		: (match(name ?? '', /^mhi_.*MBIM[0-9]*$/i) ? 'mbim' : null);
+}
+
 // A vendor fork of qmi_wwan speaks QMI just the same: Quectel ships qmi_wwan_q
 // (the driver our wwand-datapath-rmnet_nss add-on exists for), and the family
 // keeps growing. Matching the prefix rather than a fixed list matters now that
@@ -124,6 +133,10 @@ export function protocol_of(device, fx)
 	// like the RM520N on PCIe wrongly falls through to the qmi default and the
 	// daemon runs QMI CTL SYNC against an MBIM port -> sync timeout.)
 	let base = basename(sprintf('%s', device ?? ''));
+	let legacy = legacy_mhi_protocol(base);
+
+	if (legacy)
+		return legacy;
 
 	if (substr(base, 0, 4) == 'wwan') {
 		let p = wwan_port_protocol(base, fx);
@@ -186,6 +199,14 @@ export function netdev_for_device(device, fx)
 	fx = fx ?? default_fx();
 
 	let name = basename(device);
+	let legacy = match(name ?? '', /^mhi_.*QMI([0-9]+)$/i);
+
+	if (legacy) {
+		let netdev = sprintf('rmnet_mhi%s', legacy[1]);
+
+		if (fx.access(sprintf('/sys/class/net/%s', netdev)))
+			return netdev;
+	}
 
 	// USB cdc-wdm: the datapath netdev is a sibling under the same USB interface
 	let nets = fx.lsdir(sprintf('/sys/class/usbmisc/%s/device/net', name));
@@ -660,6 +681,26 @@ export function list_present(fx)
 		});
 	}
 
+	// Legacy Quectel PCIe/MHI control ports. These are not members of the
+	// kernel wwan class, but they carry the same QMI/MBIM protocols.
+	for (let path in (fx.glob('/sys/class/mhi_uci_q/mhi_QMI*',
+	                         '/sys/class/mhi_uci_q/mhi_MBIM*') ?? [])) {
+		let name = basename(path);
+		let proto = legacy_mhi_protocol(name);
+
+		if (!proto)
+			continue;
+
+		push(out, {
+			kind: 'mhi-uci',
+			device: sprintf('/dev/%s', name),
+			protocol: proto,
+			path: sysfs_path_of(path, fx),
+			serial: null,
+			vendor_id: null, product_id: null, manufacturer: null,
+		});
+	}
+
 	for (let path in (fx.glob('/sys/class/net/*') ?? [])) {
 		let netdev = basename(path);
 
@@ -809,6 +850,16 @@ export function device_for_usb_path(usb_path, fx)
 			return sprintf('/dev/%s', p.name);
 	}
 
+	// Quectel's vendor MHI stack uses the older mhi_uci_q class instead of the
+	// kernel wwan class. Match its stable full sysfs path the same way.
+	for (let path in (fx.glob('/sys/class/mhi_uci_q/mhi_QMI*',
+	                         '/sys/class/mhi_uci_q/mhi_MBIM*') ?? [])) {
+		let name = basename(path);
+
+		if (full && full_path_matches(usb_path, sysfs_path_of(path, fx)))
+			return sprintf('/dev/%s', name);
+	}
+
 	return null;
 };
 
@@ -928,6 +979,15 @@ export function list_devices(fx)
 	for (let path in (fx.glob('/sys/class/usbmisc/cdc-wdm*') ?? [])) {
 		let name = basename(path);
 		let proto = protocol_of(name, fx);
+
+		if (proto)
+			push(found, { device: sprintf('/dev/%s', name), protocol: proto });
+	}
+
+	for (let path in (fx.glob('/sys/class/mhi_uci_q/mhi_QMI*',
+	                         '/sys/class/mhi_uci_q/mhi_MBIM*') ?? [])) {
+		let name = basename(path);
+		let proto = legacy_mhi_protocol(name);
 
 		if (proto)
 			push(found, { device: sprintf('/dev/%s', name), protocol: proto });

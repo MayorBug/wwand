@@ -122,6 +122,35 @@ eq(present[0].protocol, 'qmi', 'list_present: protocol auto-detected');
 eq(present[0].serial, '99efe861', 'list_present: iSerial read pre-open');
 eq(present[0].usb_path, '3-1', 'list_present: usb device id');
 
+// Quectel's vendor PCIe driver exposes legacy mhi_uci_q character devices,
+// not kernel-wwan ports. QMI0 maps to the corresponding rmnet_mhi0 parent.
+let legacy_mhi_fx = fakefx.create({
+	present: {
+		'/dev/mhi_QMI0': true,
+		'/sys/class/mhi_uci_q/mhi_QMI0': true,
+		'/sys/class/net/rmnet_mhi0': true,
+	},
+});
+let cmhi = discovery.resolve_control({ device: '/dev/mhi_QMI0' }, legacy_mhi_fx);
+eq(discovery.protocol_of('/dev/mhi_MBIM0', legacy_mhi_fx), 'mbim',
+	'legacy MHI: MBIM control port is not classified as QMI');
+eq(cmhi?.protocol, 'qmi', 'legacy MHI: mhi_QMI0 classified as QMI');
+eq(cmhi?.netdev, 'rmnet_mhi0', 'legacy MHI: QMI0 maps to rmnet_mhi0');
+let legacy_present = discovery.list_present(legacy_mhi_fx);
+eq(length(legacy_present), 1, 'legacy MHI: listed as one present modem');
+eq(legacy_present[0]?.device, '/dev/mhi_QMI0', 'legacy MHI: control device path');
+eq(legacy_present[0]?.protocol, 'qmi', 'legacy MHI: list reports QMI');
+let legacy_mhi_path = 'pci0001:00/0001:00:00.0/0001:01:00.0/mhi_QMI0';
+let legacy_path_fx = {
+	glob: (p) => (p == '/sys/class/mhi_uci_q/mhi_QMI*')
+		? [ '/sys/class/mhi_uci_q/mhi_QMI0' ] : [],
+	realpath: (p) => (p == '/sys/class/mhi_uci_q/mhi_QMI0')
+		? '/sys/devices/' + legacy_mhi_path : null,
+	readlink: (p) => null,
+};
+eq(discovery.device_for_usb_path(legacy_mhi_path, legacy_path_fx), '/dev/mhi_QMI0',
+	'legacy MHI: saved full sysfs path resolves after restart');
+
 // --- 1h. pre-open IMEI match (modems that publish IMEI as the iSerial) -------
 let imei_fx = fakefx.create({
 	present: { '/sys/class/usbmisc/cdc-wdm0': true },

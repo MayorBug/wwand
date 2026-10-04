@@ -1236,6 +1236,33 @@ scenario('datapath-qmi-error-steps-down', {
 		eq(length(filter(events, (e) => e.event == 'error')), 0, 'qmierr: no bring-up failure');
 	});
 
+// ...and ONLY InvalidOperation: an error that says nothing about the version
+// (3 = Internal) fails at once instead of walking the modem down to a lower
+// QMAP it would then keep until its next init
+let dpfx_qe3 = fakefx.create({ present: {
+	'/sys/class/net/wwan0/qmi/pass_through': true,
+	'/sys/class/net/wwan0/qmi/raw_ip': true,
+	'/sys/module/rmnet': true,
+} });
+
+scenario('datapath-qmi-error-other', {
+	handlers: base_handlers({
+		SET_DATA_FORMAT: (args, meta) => ({ __error: 3 }),
+	}),
+	datapath: {
+		netdev: 'wwan0', ep_id: 4, mux: 'auto',
+		mux_links: [ { id: 1 } ], dgram_size: 0, fx: dpfx_qe3,
+	},
+}, 'error',
+	(modem, mock, events) => {
+		eq(length(mock.calls_for('SET_DATA_FORMAT')), 1, 'qmierr-other: one request, no ladder walk');
+
+		let errs = filter(events, (e) => e.event == 'error');
+
+		eq([ errs[0]?.data?.stage, errs[0]?.data?.err?.code ], [ 'wda_format', 3 ],
+			'qmierr-other: fails in the format stage with the modem\'s error');
+	});
+
 // ...but an error on the LAST rung still fails the format stage, with the error
 let dpfx_qe2 = fakefx.create({ present: {
 	'/sys/class/net/wwan0/qmi/pass_through': true,

@@ -710,6 +710,11 @@ eq([ netlink.ep_type_number('wwan0', epfx2), netlink.ep_iface_number('wwan0', ep
 	'ep: a usbnet netdev resolves to HSUSB and its own interface');
 epreal = {};
 
+// a netdev whose own /device exists but names no bus falls through to lower_0
+eplinks = { '/sys/class/net/odd0/device': '../../../virtual-endpoint',
+            '/sys/class/net/odd0/lower_0/device': '../../../3-1:1.4' };
+eq(netlink.ep_iface_number('odd0', epfx), 4, 'ep: a /device that names no bus does not hide lower_0');
+
 // xHCI-on-PCI: the sysfs path contains BOTH a PCI BDF (the xHCI parent) and a
 // /usbN component — usb must win (the regression the code comment warns about)
 eplinks = { '/sys/class/net/wwan1/device':

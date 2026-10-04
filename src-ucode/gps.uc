@@ -196,10 +196,10 @@ function create(o) {
 				// thing on this kind of port, and treating them alike tore the
 				// reader down within milliseconds of starting it:
 				//
-				// wwand_io.open_tty sets VMIN=0 VTIME=0 (io/src/wwand-io.c:30),
+				// wwand_io.open_tty sets VMIN=0 VTIME=0 (io/src/wwand-io.c:31),
 				// so a tty with nothing to say returns 0 bytes IMMEDIATELY —
 				// that is the configuration, not an end of file. qmit_read maps
-				// both 0 and a hard error to `false` (wwand-io.c:370), and only
+				// both 0 and a hard error to `false` (wwand-io.c:371), and only
 				// the error path sets errno, which it clears before every read.
 				// So the errno is what tells them apart: none means idle, and a
 				// real one means the device is gone. atcmd never had to make

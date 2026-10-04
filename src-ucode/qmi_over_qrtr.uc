@@ -360,13 +360,24 @@ export function create(opts)
 			if (!c || c.node != node)
 				continue;
 
+			let skey = sprintf('%d', c.service);
+
+			// a deletion names the endpoint it deletes: one whose service has
+			// meanwhile re-registered on another port is already superseded,
+			// and acting on it would drop the live mapping — for DMS, declare
+			// a modem gone that just came back (the name server reports in
+			// event order per lookup, but a restart's NEW for the new port and
+			// DEL for the old one are two events)
+			if (c.cmd == 'del' && self.svc_addr[skey] != c.port)
+				continue;
+
 			if (c.cmd == 'del' && c.service == discovery.QRTR_SVC_DMS)
 				return gone('DMS left the bus');
 
 			if (c.cmd == 'del')
-				delete self.svc_addr[sprintf('%d', c.service)];
+				delete self.svc_addr[skey];
 			else
-				self.svc_addr[sprintf('%d', c.service)] = c.port;
+				self.svc_addr[skey] = c.port;
 		}
 	}, uloop.ULOOP_READ);
 

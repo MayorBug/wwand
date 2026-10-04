@@ -1108,8 +1108,10 @@ the author on an RG520N-EB on an IPQ5018). Fixed alongside, both generic:
   netdev is `../../../mhi0_IP_HW0`, with the PCI address only above it. This
   reaches the existing MHI path (`/dev/wwan0qmi0`) as well — not yet seen on
   hardware.
-- **The QMAP ladder** steps down on a QMI error for a version, not only on an
-  echoed other version; only the last rung's error fails.
+- **The QMAP ladder** steps down on InvalidOperation (error 70) for a
+  version, not only on an echoed other version; only the last rung's error
+  fails, and any other error fails at once (a transient Internal must not
+  leave the modem on a lower QMAP until its next init).
 The hub itself, rewritten on top of #46:
 - **One socket per QMI client.** On QRTR a service tells clients apart by
   their source port; there is no client id on the wire. #46 gave every client
@@ -1125,6 +1127,11 @@ The hub itself, rewritten on top of #46:
   missing cdc-wdm, retried by the tick. `option qrtr_node` picks among several.
 - Unknown CTL requests are NotSupported instead of a fake success; a client
   whose socket cannot be opened gets ClientIdsExhausted.
+- A DEL_SERVER for an endpoint its service has already left (a restart's
+  re-registration arriving first) is ignored; `qdiscover` reads and writes
+  the control packets little-endian, as the name server does (it was host
+  order: on a big-endian target such as mips_24kc no QRTR modem would ever
+  have been found).
 Host-tested (`test_qmi_over_qrtr`, the presence gate in `test_daemon`); NOT
 yet on hardware — nobody here has a QRTR modem, xhudan is asked to verify on
 the RG520N (dual-stack, a modem reset). The feed installs

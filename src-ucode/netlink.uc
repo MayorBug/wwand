@@ -1683,6 +1683,25 @@ export function setup(fx, opts)
 	         parent: netdev };
 };
 
+const EP_HSUSB = 2, EP_PCIE = 3;
+
+// the USB interface token `<bus>-<port>[.<port>]:<cfg>.<iface>`, iface captured
+const EP_USB_IFACE = /[0-9]+-[0-9.]+:[0-9]+\.([0-9]+)$/;
+
+// the bus type of one device path, or null
+function ep_type_of(path)
+{
+	// a USB device's path always carries a `/usbN` component — checked first,
+	// because xHCI on PCI puts a PCI address in the same path
+	if (match(path, /\/usb[0-9]/))
+		return EP_HSUSB;
+
+	if (match(path, /[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]/))
+		return EP_PCIE;
+
+	return null;
+}
+
 // The device a netdev hangs off, as paths to match against: the RESOLVED path
 // first, then the bare link text. The link the kernel writes is short and
 // relative — "../../../3-1:1.4" for a usbnet device, "../../../mhi0_IP_HW0"
@@ -1711,29 +1730,14 @@ function ep_dev_paths(netdev, fx)
 		if (target != null)
 			push(out, target);
 
-		// the first link that exists is the device; lower_0 is only the
-		// fallback for a mux child that has no device of its own
-		if (length(out))
+		// stop at the first link that names a bus or a USB interface; a
+		// device that names neither (its own /device exists but says nothing
+		// about the hardware) falls through to lower_0, the physical one
+		if (length(filter(out, (p) => ep_type_of(p) != null || match(p, EP_USB_IFACE))))
 			break;
 	}
 
 	return out;
-}
-
-const EP_HSUSB = 2, EP_PCIE = 3;
-
-// the bus type of one device path, or null
-function ep_type_of(path)
-{
-	// a USB device's path always carries a `/usbN` component — checked first,
-	// because xHCI on PCI puts a PCI address in the same path
-	if (match(path, /\/usb[0-9]/))
-		return EP_HSUSB;
-
-	if (match(path, /[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]/))
-		return EP_PCIE;
-
-	return null;
 }
 
 // endpoint interface number for WDA/bind-mux (e.g. .../1-1.2:1.4 -> 4)
@@ -1754,7 +1758,7 @@ export function ep_iface_number(netdev, fx)
 		// "../../../3-1:1.4"). Require the `-`-bearing bus-port token so a bare
 		// PCI BDF ("0001:01:00.0") does NOT match the ":<cfg>.<iface>" suffix and
 		// report a bogus interface 0 for an MHI/PCIe modem.
-		let m = match(target, /[0-9]+-[0-9.]+:[0-9]+\.([0-9]+)$/);
+		let m = match(target, EP_USB_IFACE);
 
 		if (m)
 			return +m[1];

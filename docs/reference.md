@@ -452,8 +452,9 @@ config wwand_modem 'm0'
 	                                 #   latches the old one while a session is
 	                                 #   up, and the downlink goes silent.
 	                                 #   A version the modem refuses — by echoing
-	                                 #   another one or with a QMI error — makes
-	                                 #   the ladder try the next lower one.
+	                                 #   another one or with InvalidOperation
+	                                 #   (QMI error 70) — makes the ladder try the
+	                                 #   next lower one; any other error fails.
 	option ep_type ''                # WDA/WDS data endpoint override: type
 	option ep_id ''                  #   (2 HSUSB, 3 PCIE, 4 EMBEDDED) and
 	                                 #   interface. Normally derived from the data

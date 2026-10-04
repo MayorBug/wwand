@@ -191,7 +191,14 @@ inject(lookup, ctrl(5, 2, 5, 40));
 spin();
 eq(gone, 0, 'ctrl: DMS leaving ANOTHER node is not this modem going');
 
+// a modem restart: DMS re-registers on a new port BEFORE the old one's
+// deletion arrives — that deletion is stale and must not kill the live hub
+inject(lookup, ctrl(4, 2, 1, 20));
 inject(lookup, ctrl(5, 2, 1, 10));
+spin();
+eq(gone, 0, 'ctrl: a DEL_SERVER for an endpoint already superseded is ignored');
+
+inject(lookup, ctrl(5, 2, 1, 20));
 spin();
 eq(gone, 1, 'ctrl: DMS leaving the modem node is "device gone"');
 ok(s2.closed && lookup.closed, 'ctrl: ...and every socket of the hub is closed');

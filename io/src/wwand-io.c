@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <endian.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <signal.h>
@@ -805,7 +806,10 @@ qmit_qdiscover(uc_vm_t *vm, size_t nargs)
 		getsockname(t->fd, (struct sockaddr *)&me, &sl);
 	}
 
-	lk.cmd = QRTR_TYPE_NEW_LOOKUP;   /* service 0 / instance 0 = every server */
+	/* control packets are little-endian on the wire (net/qrtr/ns.c uses
+	 * cpu_to_le32 throughout, linux 6.18.41) — host order would send a
+	 * byte-swapped lookup and never recognise a reply on a big-endian target */
+	lk.cmd = htole32(QRTR_TYPE_NEW_LOOKUP);   /* service 0 / instance 0 = every server */
 	ctrl.sq_node = me.sq_node;
 	ctrl.sq_port = QRTR_PORT_CTRL;
 
@@ -845,7 +849,7 @@ qmit_qdiscover(uc_vm_t *vm, size_t nargs)
 		if (r < 4)
 			continue;
 
-		if (pkt.cmd != QRTR_TYPE_NEW_SERVER)
+		if (le32toh(pkt.cmd) != QRTR_TYPE_NEW_SERVER)
 			continue;
 
 		/* empty NEW_SERVER = end of the lookup list */
@@ -853,10 +857,10 @@ qmit_qdiscover(uc_vm_t *vm, size_t nargs)
 			break;
 
 		o = ucv_object_new(vm);
-		ucv_object_add(o, "service",  ucv_int64_new(pkt.server.service));
-		ucv_object_add(o, "instance", ucv_int64_new(pkt.server.instance));
-		ucv_object_add(o, "node",     ucv_int64_new(pkt.server.node));
-		ucv_object_add(o, "port",     ucv_int64_new(pkt.server.port));
+		ucv_object_add(o, "service",  ucv_int64_new(le32toh(pkt.server.service)));
+		ucv_object_add(o, "instance", ucv_int64_new(le32toh(pkt.server.instance)));
+		ucv_object_add(o, "node",     ucv_int64_new(le32toh(pkt.server.node)));
+		ucv_object_add(o, "port",     ucv_int64_new(le32toh(pkt.server.port)));
 		ucv_array_push(arr, o);
 	}
 

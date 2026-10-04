@@ -14,10 +14,12 @@ message-oriented cdc-wdm/tty I/O + rmnet netlink helper;
 `docs/reference.md` (config + ubus API reference).
 - **Package definitions live in ddimension/openwrt-repo** (the feed):
   `wwand/Makefile` there builds, from this repo (git source, pinned via
-  PKG_SOURCE_VERSION — after pushing here, pin it on the feed's `main` with
-  `scripts/bump-source.sh wwand <tag|commit>`, which also derives the version:
-  `X.Y.Z` at tag `vX.Y.Z`, `X.Y.Z_pN` after it; the feed's CLAUDE.md has the
-  rules, releases go to its `stable` branch only when asked), a **backend-neutral
+  PKG_SOURCE_VERSION — `scripts/bump-source.sh wwand <tag|commit>` on the
+  matching feed branch: this repo has TWO LINES, `main` (development, marker
+  `vX.Y.0-dev`, ships as `X.Y.Z_preN` on feed main) and `stable` (releases
+  tagged `vX.Y.Z` there only, pinned on feed stable; fixes reach it by
+  cherry-pick -x or are made there and merged up). The feed's CLAUDE.md has the
+  rules; a feed release is a tag on its stable, only when asked), a **backend-neutral
   base + per-backend split**: `wwand` (daemon/framework/codec/shared core +
   the native `wwand_io.so`, which since 2026-08 ships inside the base package —
   the separate `ucode-mod-wwand-io` package is gone, `PROVIDES` covers old

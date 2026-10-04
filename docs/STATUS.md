@@ -28,7 +28,7 @@ is always user-triggered.
 | Packages | `wwand` (base, no backend) + `wwand-qmi` / `-mbim` / `-ncm` / `-mhi` / `-esim`, plus two optional datapath add-ons in the feed. Plugins in their own repositories: `wwand-ipa` (SGP.32 eIM), `wwand-qlog` (Quectel QLog diag capture), `wwand-rsim` (remote SIM: readers, phones over Bluetooth SAP, other modems' cards) |
 | Datapath | one plug-in interface (`docs/datapath-interface.md`): built-ins `rmnet`, `qmimux`, `vlan` (MBIM), pseudo-modes `raw_ip` and `ethernet` (802.3, WDA-less QMI stacks); add-ons `rmnet_nss`, `rmnet_nss_mhi` |
 | QMAP | negotiated down a ladder v5 → v4 → v1, capped by `option qmap_version` |
-| Feed | ddimension/openwrt-repo — stable (releases): `wwand`, `luci-app-wwand`, `luci-proto-wwand` 1.6.8; main: development pins as `1.6.8_pN` |
+| Feed | ddimension/openwrt-repo, two independent lines — stable (releases, published only by a date tag): `wwand`, `luci-app-wwand`, `luci-proto-wwand` 1.6.9; main (development): `1.7.0_preN` from the `v1.7.0-dev` marker. The source repos have the same two lines (`stable` from v1.6.9) |
 | Upstream | openwrt/packages#30185 (pins v1.6.3), openwrt/luci#8917 |
 
 ## Hardware verified (2026-08-30, on r49 + the same day's device-support HEAD)
@@ -1349,12 +1349,21 @@ the RG520N (dual-stack, a modem reset). The feed installs
    costs nothing. What `--since HEAD` cannot see is a shift that is already
    COMMITTED: after a pass that removes or adds comment lines, run
    `tools/check-anchors.py --since <the commit before it> --fix` once.
-5. Tag, pinning the **commit** (`git rev-parse vX.Y.Z^{commit}`), never the tag
-   object.
-6. Feed, on its main branch: `scripts/bump-source.sh wwand vX.Y.Z` (and the two
-   LuCI packages, tagged `vX.Y.Z` alongside) — version, release and SDK hash in
-   one go; verify the Makefile actually changed. Rules: the feed's CLAUDE.md.
-7. One feed push, then wait: the feed CI is `cancel-in-progress` per branch.
-   Devices get it when the feed's stable is released (`scripts/release-stable.sh`).
+5. **Two lines (since 2026-10-04):** releases are tagged on the `stable` branch,
+   never on main; main carries the `vX.Y.0-dev` marker of the minor it develops
+   (currently `v1.7.0-dev`) and ships as `X.Y.Z_preN` on feed main. A patch
+   release: get the fix onto `stable` (cherry-pick `-x` from main, or fix on
+   stable and merge stable into main), run 1-4 there, tag `vX.Y.Z` on stable —
+   in luci-app-wwand / luci-proto-wwand only where they changed. Opening a new
+   minor: merge main into stable, tag `vX.Y.0` there, tag `vX.(Y+1).0-dev` on main.
+   Pin the **commit** (`git rev-parse vX.Y.Z^{commit}`), never the tag object.
+6. Feed, on its **stable** branch for a release (its **main** for a development
+   pin): `scripts/bump-source.sh wwand vX.Y.Z` (and the LuCI packages that were
+   tagged) — the channel comes from the feed branch, the commit must be on the
+   source branch of the same name; version, release and SDK hash in one go;
+   verify the Makefile actually changed. Rules: the feed's CLAUDE.md.
+7. One feed push, then wait: a push to feed stable only BUILDS. Devices get it
+   with the release tag (`scripts/release-stable.sh`, only when asked), which
+   is what publishes stable and starts the images.
 
 The traps in steps 2 and 5-7 have each fired at least once; `gotchas.md` says how.

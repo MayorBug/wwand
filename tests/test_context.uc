@@ -328,8 +328,10 @@ scenario('write_only_reject', {
 }, (ctx, mock, events, next) => {
 	ctx.up((err) => {
 		eq(err, null, 'write_only: the modem connects');
-		eq(length(mock.calls_for('MODIFY_PROFILE')), 2,
-			'write_only: both writes were attempted and both refused');
+		// 3: the attach profile on binding (context binds after the modem's
+		// init), then the data path's two attempts
+		eq(length(mock.calls_for('MODIFY_PROFILE')), 3,
+			'write_only: the attach write and both data writes were attempted and all refused');
 
 		let sn = mock.calls_for('START_NETWORK');
 		eq(length(sn), 1, 'write_only: one start-network');
@@ -675,10 +677,15 @@ scenario('pdp-update', {
 		eq(err, null, 'pdp: up ok');
 
 		// guard skips the (matching) base writes; only the differing pdp type
-		// is modified — one targeted NV write instead of three
+		// is modified. Two writes here, both of the pdp type alone: the
+		// context binds after the modem's init (as in this harness), so the
+		// ATTACH profile is programmed on binding (modem_common attach_context)
+		// — and the mock answers the same unchanged profile to the data
+		// path's read, which a real modem would not
 		let mods = mock.calls_for('MODIFY_PROFILE');
-		eq(length(mods), 1, 'pdp: single modify (only the pdp type differed)');
-		eq(mods[0].args.pdp_type, 0, 'pdp: changed to ipv4');
+		eq(length(mods), 2, 'pdp: the attach write on binding + the data profile write');
+		eq([ mods[0].args.pdp_type, mods[1].args.pdp_type, mods[0].args.apn, mods[1].args.apn ], [ 0, 0, null, null ],
+		   'pdp: both change only the pdp type to ipv4, never the matching apn');
 		next();
 	});
 });
@@ -1391,7 +1398,10 @@ ok(_all_done, sprintf('every scenario ran (%d of %d) — the pump did not run ou
 	mods = [];
 	mkctx_data({ apn: '', auth: 'chap', username: 'x', password: 'y' }, m5).ensure_attach_profile(1, () => null);
 	eq(filter(mods, (m) => m.username != null || m.password != null || m.auth != null), [],
-	   'attach: no configured APN — the provisioned one is left with its own login');
+	   'attach: no configured APN — no login is written either');
+	// ...but the APN itself IS written: unset is the empty APN, not whatever
+	// profile 1 held (a stale APN from the modem's previous life, deborah-3)
+	eq([ length(mods), mods[0]?.apn ], [ 1, '' ], 'attach: no configured APN clears a stale one to the network default');
 })();
 
 done('test_context');

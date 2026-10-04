@@ -413,8 +413,14 @@ export function create(o)
 
 			let cur_apn = cursor.get('network', iface_section, 'apn');
 
-			if (cur_apn != null && cur_apn != '')
-				return false;   // operator set an APN — leave everything alone
+			// nothing to fill (vals null: no table match) or the operator set an
+			// APN meanwhile: write nothing, but end the one-shot all the same —
+			// the autosetup run is over either way
+			if (vals == null || (cur_apn != null && cur_apn != '')) {
+				cursor.delete('network', iface_section, 'autosetup');
+				cursor.commit('network');
+				return false;
+			}
 
 			cursor.set('network', iface_section, 'apn', vals.apn);
 

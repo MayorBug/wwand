@@ -78,9 +78,16 @@ message-oriented cdc-wdm/tty I/O + rmnet netlink helper;
 - **Zero-config autosetup** (default ON, opt-out `wwand_globals option
   autosetup '0'`): modem appears on an unconfigured box → daemon hotplug
   creates `wwmodem_auto` + `interface wwan0` (default wan firewall zone),
-  then ONE-SHOT ICCID/IMSI→APN fill from `apndb.uc` is COPIED into uci
-  (marker `option autosetup 1` cleared; uci writers live in main.uc deps
-  `autosetup_create`/`autosetup_fill`). HW-verified on the Cudy LT300.
+  then ONE-SHOT ICCID/IMSI→APN fill from `apndb.uc` is COPIED into uci in
+  the autosetup run only (marker `option autosetup 1` cleared on the first
+  card read, match or not; uci writers live in deps `autosetup_create`/
+  `autosetup_fill`). HW-verified on the Cudy LT300.
+- **The attach profile carries the config, always** (since 2026-10-04): the
+  configured APN, an UNSET one written as empty (network default) — never
+  "whatever profile 1 held" (QMI context.uc ensure_attach_profile, MBIM
+  `_apply_attach`, NCM step_attach). An init that sees no bound interface
+  programs it when the first binds (modem_common attach_context); a live
+  APN/PDP/login change re-programs it (daemon apply_config → reapply_sim).
 - **Idempotent sets + deferred apply**: netsel/settings/WDS-profile/NCM
   CGDCONT/slot-switch all read-before-write (`unchanged: true`, no radio
   bounce). Quirk `netsel_deferred`/`settings_deferred` (MeiG SLM7xx) →

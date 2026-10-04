@@ -1363,7 +1363,7 @@ export function create(opts)
 	//
 	// COMPARED HERE rather than trusted from the event. modem_mbim filters its
 	// own emit on a change (modem_mbim.uc:968-977) while the shared reapply
-	// tail emits on every re-read (modem_common.uc:567-573); one comparison, in
+	// tail emits on every re-read (modem_common.uc:577-583); one comparison, in
 	// the place that acts on it, cannot disagree with itself.
 	let modem_sim_refresh = (modem, data) => {
 		let entry = self.modems[modem.id];
@@ -1626,57 +1626,27 @@ export function create(opts)
 
 			let info = self.modems[modem.id]?.modem?.info ?? {};
 
-			// A card that provisions its own attach APN has already answered the
-			// question this table exists to guess at, and it answered for THIS
-			// subscription rather than for the operator in general. Overriding it
-			// is how a working modem stops working: HW-measured on a Chateau
-			// (RG650E, 2026-09-12) whose card provisioned "nonbonding.hybrid" and
-			// whose IMSI matched the Telekom DE consumer default — autosetup wrote
-			// "internet.v6.telekom" over it and the network answered "Requested
-			// service option not subscribed", then throttled the PDN. M2M and
-			// business SIMs are exactly the ones an IMSI prefix cannot tell apart
-			// from a consumer card, and exactly the ones this breaks.
-			//
-			// The table stays for its real case: a card that provisions NOTHING,
-			// where an empty APN attaches to whatever the network defaults to.
-			let card_apn = self.modems[modem.id]?.modem?.card_apn;
-
-			if (card_apn != null && card_apn != '') {
-				log('notice', sprintf('autosetup: %s attaches with the card-provisioned APN %J — not overriding it from the APN table',
-					name, card_apn));
-				continue;
-			}
-
-			// UNKNOWN IS NOT "NONE", and treating it as none is how the guard
-			// above became decorative on most hardware: only a backend that has
-			// actually READ the attach profile can report one, and an autosetup
-			// interface has no configured APN — which is exactly the condition
-			// under which MBIM used to skip that read entirely and NCM never
-			// published what it read. So the card-wins rule protected the QMI
-			// happy path and nothing else, which is not where the outage was
-			// found.
-			//
-			// Doing nothing here is not "no APN": an empty APN attaches with the
-			// card-provisioned one, which is the value we are declining to
-			// overwrite. The table still does its job for a card that reports an
-			// EMPTY attach APN — a card that provisions nothing — which is the
-			// case it was written for.
-			if (card_apn == null) {
-				log('info', sprintf('autosetup: %s — the backend has not reported the card-provisioned APN, so the APN table is not applied (the empty APN attaches with whatever the card provides)',
-					name));
-				continue;
-			}
-
+			// ONE ATTEMPT, IN THE AUTOSETUP RUN ONLY. The table fills the APN of
+			// the interface autosetup just created — whatever profile 1 held is
+			// not consulted: the backends write the CONFIGURED APN into the
+			// attach profile, an unset one as empty (context.uc
+			// ensure_attach_profile), so a stale APN from the modem's previous
+			// life is cleared either way (deborah-3, 2026-10-04). The marker is
+			// cleared on the first card read with or without a match: after
+			// that run the config alone decides, and a card that needs its own
+			// APN (a Telekom hybrid card's nonbonding.hybrid, which the table's
+			// consumer default breaks — Chateau, 2026-09-12) gets it configured.
 			let vals = apndb.lookup(info.iccid, info.imsi);
-
-			if (!vals) {
-				log('info', sprintf('autosetup: no APN-table match for %s (iccid %s, imsi %s) — keeping the SIM-provisioned attach',
-					name, info.iccid ?? '?', info.imsi ?? '?'));
-				continue;
-			}
 
 			if (!deps.autosetup_fill)
 				continue;
+
+			if (!vals) {
+				log('info', sprintf('autosetup: no APN-table match for %s (iccid %s, imsi %s) — the empty APN (network default) stays',
+					name, info.iccid ?? '?', info.imsi ?? '?'));
+				deps.autosetup_fill(entry.cfg.interface, null);   // the run is over: marker off
+				continue;
+			}
 
 			if (deps.autosetup_fill(entry.cfg.interface, vals)) {
 				log('notice', sprintf('autosetup: %s defaults written to %s (apn %s) — reloading',
@@ -2398,13 +2368,13 @@ export function create(opts)
 			};
 
 		// TELL THE CONTEXTS FIRST, then stop the modem — the order _device_gone
-		// uses (modem_common.uc:594). Dropping `centry.ctx` below only releases
+		// uses (modem_common.uc:604). Dropping `centry.ctx` below only releases
 		// the daemon's HANDLE: the context object itself lives on with its
 		// monitor timers armed and its WDS clients alive, polling a hub that
 		// entry.modem.stop() has just closed. One orphan per removal, and its
 		// late events can arm a spurious reconnect-hold on the rebuilt entry.
 		// `lost` is built for exactly this — it stops the monitor and destroys
-		// the family clients without attempting QMI cleanup (context.uc:1063).
+		// the family clients without attempting QMI cleanup (context.uc:1058).
 		for (let cname, centry in self.contexts) {
 			if (centry.cfg.modem == name && centry.ctx)
 				centry.ctx.modem_event('lost');
@@ -3321,6 +3291,24 @@ export function create(opts)
 		// 2) stop contexts that are gone or changed on a still-running modem (their
 		//    modem stays up; only this one context re-applies — APN/auth/mtu/etc.).
 		//    Contexts of the modems stopped above are already gone.
+		// The attach profile is the MODEM's, programmed at its init — a changed
+		// APN, PDP type or login on a running modem's interface would only
+		// take effect at the modem's next init, while the context dials with
+		// the new values at once. So the modems whose interface changed one of
+		// those re-program it (reapply_sim) once the context is back: a test
+		// APN set in the config otherwise changed nothing until a restart
+		// (deborah-3, 2026-10-04).
+		const ATTACH_OPTS = [ 'apn', 'pdp_type', 'auth', 'username', 'password' ];
+		let attach_touched = {};
+
+		for (let cn in keys(self.contexts)) {
+			let old = self.contexts[cn].cfg, nw = parsed.contexts[cn];
+
+			if (nw && old && old.modem == nw.modem && self.modems[nw.modem]?.modem &&
+			    length(filter(ATTACH_OPTS, (k) => (old[k] ?? '') != (nw[k] ?? ''))))
+				attach_touched[nw.modem] = cn;
+		}
+
 		for (let cn in keys(self.contexts))
 			if (!parsed.contexts[cn] || self.contexts[cn]._sig != ctx_sig(cn))
 				stop_context(cn);
@@ -3334,6 +3322,18 @@ export function create(opts)
 		for (let name, cfg in parsed.contexts)
 			if (!self.contexts[name])
 				start_context(name, cfg);
+
+		for (let mn, cn in attach_touched) {
+			let m = self.modems[mn]?.modem;
+
+			// a modem still in its init chain programs it there anyway
+			if (!m || type(m.reapply_sim) != 'function' ||
+			    index([ 'REGISTERING', 'READY' ], m.state) < 0)
+				continue;
+
+			log('notice', sprintf('interface %s: APN, PDP type or login changed — re-programming the attach profile of modem %s', cn, mn));
+			m.reapply_sim();
+		}
 
 		// 4) stamp the applied signatures for the next reload's diff (idempotent for
 		//    the ones that kept running: same config -> same signature).

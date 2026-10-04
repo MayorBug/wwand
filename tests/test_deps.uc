@@ -650,4 +650,30 @@ function mkdeps(u, extra) {
 	fs.rmdir(dir);
 }
 
+// --- autosetup_fill: one attempt per autosetup run --------------------------
+//
+// The table APN is written only into an interface autosetup created and only
+// while its marker is on; the run ends with the first card read whether or
+// not the table matched, so a later boot never fills anything.
+{
+	let u = fake_uci({ wwan0: { '.type': 'interface', autosetup: '1' } });
+	let d = mkdeps(u);
+
+	eq(d.autosetup_fill('wwan0', { apn: 'internet.telekom', pdp_type: 'ipv4' }), true, 'autosetup_fill: a match is written');
+	eq([ u.state.wwan0.apn, u.state.wwan0.pdp_type, u.state.wwan0.autosetup ], [ 'internet.telekom', 'ipv4', null ],
+	   'autosetup_fill: ...with its PDP type, and the marker is gone');
+	eq(d.autosetup_fill('wwan0', { apn: 'other' }), false, 'autosetup_fill: never a second time');
+
+	u = fake_uci({ wwan0: { '.type': 'interface', autosetup: '1' } });
+	d = mkdeps(u);
+	eq(d.autosetup_fill('wwan0', null), false, 'autosetup_fill: no match writes nothing');
+	eq([ u.state.wwan0.apn, u.state.wwan0.autosetup, u.commits ], [ null, null, 1 ],
+	   'autosetup_fill: ...but ends the run (marker off, committed)');
+
+	u = fake_uci({ wwan0: { '.type': 'interface', autosetup: '1', apn: 'mine' } });
+	d = mkdeps(u);
+	eq(d.autosetup_fill('wwan0', { apn: 'internet.telekom' }), false, 'autosetup_fill: an APN the operator set meanwhile wins');
+	eq([ u.state.wwan0.apn, u.state.wwan0.autosetup ], [ 'mine', null ], 'autosetup_fill: ...and the run is over');
+}
+
 done('test_deps');

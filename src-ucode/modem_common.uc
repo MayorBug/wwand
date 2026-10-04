@@ -521,6 +521,16 @@ export function scaffolding(self, o)
 	self.attach_context = function(ctx) {
 		push(self.contexts, ctx);
 
+		// The init chain reached its attach step before any interface was
+		// bound (no context to take the APN from), so the attach profile was
+		// left as it was. Program it now, from the first context to bind —
+		// otherwise the modem stays attached with whatever profile 1 held
+		// until its next init, and an APN set in the config does nothing.
+		if (self._attach_pending && type(self.reapply_sim) == 'function') {
+			self._attach_pending = false;
+			self.reapply_sim();
+		}
+
 		if (self.state == 'READY')
 			ctx.modem_event('ready');
 	};

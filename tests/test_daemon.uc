@@ -4155,4 +4155,37 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	d.shutdown();
 }
 
+// --- a live APN change re-programs the attach profile (deborah-3) ------------
+//
+// The attach profile belongs to the modem and is programmed at its init; a
+// changed APN, PDP type or login on a running modem's interface must reach it
+// without a restart. Anything else on the interface (mtu) must not.
+{
+	let reapplied = 0;
+	let fake = {
+		modem: { create: (o) => ({ id: o.id, state: 'READY', config: o.config,
+			start: () => null, stop: () => null, reapply_sim: () => reapplied++ }) },
+		context: { create: (o) => ({ state: 'IDLE', name: o.name, modem: o.modem,
+			down: (cb) => cb ? cb() : null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: { log: () => null, load_qmi: () => fake } });
+	let net = (iface) => config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', ...iface },
+	} });
+
+	d.apply_config(net({ apn: 'web' }));
+	eq(reapplied, 0, 'live attach: nothing on the first load');
+
+	d.apply_config(net({ apn: 'internet.telekom' }));
+	eq(reapplied, 1, 'live attach: a changed APN re-programs the attach profile');
+
+	d.apply_config(net({ apn: 'internet.telekom', pdp_type: 'ipv4' }));
+	eq(reapplied, 2, 'live attach: ...so does a changed PDP type');
+
+	d.apply_config(net({ apn: 'internet.telekom', pdp_type: 'ipv4', mtu: '1400' }));
+	eq(reapplied, 2, 'live attach: an unrelated option does not');
+	d.shutdown();
+}
+
 done('test_daemon');

@@ -1305,40 +1305,32 @@ export function create(opts)
 	// context.uc ensure_attach_profile. On a change, cycle the radio so an
 	// already-completed attach with the stale profile re-runs. Best-effort:
 	// firmware without the CID (or any error) just proceeds to step_register.
-	step_attach_profile = () => {
+	self._apply_attach = function(next) {
 		let ctx = self.contexts[0];
 
+		// no interface bound yet: the first one to bind programs it
+		// (modem_common attach_context, via reapply_sim)
+		if (!ctx && self.mbim) {
+			log('notice', 'attach profile: no interface bound yet — programmed when the first one binds');
+			self._attach_pending = true;
+			return next();
+		}
+
 		if (!ctx || !self.mbim)
-			return step_register();
+			return next();
 
 		let apn = context_common.conn_cfg(ctx, 'apn');
 
-		// no configured APN, or '#N' (use the modem-provisioned context as-is) —
-		// never overwrite the SIM/modem-provisioned attach context (QMI parity).
-		//
-		// READ IT ANYWAY BEFORE LEAVING. Nothing is written on this path, but
-		// what the card provisions is exactly what zero-config autosetup needs
-		// to know before deciding whether an operator-table APN would be an
-		// improvement (daemon.uc maybe_autosetup_fill) — and an autosetup
-		// interface has no configured APN, so this early return was the only
-		// path it ever took. Returning here without looking left the daemon
-		// unable to tell "the card provides nothing" from "nobody asked", and
-		// it guessed. Best-effort: an error leaves card_apn unset, which the
-		// caller reads as unknown and declines to act on.
-		if (apn == null || apn == '' || substr(apn, 0, 1) == '#')
-			return mbim_backend.get_lte_attach_config(self.mbim, (gerr, cur) => {
-				if (!gerr) {
-					let home = null;
+		// '#N' means "use the modem-provisioned context as-is" — never rewrite
+		// it. Every other config, an UNSET APN included, is written: unset is
+		// the empty APN (the network's default), never "whatever the context
+		// happened to hold" — see context.uc ensure_attach_profile for the
+		// MC7710 whose stale attach APN out of another box flapped a Telekom
+		// card (deborah-3, 2026-10-04). NCM writes it at every dial too.
+		if (apn != null && substr(apn, 0, 1) == '#')
+			return next();
 
-					for (let c in (cur?.contexts ?? []))
-						if (c.roaming == ext.ROAMING_HOME) { home = c; break; }
-
-					home ??= (cur?.contexts ?? [])[0];
-					self.card_apn = home?.access_string ?? '';
-				}
-
-				step_register();
-			});
+		apn = apn ?? '';
 
 		let want_ip = bc.IP_TYPE_FROM_PDP[context_common.effective_pdp(ctx)] ?? bc.IP_TYPE_IPV4V6;
 		let user = context_common.conn_cfg(ctx, 'username') ?? '';
@@ -1360,7 +1352,7 @@ export function create(opts)
 			// up to date: same APN and (unknown or matching) IP family — leave it
 			if (!gerr && cur_apn == apn && (cur_ip == null || cur_ip == want_ip)) {
 				log('debug', sprintf('attach profile up to date (apn %J, ip %J)', cur_apn, cur_ip));
-				return step_register();
+				return next();
 			}
 
 			// overwrite all three roaming contexts with the same config (a Set
@@ -1379,7 +1371,7 @@ export function create(opts)
 				(serr) => {
 				if (serr) {
 					log('warn', sprintf('attach profile set failed: %J — continuing', serr));
-					return step_register();
+					return next();
 				}
 
 				self.effective_apn = apn;
@@ -1388,7 +1380,7 @@ export function create(opts)
 				// the radio is woken — a cycle ending online here would
 				// register behind the park's back
 				if (self.lowpower_parked || self._plugin_held)
-					return step_register();
+					return next();
 
 				// force the (possibly already-completed) autonomous attach to
 				// re-run with the new profile: radio off -> settle -> on -> settle
@@ -1399,13 +1391,15 @@ export function create(opts)
 						self.mbim.command(bc, 'RADIO_STATE', 'set',
 							{ radio_state: bc.RADIO_STATE_ON }, (e2, d2) => {
 							note_radio(d2);
-							settle_timer = uloop.timer(self.timing.settle, step_register);
+							settle_timer = uloop.timer(self.timing.settle, next);
 						});
 					});
 				});
 			});
 		});
 	};
+
+	step_attach_profile = () => self._apply_attach(step_register);
 
 	step_register = () => {
 		// HELD: the radio stays off (hold_at_open has the reason), and this is
@@ -2025,6 +2019,12 @@ export function create(opts)
 	self.reapply_sim = function(cb) {
 		let done = () => {
 			scaffold.resolve_active_sim(self.info.iccid, self.info.imsi);
+
+			// re-program the attach profile from the (possibly new) override
+			// and config — QMI parity (modem.uc reapply_sim); only once the
+			// init chain has passed its own attach step
+			if (index([ 'REGISTERING', 'READY' ], self.state) >= 0 && self.mbim)
+				return self._apply_attach(() => cb ? cb(null) : null);
 
 			if (cb)
 				cb(null);

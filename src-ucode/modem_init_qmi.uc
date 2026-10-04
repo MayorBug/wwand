@@ -303,7 +303,7 @@ export function install(self, o)
 				why, join('; ', reasons)));
 
 			// Deliberately NOT cleared on a later init pass. The object is
-			// created once per device attach (daemon.uc:2939), so a modem that
+			// created once per device attach (daemon.uc:2909), so a modem that
 			// really did reset comes back as a NEW instance with no debt — and
 			// a re-init of THIS instance means it did not, so the debt still
 			// holds. Deduplicated because a re-init re-derives the same reason
@@ -762,7 +762,16 @@ export function install(self, o)
 	step_attach_profile = () => {
 		let ctx = self.contexts[0];
 
-		if (!ctx || !ctx.ensure_attach_profile || !self.dms)
+		// no interface bound yet: the first one to bind programs it
+		// (modem_common attach_context) — said, because a skipped attach is
+		// otherwise invisible in the log
+		if (!ctx) {
+			log('notice', 'attach profile: no interface bound yet — programmed when the first one binds');
+			self._attach_pending = true;
+			return step_register();
+		}
+
+		if (!ctx.ensure_attach_profile || !self.dms)
 			return step_register();
 
 		ctx.ensure_attach_profile(1, (changed) => {

@@ -1596,28 +1596,15 @@ export function create(opts)
 			cfg.apn ?? '', (cfg.apn == null || cfg.apn == '') ? 'network default' : 'configured',
 			cfg.pdp_type ?? 'ipv4v6'));
 
-		// only a concrete configured APN (not empty/network-default, not a '#N'
-		// pass-through) forces a re-attach; an empty APN leaves the provisioned
-		// context untouched (QMI parity — never blindly detach the network default)
+		// the configured APN, an unset one as empty (the network's default),
+		// is what context 1 must carry — a '#N' pass-through only is left
+		// alone (QMI parity: context.uc ensure_attach_profile, where a stale
+		// APN from the modem's previous life flapped a card, 2026-10-04)
 		let apn = cfg.apn;
-		let configured = (apn != null && apn != '' && substr(apn, 0, 1) != '#');
+		let configured = !(apn != null && substr(apn, 0, 1) == '#');
 
 		self.at.send('AT+CGDCONT?', (rerr, rres) => {
-			// PUBLISH WHAT THE CARD PROVISIONS. This read already happens on
-			// every bring-up and its answer was used only for the comparison
-			// below — while zero-config autosetup, which needs exactly this to
-			// decide whether an operator-table APN would be an improvement, had
-			// no way to see it and guessed instead (daemon.uc
-			// maybe_autosetup_fill). A read error leaves it unset, which the
-			// caller reads as unknown rather than as "the card provides none".
-			if (!rerr)
-				for (let e in ncm_vendors.parse_cgdcont(rres?.lines))
-					if (e.cid == 1) {
-						self.card_apn = e.apn ?? '';
-						break;
-					}
-
-			// changed = a concrete APN that context 1 does not already carry
+			// changed = an APN/PDP type that context 1 does not already carry
 			// (pdp_setup_matches compares pdp-type + APN; a read error => assume
 			// changed and re-attach, the safe side)
 			let changed = configured &&

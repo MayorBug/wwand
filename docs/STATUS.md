@@ -1147,6 +1147,32 @@ yet on hardware — nobody here has a QRTR modem, xhudan is asked to verify on
 the RG520N (dual-stack, a modem reset). The feed installs
 `qmi_over_qrtr.uc` in `wwand-qmi` (modem.uc imports it).
 
+## The attach profile carries the config, always (2026-10-04)
+
+Field case deborah-3 (LTE3301-Q222 with a Sierra MC7710 out of another box,
+a fresh Telekom card): autosetup created `wwan0` without an APN; the QMI
+attach step then deliberately left profile 1 as it was ("SIM-provisioned"),
+autosetup saw an APN there and declined its table, and the modem attached
+with a stale APN out of its previous life — limited service, registration
+lost every second, every dial "no service". An APN set by hand afterwards
+changed nothing until a restart. Now, decided with the user:
+- QMI (`context.uc ensure_attach_profile`) and MBIM (`modem_mbim.uc
+  _apply_attach`) write the CONFIGURED APN, an unset one as EMPTY (network
+  default), as NCM already did at dial; `#N` alone stays untouched.
+  Credentials still only with a configured APN.
+- An init that reaches the attach step with no interface bound says so and
+  programs it when the first one binds (`modem_common attach_context`
+  -> `reapply_sim`; MBIM's `reapply_sim` now re-applies the attach too).
+- A live change of APN, PDP type or login on a running modem's interface
+  re-programs the attach profile (`daemon.uc apply_config` -> `reapply_sim`).
+- Autosetup fills from `apndb.uc` in its own run only, whatever profile 1
+  held; the marker goes on the first card read, match or not. A card that
+  needs its own APN (the Telekom hybrid `nonbonding.hybrid` the table broke on
+  a Chateau, 2026-09-12) gets it configured — the APN table no longer guards it.
+Tests: test_context, test_modem_mbim, test_autosetup, test_deps, test_daemon
+(each new check fails without its change). Not yet on hardware.
+
+## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now
   carries it beside `pincode`/`apn`/`auth`/credentials, case-folded and

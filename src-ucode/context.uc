@@ -428,32 +428,24 @@ export function create(opts)
 				return done(false);
 			}
 
-			// Unset/empty config APN = use the SIM/modem-provisioned one (carrier
-			// pre-provisions the attach profile via MBN). So READ + LOG it and let
-			// the modem attach with it, rather than writing a blank APN (too blunt).
-			// ('#N' handled above; IP family still enforced below.)
+			// The attach profile carries what the CONFIG says, always: an unset
+			// APN is written as an empty one (the network's default), never left
+			// as whatever profile 1 happened to hold. Keeping a "provisioned" APN
+			// sounds careful and is not: profile 1 survives a modem's previous
+			// life, and an MC7710 out of another box attached a Telekom card
+			// with its old APN, got limited service and flapped, while an APN
+			// set afterwards changed nothing (deborah-3, 2026-10-04). NCM
+			// already writes the configured APN, empty included, at every dial
+			// (context_ncm.uc). ('#N' handled above; IP family enforced below.)
 			let card_apn = data.apn ?? '';
-			let configured = (apn != null && apn != '');
+			let want_apn = apn ?? '';
+			let configured = (want_apn != '');
 
-			self.effective_apn = configured ? apn : card_apn;
+			self.effective_apn = want_apn;
 
-			// Publish it on the MODEM, not just here: the attach profile is a
-			// property of the card, and zero-config autosetup needs it before it
-			// decides whether an operator-table APN is an improvement (see
-			// daemon.uc maybe_autosetup_fill). Recorded on every read so a SIM
-			// swap cannot leave a stale one behind.
-			if (self.modem)
-				self.modem.card_apn = card_apn;
-
-			if (!configured)
-				log('notice', sprintf('attach profile %d: no config APN — using SIM/modem-provisioned APN %s (pdp %J, auth %J%s)',
-					index, card_apn == '' ? '(network default)' : sprintf('%J', card_apn),
-					data.pdp_type, data.auth,
-					data.username ? sprintf(', user %J', data.username) : ''));
-
-			// only rewrite the APN when the config sets one that differs; an empty
-			// config never touches the provisioned APN
-			let need_apn = configured && (card_apn != apn);
+			// rewrite whenever the profile differs from the config — an empty
+			// config clears a stale APN just as a set one replaces it
+			let need_apn = (card_apn != want_apn);
 			let need_pdp = (want_pdp != null && data.pdp_type != want_pdp);
 
 			// The attach bearer's credentials come from wherever its APN does:
@@ -498,7 +490,7 @@ export function create(opts)
 			let mod = { profile: prof };
 
 			if (need_apn) {
-				mod.apn = apn;
+				mod.apn = want_apn;
 				mod.apn_disabled = 0;
 			}
 
@@ -516,8 +508,11 @@ export function create(opts)
 			if (want_pdp != null)
 				mod.pdp_type = want_pdp;
 
-			log('notice', sprintf('attach profile %d: apn %J%s, pdp %J->%J%s',
-				index, need_apn ? apn : card_apn,
+			log('notice', sprintf('attach profile %d: apn %s%s, pdp %J->%J%s',
+				index, need_apn
+					? sprintf('%s (was %s)', want_apn == '' ? '(network default)' : sprintf('%J', want_apn),
+						card_apn == '' ? '(network default)' : sprintf('%J', card_apn))
+					: sprintf('%J', card_apn),
 				init ? ' (init_apn — distinct from the data APN)' : '',
 				data.pdp_type, want_pdp,
 				need_auth ? sprintf(', auth %J%s', c_auth ?? '(kept)', c_user != null ? sprintf(' user %J', c_user) : '') : ''));

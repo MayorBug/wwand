@@ -31,9 +31,13 @@ joins `wwan0` to the default `wan` firewall zone and brings it up. Once the
 SIM is read, the ICCID/IMSI is matched against a small internal APN table
 (`apndb.uc`: prefix → apn/pdp type/auth/credentials); on a match the values
 are **copied into `/etc/config/network` once** and the `autosetup` marker
-is removed — afterwards the config is an ordinary hand-editable config. No
-table match keeps the APN empty, which attaches with the SIM/modem-
-provisioned APN.
+is removed — afterwards the config is an ordinary hand-editable config. That
+happens in the autosetup run only: the marker is removed on the first card
+read with or without a match, so no later boot fills anything. Whatever the
+modem's attach profile held is not consulted. No table match keeps the APN
+empty — the network's default (see the precedence below); a card that needs
+its own APN (an operator's special APN such as a Telekom hybrid card's) gets
+it configured.
 
 On **QMI** the created interface also gets `mux_id 'auto'` — but only when this
 modem can actually carry a channel: the question is asked per modem, against the
@@ -159,8 +163,8 @@ config interface 'wan'
 ```
 
 **Precedence:** PIN = matching `wwand_sim.pincode` → `wwand_modem.pincode`;
-APN/auth/username/password = active `wwand_sim` → `interface` →
-card-provisioned; `pdp_type` = active `wwand_sim` → `interface` → `ipv4v6`
+APN/auth/username/password = active `wwand_sim` → `interface` → **empty**
+(the network's default APN, no login); `pdp_type` = active `wwand_sim` → `interface` → `ipv4v6`
 (there is no card-provisioned IP family to fall back to — the default is the
 dual stack an interface that never said gets). The SIM-specific entry is more specific than the
 SIM-agnostic dial profile, so it wins (same rule as the PIN) — swap SIMs and
@@ -234,7 +238,7 @@ flowchart LR
   end
   subgraph APN["APN / auth / credentials"]
     A1["active wwand_sim"] -->|else| A2["the interface"]
-    A2 -->|else| A3["card-provisioned<br/><small>MBN / attach profile</small>"]
+    A2 -->|else| A3["empty APN<br/><small>the network's default</small>"]
   end
 ```
 
@@ -884,7 +888,12 @@ config interface 'wan'
 ```
 
 `modem_probe` lists detected control devices with their stable `path`; leave
-`apn` empty to attach with the SIM/modem-provisioned APN. The L3 device gets
+`apn` empty to attach with the network's default APN — wwand writes the
+configured APN into the modem's attach profile, an unset one as empty, so a
+stale APN in profile 1 (from the modem's previous life, say) never stays. A
+`#N` APN alone leaves profile N as the modem has it. A changed APN, PDP type
+or login takes effect on the running modem at once (the attach profile is
+re-programmed on reload). The L3 device gets
 the next free `wwandN` name and is written back as `option device`.
 
 ### A second APN / PDN on the same modem (mux)

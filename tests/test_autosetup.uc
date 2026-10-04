@@ -163,7 +163,7 @@ function mk_fill(card_apn, iccid)
 		learn_device: () => null,
 		learn_modem_path: () => null,
 		network_reload: () => null,
-		autosetup_fill: (iface, vals) => { push(fills, { iface: iface, apn: vals.apn }); return true; },
+		autosetup_fill: (iface, vals) => { push(fills, { iface: iface, apn: vals?.apn }); return vals != null; },
 	} });
 
 	d.apply_config(config.parse({ network: {
@@ -181,32 +181,37 @@ function mk_fill(card_apn, iccid)
 	return { d: d, modem: modem, fire: () => on_event(modem, 'registered', {}) };
 }
 
-// (8) card provisions an APN -> the table is not consulted at all
+// (8) WHATEVER PROFILE 1 HELD, the autosetup run takes the table: the
+// backends write the configured APN, an unset one as empty, so a stale APN
+// from the modem's previous life is cleared anyway (deborah-3, 2026-10-04) —
+// a card that needs its own APN gets it configured
 fills = [];
 let h = mk_fill('nonbonding.hybrid', '89490200001844967110');
 h.fire();
-eq(fills, [], 'fill: a card-provisioned APN is never overridden by the APN table');
+ok(length(fills) == 1 && fills[0].iface == 'wwan0' && fills[0].apn != null,
+	'fill: the autosetup run takes the APN table whatever profile 1 held');
 
-// (9) card provisions NOTHING -> the table is exactly what autosetup is for
+// (9) profile 1 empty -> the table, as ever
 fills = [];
 h = mk_fill('', '89490200001844967110');
 h.fire();
-ok(length(fills) == 1 && fills[0].iface == 'wwan0',
-	'fill: an empty card APN still takes the operator default');
+ok(length(fills) == 1 && fills[0].iface == 'wwan0', 'fill: an empty profile takes the operator default');
 
-// (10) UNKNOWN IS NOT "NONE". This asserted the opposite until 2026-09-12, and
-// the assertion was the bug: only a backend that has actually read the attach
-// profile can report one, and an autosetup interface has no configured APN —
-// which is exactly the condition under which MBIM skipped that read and NCM
-// never published what it read. So "unknown" was the ORDINARY case on two of
-// three backends, and treating it as "the card provides nothing" handed those
-// boxes straight back to the guess this whole guard exists to prevent.
-//
-// Declining is not "no APN": an empty APN attaches with whatever the card
-// provides, which is the value being protected.
+// (10) not even read -> the table all the same: nothing is guarded on it
 fills = [];
 h = mk_fill(null, '89490200001844967110');
 h.fire();
-eq(fills, [], 'fill: an unknown card APN does NOT license the table');
+eq(length(fills), 1, 'fill: an unread profile does not hold the table back either');
+
+// (11) ONE attempt: no table match ends the autosetup run too (marker off),
+// so no later boot fills anything — the config alone decides from then on
+fills = [];
+h = mk_fill(null, '00000000000000000000');
+h.d.modems.m0.modem.info.imsi = '001019999999999';
+h.fire();
+eq(fills, [ { iface: 'wwan0', apn: null } ], 'fill: no match still ends the run (called with nothing to write)');
+
+h.fire();
+eq(length(fills), 1, 'fill: ...and only once per run');
 
 done('test_autosetup');

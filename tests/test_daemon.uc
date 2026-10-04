@@ -3229,6 +3229,57 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	d3.shutdown();
 })();
 
+// A SETUP PENDING ON A RUNNING ACTIVATION IS NOT ORPHANED. After a modem
+// reset netifd's setup waits in the queue; READY releases it into an
+// activation WHILE the registered handler's status probe is out, so the probe
+// answers `pending` for a context that is already dialling. Resetting that
+// (down, kick) cut into the activation on every plain bring-up (deborah-3,
+// 2026-10-04). Only a context still IDLE behind a pending setup is an orphan.
+(() => {
+	let hooks = {}, calls = [], the_ctx = null, during_probe = null;
+	let st = { up: false, pending: true, autostart: true, errors: [] };
+	let fake = {
+		modem: { create: (o) => {
+			hooks[o.id] = o.deps.on_event;
+			return { id: o.id, state: 'READY', config: o.config, start: () => null, stop: () => null,
+			         note_connect_success: () => null };
+		} },
+		context: { create: (o) => (the_ctx = { state: 'IDLE', name: o.name, modem: o.modem,
+		                             config: o.config, down: (cb) => cb ? cb() : null,
+		                             up: (cb) => null, modem_event: () => null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: {
+		log: () => null, load_qmi: () => fake,
+		giveups_file: '/tmp/test-giveups-pend.json', admin_downs_file: '/tmp/test-admin-downs-pend.json',
+		kick_interface: (i) => push(calls, 'kick:' + i),
+		down_interface: (i) => push(calls, 'down:' + i),
+		// what happens between the probe going out and its answer
+		iface_status: (i, cb) => { during_probe?.(); cb(st); },
+	} });
+
+	d.apply_config(config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3p', apn: 'a' },
+	} }));
+	d.contexts.wan.wanted = true;
+
+	for (let state in [ 'PREPARING', 'ACTIVATING', 'CONNECTED' ]) {
+		calls = [];
+		the_ctx.state = 'IDLE';
+		during_probe = () => { the_ctx.state = state; };
+		hooks.m0(d.modems.m0.modem, 'registered', {});
+		eq(calls, [], sprintf('pending setup, context %s by the time the probe answers: no reset, no kick', state));
+	}
+
+	// counter-proof: still IDLE when the probe answers — the orphan is reset
+	calls = [];
+	the_ctx.state = 'IDLE';
+	during_probe = null;
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(calls, [ 'down:wan', 'kick:wan' ], 'pending setup + idle context: the orphan is reset and kicked');
+	d.shutdown();
+})();
+
 // WHO CLEARED AUTOSTART, after a restart. The in-memory _our_downs marker is
 // gone, so netifd's evidence decides: a `wwand` error on the interface is the
 // shim's failed setup (a block, or a reset of ours) — brought back; an ifdown

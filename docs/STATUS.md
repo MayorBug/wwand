@@ -1231,6 +1231,18 @@ unanswered dial stays as the safety net.
   configured, so clearing or changing the APN keeps an old login there (MBIM
   writes them in full).
 
+- **The MC7710 crashes on IPv6** (deborah-3, 2026-10-04): an ipv4v6 attach
+  profile leaves it in limited service, a dial with IPv6 in it answers
+  internal 204 until a reset. Quirk `ipv4_only` (modem_quirks.uc):
+  `context_common.effective_pdp()` resolves every pdp_type to ipv4 for that
+  model — attach profile, data profile and dialled families all read it there
+  — and autosetup writes the carrier's IPv4 APN (`apn_ipv4`) with pdp ipv4.
+  HW: config `ipv4v6`, attach stays pdp 0, ifdown/ifup up in 3 s.
+- **No netifd reset while an activation runs:** the registered handler reset
+  a `pending` interface (down + kick) even when the queued up was already
+  dialling — on every plain bring-up after a modem reset. Only an IDLE context
+  behind a pending setup is an orphan now.
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

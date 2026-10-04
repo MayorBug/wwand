@@ -325,6 +325,16 @@ eq(cc.effective_pdp({ config: { pdp_type: 'ipv4' },
 	modem: { active_sim: { pdp_type: 'ipv4v6' } } }), 'ipv4v6',
 	'pdp: ...in both directions, so one card keeps its IPv6 while the other does not');
 
+// a modem whose firmware crashes on IPv6 (modem_quirks ipv4_only) gets ipv4
+// whatever the interface or the card says
+eq(cc.effective_pdp({ config: { pdp_type: 'ipv4v6' }, modem: { info: { model: 'MC7710' } } }), 'ipv4',
+	'pdp: an ipv4-only modem resolves dual stack to ipv4');
+eq(cc.effective_pdp({ config: { pdp_type: 'ipv4' },
+	modem: { info: { model: 'MC7710' }, active_sim: { pdp_type: 'ipv6' } } }), 'ipv4',
+	'pdp: ...and a card asking IPv6 alone too');
+eq(cc.effective_pdp({ config: { pdp_type: 'ipv4v6' }, modem: { info: { model: 'EM7455' } } }), 'ipv4v6',
+	'pdp: another Sierra keeps what was configured');
+
 // an override that is absent, empty or null must fall THROUGH, not win as a
 // blank: conn_cfg treats both as "not overridden"
 eq(cc.effective_pdp({ config: { pdp_type: 'ipv6' },

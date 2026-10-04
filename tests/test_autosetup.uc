@@ -163,7 +163,7 @@ function mk_fill(card_apn, iccid)
 		learn_device: () => null,
 		learn_modem_path: () => null,
 		network_reload: () => null,
-		autosetup_fill: (iface, vals) => { push(fills, { iface: iface, apn: vals?.apn }); return vals != null; },
+		autosetup_fill: (iface, vals) => { push(fills, { iface: iface, apn: vals?.apn, pdp: vals?.pdp_type }); return vals != null; },
 	} });
 
 	d.apply_config(config.parse({ network: {
@@ -209,9 +209,25 @@ fills = [];
 h = mk_fill(null, '00000000000000000000');
 h.d.modems.m0.modem.info.imsi = '001019999999999';
 h.fire();
-eq(fills, [ { iface: 'wwan0', apn: null } ], 'fill: no match still ends the run (called with nothing to write)');
+eq(fills, [ { iface: 'wwan0', apn: null, pdp: null } ], 'fill: no match still ends the run (called with nothing to write)');
 
 h.fire();
 eq(length(fills), 1, 'fill: ...and only once per run');
+
+// (12) a modem that cannot do IPv6 (modem_quirks ipv4_only, the MC7710) gets
+// the carrier's IPv4 APN and pdp_type ipv4 — a dual-stack entry would be
+// written and never dialled
+fills = [];
+h = mk_fill(null, '89490200001820553637');
+h.modem.info.model = 'MC7710';
+h.fire();
+eq(fills, [ { iface: 'wwan0', apn: 'internet.telekom', pdp: 'ipv4' } ],
+	'fill: an ipv4-only modem gets the IPv4 APN and pdp ipv4');
+
+fills = [];
+h = mk_fill(null, '89490200001820553637');
+h.fire();
+eq(fills, [ { iface: 'wwan0', apn: 'internet.v6.telekom', pdp: 'ipv4v6' } ],
+	'fill: ...any other modem the dual-stack entry');
 
 done('test_autosetup');

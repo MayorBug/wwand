@@ -8,6 +8,7 @@
 
 import * as uloop from 'uloop';
 import * as apndb from 'wwand.apndb';
+import * as modem_quirks from 'wwand.modem_quirks';
 import * as discovery from 'wwand.discovery';
 import * as netsel_ops from 'wwand.netsel_ops';
 import * as simops from 'wwand.simops';
@@ -1070,6 +1071,19 @@ export function create(opts)
 					confirm_then(centry, () => self.contexts[cname] === centry && centry.ctx === cctx,
 						(st2) => decide(st2, true));
 				}
+				else if (st?.pending && centry.ctx && centry.ctx.state != 'IDLE') {
+					// netifd's setup is waiting on an activation that is already
+					// running — the queued up that READY just released. Its
+					// answer completes that setup; a reset here (down, kick)
+					// only interrupted it and made netifd set up again, on every
+					// plain bring-up after a modem reset (HW-seen on deborah-3,
+					// MC7710, 2026-10-04). The loop above only takes IDLE
+					// contexts, so a state other than IDLE here means the
+					// activation started (or even finished) during this status
+					// probe: nothing is orphaned, there is nothing to reset.
+					log('debug', sprintf('interface %s: setup pending on a running activation (%s), not kicking',
+						centry.cfg.interface, centry.ctx.state));
+				}
 				else if (deps.kick_interface) {
 					// our own down is being undone here; the kick re-arms
 					// netifd's autostart, so the marker has served its purpose
@@ -1080,6 +1094,7 @@ export function create(opts)
 					// IDLE context while netifd holds the interface 'pending' = an
 					// ORPHANED setup (e.g. a wwand restart mid-setup). 'up' no-ops on a
 					// pending interface, so 'down' first, then the kick re-runs setup.
+					// (A busy context never gets here: the branch above.)
 					if (st?.pending && deps.down_interface) {
 						log('info', sprintf('interface %s stuck pending, resetting before setup', centry.cfg.interface));
 						// Two markers, because two different readers ask two different
@@ -1642,6 +1657,11 @@ export function create(opts)
 			// APN (a Telekom hybrid card's nonbonding.hybrid, which the table's
 			// consumer default breaks — Chateau, 2026-09-12) gets it configured.
 			let vals = apndb.lookup(info.iccid, info.imsi);
+
+			// a modem that cannot do IPv6 gets the carrier's IPv4 APN and says
+			// so in the config, rather than a dual-stack entry it never dials
+			if (vals && modem_quirks.for_model(info.model).ipv4_only)
+				vals = { ...vals, apn: vals.apn_ipv4 ?? vals.apn, pdp_type: 'ipv4' };
 
 			if (!deps.autosetup_fill)
 				continue;

@@ -38,6 +38,9 @@ modem's attach profile held is not consulted. No table match keeps the APN
 empty — the network's default (see the precedence below); a card that needs
 its own APN (an operator's special APN such as a Telekom hybrid card's) gets
 it configured.
+A modem that cannot do IPv6 (`ipv4_only` in `modem_quirks.uc` — the Sierra
+MC7710) is filled with the carrier's IPv4 APN where the table has one
+(`apn_ipv4`, e.g. `internet.telekom`) and `pdp_type 'ipv4'`.
 
 On **QMI** the created interface also gets `mux_id 'auto'` — but only when this
 modem can actually carry a channel: the question is asked per modem, against the
@@ -164,7 +167,7 @@ config interface 'wan'
 
 **Precedence:** PIN = matching `wwand_sim.pincode` → `wwand_modem.pincode`;
 APN/auth/username/password = active `wwand_sim` → `interface` → **empty**
-(the network's default APN, no login); `pdp_type` = active `wwand_sim` → `interface` → `ipv4v6`
+(the network's default APN, no login); `pdp_type` = active `wwand_sim` → `interface` → `ipv4v6` — and `ipv4` on a modem whose firmware cannot take IPv6 at all (`ipv4_only` quirk, the Sierra MC7710: an IPv6 request crashes it), whatever was configured
 (there is no card-provisioned IP family to fall back to — the default is the
 dual stack an interface that never said gets). The SIM-specific entry is more specific than the
 SIM-agnostic dial profile, so it wins (same rule as the PIN) — swap SIMs and

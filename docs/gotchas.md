@@ -77,6 +77,42 @@ HW-proven on the EG06. Structurally blocked in `qmi_over_mbim.send`.
 
 ---
 
+### A netdev's `device` link shows which bus the modem is on
+**Only after resolving it.** The link the kernel writes is short and relative:
+`../../../3-1:1.4` for a usbnet netdev, `../../../mhi0_IP_HW0` for an mhi_net
+one. The USB interface token happens to be in the first; for MHI the link names
+the MHI client device and nothing above it, so a `readlink` never shows the
+PCI address — the netdev hangs off the MHI client, whose parent is the
+controller, whose parent is the PCI function. `netlink.ep_type_number` read the
+link text and so could not have recognised a real MHI modem as PCIe; its test
+used a full path no kernel writes. Resolve the link (`realpath`) and match
+that; keep the link text as a second candidate.
+
+*Evidence:* `drivers/net/mhi_net.c:363` (SET_NETDEV_DEV on the MHI client),
+`drivers/bus/mhi/host/init.c:1254-1260` (the parent chain), linux 6.18.41;
+the usbnet short form HW-seen on the RG650E. Guarded in `tests/test_datapath`
+("the link text alone cannot tell an MHI netdev's bus") (2026-10-04).
+
+---
+
+### A client id is enough to tell QMI clients apart
+**Not on QRTR.** Over QMUX the client id is in every frame. Over QRTR there is
+no QMUX header: a service tells its clients apart by the SOURCE (node, port) of
+their datagrams, so one socket is one client whatever cid the hub hands out.
+The first QRTR hub (#46) gave every client of a service one cid on one socket,
+and passed its hardware test, because that test had one IPv4 session — wwand
+runs several WDS clients at once (the modem's own, one per IP family and
+attempt), and on one socket they share the modem-side session, IP family and
+mux binding. One socket per emulated ALLOCATE_CID, as the kernel's own QMI
+clients do (`net/qrtr/qmi_interface.c`, a socket per `qmi_handle`).
+
+*Evidence:* `include/uapi/linux/qrtr.h` (no client field anywhere), linux
+6.18.41; `context.uc` activate_family (a fresh WDS client per family and
+attempt). Guarded in `tests/test_qmi_over_qrtr` ("...and a socket each")
+(2026-10-04).
+
+---
+
 ### `/sys/bus/usb/devices/$DEVPATH` addresses a USB interface
 **Neither half of that is true, and both were believed at once** in the E182E
 hotplug binder.

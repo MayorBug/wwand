@@ -101,7 +101,8 @@ message-oriented cdc-wdm/tty I/O + rmnet netlink helper;
 ## Core layering (src-ucode)
 native `wwand_io.so` → codec (`qmux.uc`, `tlv.uc`, `hex.uc`, `schema/*.uc`
 incl. `schema/rat.uc` = canonical RAT/IoT vocabulary, `mbim*.uc`) → session
-(`transport.uc`, `client.uc`) → state machines
+(`transport.uc`, `client.uc`; further hubs under the same contract:
+`qmi_over_mbim.uc`, `qmi_over_qrtr.uc`) → state machines
 (`modem.uc` + its extracted QMI helpers `modem_init_qmi.uc` / `telemetry_qmi.uc`
 / `regdetail.uc` / `config_check.uc` / `datapath_qmi.uc`; the datapath
 interface lives in `netlink.uc` with `datapath_*.uc` add-ons beside it

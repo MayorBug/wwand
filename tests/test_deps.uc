@@ -676,4 +676,12 @@ function mkdeps(u, extra) {
 	eq([ u.state.wwan0.apn, u.state.wwan0.autosetup ], [ 'mine', null ], 'autosetup_fill: ...and the run is over');
 }
 
+// Vendor MHI control names are persisted as /dev paths without a board profile.
+{
+	let u = fake_uci({});
+	let d = mkdeps(u);
+	ok(d.autosetup_create('mhi_QMI7', {}), 'autosetup: vendor MHI control accepted');
+	eq(u.state.wwmodem_auto?.device, '/dev/mhi_QMI7', 'autosetup: vendor MHI /dev path');
+}
+
 done('test_deps');

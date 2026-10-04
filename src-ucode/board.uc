@@ -186,6 +186,14 @@ function render_mobile(fx, m, s)
 const SIGNAL5 = [ 'green:mobile-1', 'green:mobile-2', 'green:mobile-3',
                   'green:mobile-4', 'green:mobile-5' ];
 
+// The OpenWrt port of the LTE3301-M209/Q222 (one shared dtsi) names its
+// gpio-leds by color + function only, so the kernel calls them
+// `green:mobile`, `red:mobile`, `green:lte` — the vendor image's `lte3301:`
+// prefix is gone (mt7620n_zyxel_lte3301.dtsi, lte3301 fork afab7c890b;
+// /sys/class/leds HW-observed on an M209, 2026-10-03). An old name would make
+// every write here land in a path that does not exist, silently.
+const LTE3301_LEDS = { red: 'red:mobile', green: 'green:mobile', tech: 'green:lte' };
+
 const PROFILES = {
 	'mikrotik,chateau-5g-r17-ax': {
 		power_gpio: 'modem-power',
@@ -206,18 +214,12 @@ const PROFILES = {
 	'zyxel,lte3301-m209': {
 		power_gpio: 'usbpower',
 		option_ids: [ '1435 d181', '2020 2033' ],
-		leds: (fx, s) => render_mobile(fx, {
-			red: 'lte3301:red:mobile', green: 'lte3301:green:mobile',
-			tech: 'lte3301:green:lte',
-		}, s),
+		leds: (fx, s) => render_mobile(fx, LTE3301_LEDS, s),
 	},
 	'zyxel,lte3301-q222': {
 		power_gpio: 'usbpower',
 		option_ids: [ '1435 d181', '2020 2033' ],
-		leds: (fx, s) => render_mobile(fx, {
-			red: 'lte3301:red:mobile', green: 'lte3301:green:mobile',
-			tech: 'lte3301:green:lte',
-		}, s),
+		leds: (fx, s) => render_mobile(fx, LTE3301_LEDS, s),
 	},
 	// Zyxel LTE5398-M904: `lte_power` gates the modem's USB power (wired active-low
 	// at HW, but the sysfs gpio applies the inversion, so value 1 = on, default 1).

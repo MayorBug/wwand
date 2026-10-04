@@ -1054,7 +1054,12 @@ power-cycles the card after lpac's enable rather than trusting the refresh.
 - **Zyxel LTE3301-M209/-Q222** (`board.uc`): the rest of the vendor helper
   `/usr/sbin/lte3301` taken over — both boards bind both modem ids
   (`1435 d181`, `2020 2033`), and the LTE LED lights only on LTE (daemon
-  `led_state.lte`). Not HW-verified (no unit here).
+  `led_state.lte`). The OpenWrt port (lte3301 fork, one dtsi for both) names
+  the LEDs `green:mobile` / `red:mobile` / `green:lte` — no `lte3301:`
+  prefix any more; HW-verified on an M209 with a BG96 (2026-10-03: EDGE ->
+  green mobile on, red off, LTE off). The port's board.d hangs `green:wan` on
+  netdev `wwan0`, which wwand renames to `wwand0`: set
+  `system.led_wan.dev='wwand0'` (done on that unit by hand).
 - **wwand-apntest phase 1** (`apntest/runner.uc`, `apntest_cli.uc` ->
   `/usr/sbin/wwand-apntest`, `files/wwand-apntest.init`, `files/apntest.config`):
   sweep, slot groups, dial via netifd with uncommitted uci, pool/DNS regex,

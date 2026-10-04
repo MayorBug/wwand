@@ -1190,8 +1190,24 @@ a radio cycle frees it. Two ways into that, both fixed and HW-verified there:
   registered modem now cycles the radio once at once (`modem.reattach`, at
   most every 10 min per modem) instead of waiting for the ladder's cycle at
   attempt 8 (~16 min). ifdown, 10 s, ifup: connected after 126 s, by itself.
-Possible follow-up: probe WDS right after a stop and cycle before the 120 s
-timeout — only worth it if more firmware turns out to do this.
+**Root cause, proven the same day (debug, with the client bookkeeping below):**
+not client-ID exhaustion — wwand holds at most two WDS clients (the config
+client and the dial's), every RELEASE_CID is acknowledged, and the modem kept
+handing out new CIDs during the hang. The MC7710 acknowledges STOP_NETWORK
+and keeps the LTE default bearer up: with wwand stopped and uqmi the only
+reader, packet status read `connected` after the stop, with the very address
+"stopped" (the pdh is the same 41124240 in every session). A new
+START_NETWORK for it then gets no answer at all, where newer firmware says
+NO_EFFECT. So the dial now asks first (GET_PACKET_SERVICE_STATUS, unmuxed and
+alone on the modem only) and adopts a running session — the NO_EFFECT path.
+HW: ifdown, 10 s, ifup -> up in 1 s, traffic flows. The radio cycle on an
+unanswered dial stays as the safety net.
+- **Client bookkeeping:** every ALLOCATE_CID/RELEASE_CID is logged with its
+  result (a refused or unanswered release is a warn: the slot stays taken)
+  and `status.qmi_clients` lists the CIDs wwand holds per service. Note for
+  any uqmi check alongside a running wwand: both read the same cdc-wdm, and
+  wwand swallows the other's CTL answers — "Failed to connect to service"
+  there is the test, not the modem.
 
 ## Known open
 

@@ -80,6 +80,9 @@ function handlers()
 		// succeeds for the initial connect and the first transient-drop
 		// reconnect; fails afterwards so the second drop exercises the
 		// bounded-hold fallback (interface eventually driven down).
+		// asked before every dial (context.uc start_activation): nothing
+		// running, so the scenario dials as it always has
+		GET_PACKET_SERVICE_STATUS: { status: 1 },
 		START_NETWORK: (args, meta) =>
 			(meta.count <= 2) ? { pdh: 4242 } : { __error: 0x0001 },
 		// activation returns the base settings; a later refresh (triggered by

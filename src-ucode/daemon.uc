@@ -2396,7 +2396,7 @@ export function create(opts)
 		// entry.modem.stop() has just closed. One orphan per removal, and its
 		// late events can arm a spurious reconnect-hold on the rebuilt entry.
 		// `lost` is built for exactly this — it stops the monitor and destroys
-		// the family clients without attempting QMI cleanup (context.uc:1058).
+		// the family clients without attempting QMI cleanup (context.uc:1088).
 		for (let cname, centry in self.contexts) {
 			if (centry.cfg.modem == name && centry.ctx)
 				centry.ctx.modem_event('lost');
@@ -4297,6 +4297,10 @@ export function create(opts)
 				datapath: entry.modem?.datapath?.backend,
 				proto_errors: entry.modem?.counters?.proto_errors,
 				qmi_errors: entry.modem?.counters?.proto_errors,   // deprecated alias
+				// QMI client IDs wwand holds on the modem, per service
+				// (modem.uc alloc/release) — the evidence when a small
+				// client table runs full
+				qmi_clients: entry.modem?.qmi_clients,
 
 				attempts: entry.modem?.counters?.attempts,
 				// false while the recovery hardware ladder (opmode/reset/repower/

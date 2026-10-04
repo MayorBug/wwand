@@ -676,63 +676,93 @@ export function create(opts)
 					}
 				}
 
-				log('notice', sprintf('starting ipv%d: apn \'%s\', %s',
-					family, cfg('apn') ?? '(profile default)',
-					(start_args.profile_3gpp != null)
-						? sprintf('profile %d', profile.index)
-						: 'no profile (the modem rejected the index — inline apn)'));
-
-				client.request('START_NETWORK', start_args, (e3, d3) => {
-					// NO_EFFECT: the session is ALREADY up. A modem with
-					// autoconnect dials before anyone asks it to, so the first
-					// START_NETWORK of a fresh bring-up can land on a call that
-					// exists (ddimension/wwand#18, reported on a RUT956/EC25).
-					//
-					// THE HANDLE IS NOT OURS AND MUST NOT BE FAKED. Measured on
-					// an RG650E: the NO_EFFECT reply carries a pdh TLV of 0, and
-					// 0 is not null — so clearing the error and falling through
-					// to the `d3?.pdh == null` guard below stores 0 as the
-					// handle. wwand then believes it owns a session it never
-					// started, logs "pdh 0", and on teardown sends STOP_NETWORK
-					// with handle 0, which the modem refuses.
-					//
-					// A null handle is the truth and the code already knows what
-					// to do with it: _close_family releases the client and skips
-					// the stop. The settings come from GET_CURRENT_SETTINGS,
-					// which asks the client, not the handle.
-					//
-					// The error still ticks the proto-error counter on its way
-					// here (client.uc:176 — no `no_recovery` on the dial, and
-					// there must not be: a dial that genuinely fails has to
-					// climb). That is deliberate and harmless: the very next
-					// successful request zeroes it (recovery.uc:462-463), and
-					// the same is already true of the NO_EFFECT that
-					// qmi_backend.set_opmode normalises.
-					if (e3?.error == 'qmi' && e3.code == QMI_ERR_NO_EFFECT) {
-						fam.pdh = null;
-						// a family is registered with pdh null BEFORE the dial,
-						// so null alone cannot tell "adopted" from "still
-						// dialling" — the monitor needs that distinction.
-						fam.adopted = true;
-						log('notice', sprintf('ipv%d already connected — adopting the running session (no handle of our own to stop later)',
-							family));
-						return done(null);
-					}
-
-					if (e3 || d3?.pdh == null) {
-						return done({
-							stage: 'start_network',
-							err: e3,
-							call_end_reason: d3?.call_end_reason,
-							verbose: d3?.verbose_call_end,
-							ext_error: d3?.ext_error,
-						});
-					}
-
-					fam.pdh = d3.pdh;
-					log('notice', sprintf('ipv%d up, pdh %d (cid %d)', family, fam.pdh, client.cid));
+				// adopt a session the modem already runs — the same path a
+				// NO_EFFECT answer takes (below), for a modem that never sends
+				// one: an MC7710 (SWI9200X_03.05.29) acknowledges STOP_NETWORK
+				// but keeps the LTE default bearer up (the same pdh, the same
+				// address, packet status `connected` after the stop), and then
+				// answers no START_NETWORK at all until a radio cycle
+				// (deborah-3, 2026-10-04). Asked first, the next dial adopts it
+				// in a second. Only alone on the modem and unmuxed: with more
+				// than one session the status could be another context's.
+				let adopt_running = () => {
+					fam.pdh = null;
+					fam.adopted = true;
+					log('notice', sprintf('ipv%d already connected — adopting the running session (no handle of our own to stop later)',
+						family));
 					done(null);
-				}, { timeout: START_NETWORK_TIMEOUT_MS });
+				};
+
+				let dial = () => {
+					log('notice', sprintf('starting ipv%d: apn \'%s\', %s',
+						family, cfg('apn') ?? '(profile default)',
+						(start_args.profile_3gpp != null)
+							? sprintf('profile %d', profile.index)
+							: 'no profile (the modem rejected the index — inline apn)'));
+
+					client.request('START_NETWORK', start_args, (e3, d3) => {
+						// NO_EFFECT: the session is ALREADY up. A modem with
+						// autoconnect dials before anyone asks it to, so the first
+						// START_NETWORK of a fresh bring-up can land on a call that
+						// exists (ddimension/wwand#18, reported on a RUT956/EC25).
+						//
+						// THE HANDLE IS NOT OURS AND MUST NOT BE FAKED. Measured on
+						// an RG650E: the NO_EFFECT reply carries a pdh TLV of 0, and
+						// 0 is not null — so clearing the error and falling through
+						// to the `d3?.pdh == null` guard below stores 0 as the
+						// handle. wwand then believes it owns a session it never
+						// started, logs "pdh 0", and on teardown sends STOP_NETWORK
+						// with handle 0, which the modem refuses.
+						//
+						// A null handle is the truth and the code already knows what
+						// to do with it: _close_family releases the client and skips
+						// the stop. The settings come from GET_CURRENT_SETTINGS,
+						// which asks the client, not the handle.
+						//
+						// The error still ticks the proto-error counter on its way
+						// here (client.uc:176 — no `no_recovery` on the dial, and
+						// there must not be: a dial that genuinely fails has to
+						// climb). That is deliberate and harmless: the very next
+						// successful request zeroes it (recovery.uc:462-463), and
+						// the same is already true of the NO_EFFECT that
+						// qmi_backend.set_opmode normalises.
+						// (a family is registered with pdh null BEFORE the dial,
+						// so null alone cannot tell "adopted" from "still
+						// dialling" — adopt_running sets `adopted` for the monitor)
+						if (e3?.error == 'qmi' && e3.code == QMI_ERR_NO_EFFECT)
+							return adopt_running();
+
+						if (e3 || d3?.pdh == null) {
+							return done({
+								stage: 'start_network',
+								err: e3,
+								call_end_reason: d3?.call_end_reason,
+								verbose: d3?.verbose_call_end,
+								ext_error: d3?.ext_error,
+							});
+						}
+
+						fam.pdh = d3.pdh;
+						log('notice', sprintf('ipv%d up, pdh %d (cid %d)', family, fam.pdh, client.cid));
+						done(null);
+					}, { timeout: START_NETWORK_TIMEOUT_MS });
+				};
+
+				let alone = (mux_id == 0) && !length(filter(self.modem.contexts ?? [],
+					(c) => c !== self && c.state == 'CONNECTED'));
+
+				if (!alone)
+					return dial();
+
+				client.request('GET_PACKET_SERVICE_STATUS', {}, (es, ds) => {
+					if (es?.error == 'cancelled')
+						return done({ stage: 'cancelled', err: es });
+
+					if (!es && ds?.status == wdsmod.CONN_CONNECTED)
+						return adopt_running();
+
+					dial();
+				}, { timeout: 5000, no_recovery: true });
 			});
 
 			if (mux_id == 0)

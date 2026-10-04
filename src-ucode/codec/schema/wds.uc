@@ -107,7 +107,9 @@ export default {
 			resp: {},
 		},
 
-	// unused in production — kept as a stable codec fixture for test_qmux
+	// asked before a dial whether a session already runs (context.uc
+	// start_activation); libqmi 1.38 qmi-service-wds.json "Get Packet Service
+	// Status": output 0x01 guint8 QmiWdsConnectionStatus
 		GET_PACKET_SERVICE_STATUS: {
 			id: 0x0022,
 			req:  {},

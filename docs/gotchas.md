@@ -79,15 +79,21 @@ HW-proven on the EG06. Structurally blocked in `qmi_over_mbim.send`.
 
 ### A STOP_NETWORK that answered success has ended the session
 **Not on every firmware.** A Sierra MC7710 (SWI9200X_03.05.29) acknowledges
-the stop, and afterwards its WDS side hangs: every later START_NETWORK goes
-unanswered, no new WDS client is handed out, and the modem still reports the
-session `connected`. A radio cycle (DMS low_power -> online) frees it; nothing
-on the WDS side does. So an unanswered dial on a registered modem cycles the
-radio at once (daemon `error` handling), and wwand never stops a live session
-for its own bookkeeping (context_down on a reset).
+the stop and keeps the LTE default bearer up: packet status still reads
+`connected`, with the same address, and every later START_NETWORK goes
+unanswered (newer firmware says NO_EFFECT) until a radio cycle. So a dial
+asks GET_PACKET_SERVICE_STATUS first and adopts a running session (unmuxed,
+alone on the modem), an unanswered dial still cycles the radio as the safety
+net, and wwand never stops a live session for its own bookkeeping.
 
-*Evidence:* deborah-3, 2026-10-04 — uqmi on the same modem hung the same way,
-`wwandctl reattach` freed it (dial connected in 3 s). Guarded in
+It is NOT client-ID exhaustion, though it looks like it: uqmi run beside wwand
+reports "Failed to connect to service" because wwand reads the same cdc-wdm
+and swallows uqmi's CTL answer — the modem had in fact allocated the CID.
+
+*Evidence:* deborah-3, 2026-10-04 — with wwand stopped and uqmi alone, status
+`connected` and the "stopped" address after the acknowledged stop; wwand's
+CID log showed every release acknowledged and at most two WDS clients. Guarded
+in `tests/test_context` ("adopt-running", "dial-when-idle") and
 `tests/test_daemon` ("unanswered dial", "reset of a pending setup").
 
 ---

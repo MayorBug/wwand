@@ -189,7 +189,7 @@ export function create(opts)
 	// clients, which delivers a synchronous `cancelled` to everything in flight —
 	// so an outer set_opmode callback that ignores its error re-arms tm.settle
 	// AFTER the cancel pass. The new timer fires with self.dms already null
-	// (modem.uc:1607) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
+	// (modem.uc:1644) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
 	// which in ucode is a throw inside a uloop callback: the daemon dies and procd
 	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:668, step_sim), and
 	// every QMI site that re-arms tm.settle needs it too.
@@ -309,9 +309,34 @@ export function create(opts)
 		on_answer: (client) => rec.note_answer(),
 	};
 
+	// The CIDs this modem object holds on the modem, per service — what its
+	// client table carries for us. Old stacks keep very few slots, and a CID
+	// that is never released stays until the stack resets; the table is the
+	// evidence when ALLOCATE_CID starts failing (status `qmi_clients`).
+	self.qmi_clients = {};
+
+	let cid_held = (service, cid, on) => {
+		let k = sprintf('%d', service);
+		let list = filter(self.qmi_clients[k] ?? [], (c) => c != cid);
+
+		if (on)
+			push(list, cid);
+
+		if (length(list))
+			self.qmi_clients[k] = list;
+		else
+			delete self.qmi_clients[k];
+	};
+
+	let held_summary = () => join(' ', map(sort(keys(self.qmi_clients)), (k) =>
+		sprintf('%s:[%s]', k, join(',', self.qmi_clients[k]))));
+
 	self.alloc = function(schema, cb) {
 		self.ctl.request('ALLOCATE_CID', { service: schema.service }, (err, data) => {
 			if (err || !data?.allocation) {
+				log((err?.code == 5) ? 'warn' : 'debug', sprintf('allocating a client of service %d failed: %J — held: %s',
+					schema.service, err ?? 'no allocation tlv', held_summary() || 'none'));
+
 				// ClientIdsExhausted (CTL error 5): the modem's client table
 				// is full. Old stacks keep a tiny table (~5 slots) and a failed
 				// attempt can leak a slot, so plain retries only burn attempts
@@ -325,8 +350,9 @@ export function create(opts)
 				return cb(err ?? { error: 'proto', detail: 'no allocation tlv' }, null);
 			}
 
-			log('debug', sprintf('allocated cid %d for service %d',
-				data.allocation.cid, schema.service));
+			cid_held(schema.service, data.allocation.cid, true);
+			log('debug', sprintf('allocated cid %d for service %d — held: %s',
+				data.allocation.cid, schema.service, held_summary()));
 			cb(null, client_mod.create(self.hub, schema, data.allocation.cid, client_hooks));
 		});
 	};
@@ -342,7 +368,18 @@ export function create(opts)
 
 		self.ctl.request('RELEASE_CID',
 			{ release: { service: client.service, cid: client.cid } },
-			(err) => cb ? cb(err) : null, { timeout: 3000 });
+			(err) => {
+				// a refused or unanswered release leaves the CID in the
+				// modem's table — exactly what fills it up on a small stack
+				if (!err)
+					cid_held(client.service, client.cid, false);
+
+				log(err ? 'warn' : 'debug', sprintf('release of cid %d (service %d): %s — held: %s',
+					client.cid, client.service, err ? sprintf('%J', err) : 'ok', held_summary() || 'none'));
+
+				if (cb)
+					cb(err);
+			}, { timeout: 3000 });
 	};
 
 	// A client of a service the core does not know, for a plugin (daemon dep

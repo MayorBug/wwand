@@ -87,6 +87,9 @@ function make_handlers(over, started)
 		MODIFY_PROFILE: {},
 		GET_PROFILE_SETTINGS: { pdp_type: 3, apn: 'web' },
 		SET_IP_FAMILY: {},
+		// asked before every dial (context.uc start_activation): nothing
+		// running, so the scenario dials as it always has
+		GET_PACKET_SERVICE_STATUS: { status: 1 },
 		START_NETWORK: (args, meta) => {
 			started[sprintf('%d', meta.cid)] = (meta.count == 1) ? 4 : 6;
 			return { pdh: (meta.count == 1) ? 1111 : 2222 };
@@ -661,6 +664,41 @@ scenario('profile-passthrough', { config: { apn: '#3', pdp_type: 'ipv4v6' } }, (
 		eq(length(mock.calls_for('MODIFY_PROFILE')), 0, 'pp: profile untouched');
 		eq(mock.calls_for('GET_PROFILE_SETTINGS')[0].args.profile.index, 3, 'pp: profile 3 checked');
 		eq(mock.calls_for('START_NETWORK')[0].args.profile_3gpp, 3, 'pp: started with profile 3');
+		next();
+	});
+});
+
+// --- a session the modem still runs is adopted, not dialled into -------------
+//
+// An MC7710 (SWI9200X_03.05.29) acknowledges STOP_NETWORK but keeps the LTE
+// default bearer up, and then answers no START_NETWORK until a radio cycle
+// (deborah-3, 2026-10-04). Asked first, the dial adopts what runs.
+scenario('adopt-running', {
+	config: { apn: 'web', pdp_type: 'ipv4' },
+	handlers: {
+		GET_PACKET_SERVICE_STATUS: { status: 2 },   // connected
+		START_NETWORK: () => null,                  // would never answer
+	},
+}, (ctx, mock, events, next) => {
+	ctx.up((err, settings) => {
+		eq(err, null, 'adopt: up ok without a dial');
+		eq(length(mock.calls_for('START_NETWORK')), 0, 'adopt: no START_NETWORK sent');
+		ok(length(mock.calls_for('GET_CURRENT_SETTINGS')) > 0,
+			'adopt: the settings are read from the running session');
+		eq([ ctx.families['4']?.adopted, ctx.families['4']?.pdh ], [ true, null ],
+			'adopt: marked adopted, with no handle of our own to stop');
+		next();
+	});
+});
+
+scenario('dial-when-idle', {
+	config: { apn: 'web', pdp_type: 'ipv4' },
+	handlers: { GET_PACKET_SERVICE_STATUS: { status: 1 } },   // disconnected
+}, (ctx, mock, events, next) => {
+	ctx.up((err) => {
+		eq(err, null, 'idle: up ok');
+		eq([ length(mock.calls_for('GET_PACKET_SERVICE_STATUS')), length(mock.calls_for('START_NETWORK')) ], [ 1, 1 ],
+			'idle: asked once, then dialled');
 		next();
 	});
 });

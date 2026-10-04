@@ -472,7 +472,7 @@ export function create(opts)
 	// KEYED BY INTERFACE, NOT CARRIED ON THE ENTRY. The marker is evidence
 	// about an interface, and the context entry lives SHORTER than the
 	// interface. A config reload that cannot resolve an interface's modem
-	// produces no entry for it at all (config.uc:894-897 warns "references
+	// produces no entry for it at all (config.uc:898-901 warns "references
 	// unknown modem" and skips it), so a marker on the entry would have nothing
 	// to be carried over from. Re-adding the modem would then build a fresh
 	// entry with no marker, the status poll would see netifd's cleared
@@ -2638,20 +2638,28 @@ export function create(opts)
 
 		// A QRTR modem (a Qualcomm SDX on PCIe/MHI, whose QMI lives on the QRTR bus
 		// via qcom_mhi_qrtr — there is no cdc-wdm control node) is selected by the
-		// sentinel control device "qrtr". Its control channel is an AF_QIPCRTR
-		// socket that is always present, so synthesize a ready QMI control record
-		// rather than resolving/awaiting a sysfs node — modem.uc opens the
-		// QMI-over-QRTR hub for device "qrtr". The data netdev still comes from the
-		// interface (option device), exactly as for a cdc-wdm modem.
-		if (cfg.device == 'qrtr')
-			control = { protocol: 'qmi', device: 'qrtr', netdev: cfg.netdev, tty: null };
+		// sentinel control device "qrtr"; modem.uc opens the QMI-over-QRTR hub for
+		// it. The socket can always be opened, so it says nothing about the modem:
+		// PRESENT means its node serves DMS (discovery.qrtr_probe). Until then the
+		// control record stays null and the modem takes the same waiting path as
+		// a missing cdc-wdm, retried by the tick — there is no hotplug for QRTR.
+		// The data netdev still comes from the interface (option device).
+		if (cfg.device == 'qrtr') {
+			let node = deps.qrtr_probe ? deps.qrtr_probe(cfg) : null;
+
+			control = (node != null)
+				? { protocol: 'qmi', device: 'qrtr', netdev: cfg.netdev, tty: null, qrtr_node: node }
+				: null;
+		}
 
 		// legacy dep path (resolve_modem_device/resolve_protocol instead of
 		// resolve_control): synthesize a control record. ONLY when resolve_control
 		// isn't injected — otherwise its null is authoritative ("device not present
 		// yet") and we must NOT fall back to raw cfg.device (a netdev name isn't an
 		// openable control node); the modem must WAIT for hotplug.
-		if (!control && !deps.resolve_control) {
+		// (never for qrtr: its presence is the probe's answer above, and a
+		// control record made up from the config would bypass it)
+		if (!control && !deps.resolve_control && cfg.device != 'qrtr') {
 			let device = cfg.device;
 
 			if (!device && deps.resolve_modem_device)
@@ -2774,7 +2782,9 @@ export function create(opts)
 			// surface the wait to status()/netifd; the periodic tick re-logs it every 30s.
 			entry.control_note = entry.vanished
 				? 'waiting for modem (device vanished)'
-				: 'waiting for modem (control device not present)';
+				: (cfg.device == 'qrtr')
+					? 'waiting for modem (no QMI service on the QRTR bus)'
+					: 'waiting for modem (control device not present)';
 			entry.waiting_since = entry.waiting_since ?? time();
 			return;
 		}

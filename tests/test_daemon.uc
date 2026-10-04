@@ -4120,4 +4120,39 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	d.shutdown();
 }
 
+// --- a QRTR modem is present once DMS is on the bus (ddimension/wwand#46) ---------
+//
+// QRTR has no device node and no hotplug, and its socket opens whether or not
+// a modem is there. So presence is the probe's answer: no DMS on the bus, the
+// modem WAITS like a missing cdc-wdm (no hub whose every request would fail
+// and climb the recovery ladder), and the tick brings it up once DMS shows.
+{
+	let node = null, made = [];
+	let fake = {
+		modem: { create: (o) => (push(made, o), { id: o.id, state: 'INIT', config: o.config,
+			start: () => null, stop: () => null }) },
+		context: { create: (o) => ({ state: 'IDLE', name: o.name, modem: o.modem }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: {
+		log: () => null, load_qmi: () => fake,
+		qrtr_probe: (cfg) => node,
+	} });
+
+	d.apply_config(config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: 'qrtr', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'mhi_hwip0', apn: 'a' },
+	} }));
+
+	eq([ d.modems.m0.modem, length(made) ], [ null, 0 ], 'qrtr: no DMS on the bus -> no modem built');
+	ok(match(d.modems.m0.control_note ?? '', /waiting for modem \(no QMI service on the QRTR bus\)/),
+		'qrtr: ...it waits, and says why');
+
+	node = 1;
+	d.modems.m0._waiting_logged = 0;
+	d._tick();
+	ok(d.modems.m0.modem != null && made[0]?.device == 'qrtr', 'qrtr: DMS on the bus -> the tick builds it on device qrtr');
+	eq(d.modems.m0.control_note, null, 'qrtr: ...and the wait note is gone');
+	d.shutdown();
+}
+
 done('test_daemon');

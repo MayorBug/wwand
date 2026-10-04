@@ -343,7 +343,10 @@ const MODEM_KNOWN_OPTS = [ 'protocol', 'device', 'netdev', 'path', 'usb_path', '
 	// auto-derived from the control device's sysfs bus, but a QRTR/MHI modem has no
 	// such sysfs path to read the iface id from, so it is configurable there (a
 	// Quectel RG520N on MHI is accepted with ep_type 3 + ep_id 4).
-	'ep_type', 'ep_id' ];
+	'ep_type', 'ep_id',
+	// the QRTR node of a `device 'qrtr'` modem, for a box with more than one
+	// (default: the node that serves QMI DMS)
+	'qrtr_node' ];
 // option ip6ifaceid / ifaceid — resolve the alias and say so when the value is
 // one apply_iface_id() will refuse. Without the warning a typo'd identifier is
 // perfectly silent: the address simply stays what the network assigned, which
@@ -446,6 +449,7 @@ function modem_from_section(s, warnings)
 		// auto-derivation for USB modems. Coerced to a number (uci gives strings).
 		ep_type: (s.ep_type != null && s.ep_type != '') ? +s.ep_type : null,
 		ep_id:   (s.ep_id   != null && s.ep_id   != '') ? +s.ep_id   : null,
+		qrtr_node: (s.qrtr_node != null && s.qrtr_node != '') ? +s.qrtr_node : null,
 		tty: s.tty,
 		// explicit DM/DIAG node, the override for the generated 'qcdm' role
 		// table. wwand NEVER opens it — it is published as status.diag_port for
@@ -1576,7 +1580,7 @@ export function migrate_plan(raw, opts)
 				// THE ANCHORS BELONG TO THE INTERFACE THE MODEM WAS CREATED
 				// FROM. `device` is the obvious one; `netdev` is the same
 				// thing by another name — discovery resolves the modem and
-				// picks its datapath from it (discovery.uc:943,952), so a
+				// picks its datapath from it (discovery.uc:958,952), so a
 				// second interface supplying a different one would bind the
 				// section to the wrong hardware. Everything else in
 				// MIGRATE_MODEM_OPTS is modem POLICY (pincode, modes, mux,

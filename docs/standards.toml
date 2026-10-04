@@ -95,6 +95,16 @@ code = "src-ucode/{qmi_over_mbim,atcmd_mbim}.uc, codec/mbim_schema/qmi_passthrou
     review = "tbd"
 
 [[component]]
+name = "QMI over QRTR"
+code = "src-ucode/qmi_over_qrtr.uc, io/src/wwand-io.c (qrtr_*), discovery.uc (qrtr_*)"
+  [[component.standard]]
+  name = "Qualcomm IPC router (QRTR) and its name server"
+  basis = "linux 6.18.41 net/qrtr (ns.c, qmi_interface.c), include/uapi/linux/qrtr.h"
+  sections = "control packets (NEW/DEL_SERVER, NEW_LOOKUP), one socket per QMI client, SDU without QMUX header"
+    [[component.standard.review]]
+    review = "tbd"
+
+[[component]]
 name = "NCM / ECM backend"
 code = "src-ucode/{modem_ncm,context_ncm,telemetry_ncm,ncm_vendors}.uc"
   [[component.standard]]

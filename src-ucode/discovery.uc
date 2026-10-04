@@ -21,6 +21,7 @@
 
 import { glob, readlink, lsdir, access, open, realpath } from 'fs';
 import * as atcmd from 'wwand.atcmd';
+import * as qmit from 'wwand_io';
 
 // datapath drivers that mean "no rich control protocol — driven over AT"
 // Drivers whose control is AT rather than a rich protocol. `huawei_cdc_ncm` is
@@ -49,6 +50,20 @@ export function default_fx()
 		realpath: (p) => realpath(p),
 		lsdir:    (p) => lsdir(p),
 		access:   (p) => access(p) == true,
+		// one QRTR name-server lookup: [ { service, instance, node, port } ],
+		// or null when the address family is missing (no qrtr in the kernel)
+		qrtr_servers: (ms) => {
+			let h = qmit.qrtr_open?.();
+
+			if (!h)
+				return null;
+
+			let list = h.qdiscover(ms);
+
+			h.close();
+
+			return list;
+		},
 		read:     (p) => {
 			let f = open(p, 'r');
 
@@ -1140,4 +1155,42 @@ export function resolve_control(cfg, fx)
 
 	// 5. nothing present yet
 	return null;
+};
+
+// --- QRTR (QMI over the Qualcomm IPC router, ddimension/wwand#46) -----------
+
+// QMI DMS: every modem's QMI stack hosts it, so the node that serves it IS the
+// modem. Other nodes on the same bus are the SoC's own (IPA, DPM, ...) and
+// serve low-numbered services too; mapping theirs would shadow the modem's.
+export const QRTR_SVC_DMS = 2;
+
+// The modem's node among the servers a lookup returned: `want` if it hosts
+// DMS, else the first node that does. null = no modem on the bus (yet) — NOT
+// "any node", because a node without DMS answers no QMI wwand needs.
+export function qrtr_pick_node(servers, want)
+{
+	let nodes = [];
+
+	for (let s in (servers ?? []))
+		if (s.service == QRTR_SVC_DMS && index(nodes, s.node) < 0)
+			push(nodes, s.node);
+
+	if (want != null)
+		return (index(nodes, want) >= 0) ? want : null;
+
+	return length(nodes) ? nodes[0] : null;
+};
+
+// Is a QRTR modem there? The node, or null. The presence gate for
+// `option device 'qrtr'`: QRTR has no hotplug event and no device node, so a
+// modem still booting (services not registered yet) must read as ABSENT and
+// be retried by the waiting tick, the way a missing cdc-wdm is — opening a hub
+// then would fail every request, and those failures would climb the recovery
+// ladder for a modem that is merely late. Blocks for at most `ms`; the name
+// server answers in tens of milliseconds (its end-of-list marker ends it).
+export function qrtr_probe(want, fx, ms)
+{
+	fx = fx ?? default_fx();
+
+	return qrtr_pick_node(fx.qrtr_servers?.(ms ?? 300), want);
 };

@@ -879,6 +879,8 @@ export function create(o)
 		},
 		// one-time usbnet mode switch for a PPP-only modem (serial port only)
 		modeswitch: (o, cb) => modeswitch.attempt(o, cb),
+		// the presence gate of a QRTR modem (discovery.qrtr_probe)
+		qrtr_probe: (cfg) => discovery.qrtr_probe(cfg.qrtr_node),
 		resolve_ep_id: (cfg, device, netdev) =>
 			netdev ? netlink.ep_iface_number(netdev) : null,
 		resolve_ep_type: (cfg, device, netdev) =>

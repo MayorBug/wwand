@@ -1110,12 +1110,25 @@ the author on an RG520N-EB on an IPQ5018). Fixed alongside, both generic:
   hardware.
 - **The QMAP ladder** steps down on a QMI error for a version, not only on an
   echoed other version; only the last rung's error fails.
-Still open on the QRTR hub (ranked): one client id per service, while wwand
-runs several WDS clients at once — needs a socket per client; no
-NEW_SERVER/DEL_SERVER handling, so a modem restart is never seen; presence
-and the 2 s blocking discovery at start; `qrtr_node` for two QRTR modems;
-tests for the hub. The feed must install `qmi_over_qrtr.uc` in `wwand-qmi`
-(modem.uc imports it) before any bump that carries #46.
+The hub itself, rewritten on top of #46:
+- **One socket per QMI client.** On QRTR a service tells clients apart by
+  their source port; there is no client id on the wire. #46 gave every client
+  of a service the same cid on one socket, and wwand runs several WDS clients
+  at once (the modem's own plus one per IP family and attempt), so they were
+  one client on the modem. Each emulated ALLOCATE_CID now opens a socket,
+  RELEASE_CID closes it, and a reply belongs to the socket it arrived on.
+- **The modem's lifecycle.** The name server keeps reporting to the lookup
+  socket; DMS leaving the modem's node is "device gone" (rebuild, vanish
+  escalation as for a cdc-wdm), a NEW_SERVER moves a service's port.
+- **Presence.** `device 'qrtr'` is present once a node serves DMS
+  (`discovery.qrtr_probe`, at most 300 ms); before that it waits like a
+  missing cdc-wdm, retried by the tick. `option qrtr_node` picks among several.
+- Unknown CTL requests are NotSupported instead of a fake success; a client
+  whose socket cannot be opened gets ClientIdsExhausted.
+Host-tested (`test_qmi_over_qrtr`, the presence gate in `test_daemon`); NOT
+yet on hardware — nobody here has a QRTR modem, xhudan is asked to verify on
+the RG520N (dual-stack, a modem reset). The feed installs
+`qmi_over_qrtr.uc` in `wwand-qmi` (modem.uc imports it).
 
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

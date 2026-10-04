@@ -92,5 +92,6 @@ row. That is the whole maintenance rule.
 | Question | Answer |
 |---|---|
 | How is a mux child created, and which modes exist? | `netlink.uc`; the plug-in contract is `netlink.uc valid_plugin` and `datapath-interface.md`. |
+| How does a `device 'qrtr'` modem reach its QMI, and when does it count as present or gone? | `qmi_over_qrtr.uc create` (the hub: CTL emulated, one socket per client, the name server's DEL_SERVER of DMS = gone); presence is `discovery.uc qrtr_probe` / `discovery.uc qrtr_pick_node`, gated in `daemon.uc start_modem`. |
 | Which WDA endpoint (type, interface) does a modem get, and which QMAP version did it end on? | `netlink.uc ep_type_number` / `netlink.uc ep_iface_number` (from the resolved sysfs path of the data netdev; PCIe -> 4), a config `ep_type`/`ep_id` wins (`daemon.uc` passes them on); the version ladder and when it steps down is `modem_datapath_qmi.uc negotiate`. |
 | Why is my QMAP child not adopted by the vendor driver? | The `datapath_rmnet_nss*.uc` add-ons; they RETURN their implementation rather than registering it, because `require()` does not share module state. |

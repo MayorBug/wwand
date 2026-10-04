@@ -408,14 +408,15 @@ config wwand_modem 'm0'
 	                                 #   lives only on the QRTR bus (no cdc-wdm,
 	                                 #   e.g. an RG520N on an IPQ5018). QMI backend
 	                                 #   only. The modem counts as present once a
-	                                 #   node on the bus serves QMI DMS; until then
+	                                 #   node on the bus serves QMI DMS and WDS;
+	                                 #   until then
 	                                 #   it waits (status: "no QMI service on the
 	                                 #   QRTR bus"), retried every 30 s. The data
 	                                 #   netdev comes from the interface's
 	                                 #   `option device` (the mhi_net link).
 	option qrtr_node ''              # device 'qrtr' only: the QRTR node to use when
-	                                 #   more than one serves DMS (default: the
-	                                 #   first that does)
+	                                 #   more than one serves DMS + WDS (default:
+	                                 #   the first that does)
 	                                 # or `option path` — PREFERRED for multi-modem
 	                                 #   setups: netdev/cdc-wdm names follow USB
 	                                 #   enumeration order and can swap on reboot.

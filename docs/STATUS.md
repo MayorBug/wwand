@@ -1120,11 +1120,21 @@ The hub itself, rewritten on top of #46:
   one client on the modem. Each emulated ALLOCATE_CID now opens a socket,
   RELEASE_CID closes it, and a reply belongs to the socket it arrived on.
 - **The modem's lifecycle.** The name server keeps reporting to the lookup
-  socket; DMS leaving the modem's node is "device gone" (rebuild, vanish
-  escalation as for a cdc-wdm), a NEW_SERVER moves a service's port.
-- **Presence.** `device 'qrtr'` is present once a node serves DMS
-  (`discovery.qrtr_probe`, at most 300 ms); before that it waits like a
-  missing cdc-wdm, retried by the tick. `option qrtr_node` picks among several.
+  socket; DMS leaving the modem's node, or showing up there on another port
+  (a restart, whichever report comes first), is "device gone" (rebuild,
+  vanish escalation as for a cdc-wdm); a NEW_SERVER moves any other
+  service's port, and a DEL_SERVER for a port already superseded is ignored.
+- **Presence.** `device 'qrtr'` is present once a node serves DMS and WDS
+  (`discovery.qrtr_probe`, at most 300 ms) — WDS too, because the QMI init
+  reads the service list once and a booting SDX registers its services one by
+  one; a WDA registering later than WDS is still missed until the next init.
+  Before that it waits like a missing cdc-wdm, retried by the tick.
+  `option qrtr_node` picks among several.
+- **Existing MHI users:** the PCIe endpoint (PCIE/4) now goes out on the
+  `/dev/wwan0qmi0` + mhi_net path and with the vendor pcie_mhi /
+  rmnet_nss_mhi add-on too, where before no endpoint was sent and a muxed
+  context stopped at `endpoint_unknown`. ModemManager and quectel-CM do the
+  same; not yet seen on hardware here — `ep_type`/`ep_id` override it.
 - Unknown CTL requests are NotSupported instead of a fake success; a client
   whose socket cannot be opened gets ClientIdsExhausted.
 - A DEL_SERVER for an endpoint its service has already left (a restart's

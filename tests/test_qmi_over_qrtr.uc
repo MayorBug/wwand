@@ -191,17 +191,34 @@ inject(lookup, ctrl(5, 2, 5, 40));
 spin();
 eq(gone, 0, 'ctrl: DMS leaving ANOTHER node is not this modem going');
 
-// a modem restart: DMS re-registers on a new port BEFORE the old one's
-// deletion arrives — that deletion is stale and must not kill the live hub
-inject(lookup, ctrl(4, 2, 1, 20));
-inject(lookup, ctrl(5, 2, 1, 10));
+// a service re-registered on a new port before the old one's deletion
+// arrives: that deletion is stale and must not drop the live mapping
+inject(lookup, ctrl(4, 1, 1, 31));
+inject(lookup, ctrl(5, 1, 1, 21));
 spin();
-eq(gone, 0, 'ctrl: a DEL_SERVER for an endpoint already superseded is ignored');
+hub.send(f2);
+eq(s2.sent[length(s2.sent) - 1], [ 1, 31, substr(f2, 6) ], 'ctrl: a DEL_SERVER for an endpoint already superseded is ignored');
 
-inject(lookup, ctrl(5, 2, 1, 20));
+inject(lookup, ctrl(5, 2, 1, 10));
 spin();
 eq(gone, 1, 'ctrl: DMS leaving the modem node is "device gone"');
 ok(s2.closed && lookup.closed, 'ctrl: ...and every socket of the hub is closed');
 eq(hub.send(f2), false, 'ctrl: a gone hub refuses to send');
+
+// DMS showing up on a NEW port is a restart too, even when that report
+// comes before the old port's deletion
+let gone2 = 0;
+let hub2 = qrtr.create({ io: fake_io, on_gone: () => gone2++ });
+let lookup2 = socks[length(socks) - 1];
+inject(lookup2, ctrl(4, 2, 1, 50));
+spin();
+eq(gone2, 1, 'ctrl: DMS re-registered on another port is "device gone"');
+inject(lookup2, ctrl(4, 2, 1, 50));
+spin();
+eq(gone2, 1, 'ctrl: ...reported once, the hub is closed after it');
+
+// presence wants WDS beside DMS: a node caught mid-boot is not a modem yet
+eq(discovery.qrtr_pick_node([ { service: 2, node: 1, port: 10 } ]), null,
+	'pick: DMS without WDS yet -> not present (the init reads the service list once)');
 
 done('test_qmi_over_qrtr');

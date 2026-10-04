@@ -374,6 +374,13 @@ export function create(opts)
 			if (c.cmd == 'del' && c.service == discovery.QRTR_SVC_DMS)
 				return gone('DMS left the bus');
 
+			// DMS on a NEW port is DMS restarted, whichever of the two
+			// reports comes first: every modem-side client is gone with it,
+			// so the hub must be rebuilt, not re-pointed
+			if (c.cmd == 'new' && c.service == discovery.QRTR_SVC_DMS &&
+			    self.svc_addr[skey] != null && self.svc_addr[skey] != c.port)
+				return gone('DMS re-registered on another port');
+
 			if (c.cmd == 'del')
 				delete self.svc_addr[skey];
 			else

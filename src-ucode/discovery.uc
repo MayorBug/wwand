@@ -1163,16 +1163,29 @@ export function resolve_control(cfg, fx)
 // modem. Other nodes on the same bus are the SoC's own (IPA, DPM, ...) and
 // serve low-numbered services too; mapping theirs would shadow the modem's.
 export const QRTR_SVC_DMS = 2;
+export const QRTR_SVC_WDS = 1;
 
 // The modem's node among the servers a lookup returned: `want` if it hosts
-// DMS, else the first node that does. null = no modem on the bus (yet) — NOT
-// "any node", because a node without DMS answers no QMI wwand needs.
+// DMS AND WDS, else the first node that does. null = no modem on the bus
+// (yet) — NOT "any node", because a node without DMS answers no QMI wwand
+// needs. WDS too, because a booting modem registers its services one by one
+// and the QMI init reads the service list ONCE (GET_VERSION_INFO,
+// modem_init_qmi.uc): a node caught with DMS but before WDS would be brought
+// up without a data service. WDA is not required — not every modem has it —
+// so a WDA that registers after WDS is still missed until the next init.
 export function qrtr_pick_node(servers, want)
 {
+	let has = {};
+
+	for (let s in (servers ?? []))
+		if (s.service == QRTR_SVC_DMS || s.service == QRTR_SVC_WDS)
+			(has[sprintf('%d', s.node)] ??= {})[sprintf('%d', s.service)] = true;
+
 	let nodes = [];
 
 	for (let s in (servers ?? []))
-		if (s.service == QRTR_SVC_DMS && index(nodes, s.node) < 0)
+		if (has[sprintf('%d', s.node)]?.['2'] && has[sprintf('%d', s.node)]?.['1'] &&
+		    index(nodes, s.node) < 0)
 			push(nodes, s.node);
 
 	if (want != null)

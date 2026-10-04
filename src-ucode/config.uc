@@ -339,10 +339,10 @@ const MODEM_KNOWN_OPTS = [ 'protocol', 'device', 'netdev', 'path', 'usb_path', '
 	// unset/0 = whatever the datapath can drive). Mostly a bring-up handle:
 	// pinning it is how a specific version gets exercised on real hardware.
 	'qmap_version',
-	// WDA data endpoint (type: 2 HSUSB / 3 PCIE / 4 EMBEDDED; iface id). Normally
-	// auto-derived from the control device's sysfs bus, but a QRTR/MHI modem has no
-	// such sysfs path to read the iface id from, so it is configurable there (a
-	// Quectel RG520N on MHI is accepted with ep_type 3 + ep_id 4).
+	// WDA data endpoint override (type: 2 HSUSB / 3 PCIE / 4 EMBEDDED; iface id).
+	// Derived from the data netdev's bus otherwise (netlink.ep_type_number /
+	// ep_iface_number: USB -> the QMI interface, PCIe -> 4); set only for a modem
+	// that refuses the derived endpoint.
 	'ep_type', 'ep_id',
 	// the QRTR node of a `device 'qrtr'` modem, for a box with more than one
 	// (default: the node that serves QMI DMS)
@@ -443,10 +443,9 @@ function modem_from_section(s, warnings)
 		mnc: s.mnc,
 		mux: s.mux ?? 'auto',
 		dl_datagram_max_size: num_opt(s.dl_datagram_max_size, 0, 'dl_datagram_max_size', warnings),
-		// WDA data endpoint, usually auto-derived from the control device's sysfs bus
-		// (daemon resolve_ep_id/resolve_ep_type). A QRTR/MHI modem has no such sysfs
-		// path for the iface id, so it is set here instead; null (unset) keeps the
-		// auto-derivation for USB modems. Coerced to a number (uci gives strings).
+		// WDA data endpoint override; null (unset) keeps the derivation from the
+		// data netdev (deps resolve_ep_id/resolve_ep_type). Coerced to a number
+		// (uci gives strings).
 		ep_type: (s.ep_type != null && s.ep_type != '') ? +s.ep_type : null,
 		ep_id:   (s.ep_id   != null && s.ep_id   != '') ? +s.ep_id   : null,
 		qrtr_node: (s.qrtr_node != null && s.qrtr_node != '') ? +s.qrtr_node : null,
@@ -1580,7 +1579,7 @@ export function migrate_plan(raw, opts)
 				// THE ANCHORS BELONG TO THE INTERFACE THE MODEM WAS CREATED
 				// FROM. `device` is the obvious one; `netdev` is the same
 				// thing by another name — discovery resolves the modem and
-				// picks its datapath from it (discovery.uc:958,952), so a
+				// picks its datapath from it (discovery.uc:958,967), so a
 				// second interface supplying a different one would bind the
 				// section to the wrong hardware. Everything else in
 				// MIGRATE_MODEM_OPTS is modem POLICY (pincode, modes, mux,

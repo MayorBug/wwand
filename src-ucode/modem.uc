@@ -33,8 +33,10 @@ import * as tmdmod from 'wwand.codec.schema.tmd';
 import * as catmod from 'wwand.codec.schema.cat';
 import * as pdcmod from 'wwand.codec.schema.pdc';
 import * as carrier from 'wwand.carrier_config';
-// loc.uc + wms.uc are lazy-loaded (require of a *_lazy shim) only when GPS /
-// SMS is actually used, keeping those schemas off the heap on the common path.
+// wms.uc is lazy-loaded (require of a *_lazy shim) only when SMS is actually
+// used, keeping that schema off the heap on the common path. GNSS over QMI LOC
+// is not here at all: it lives in the optional wwand-gps package, which asks
+// for its client through extra_client like any plugin.
 
 const TIMING_DEFAULTS = {
 	...modem_common.TIMING_BASE,   // settle/reg_timeout/backoff_min/backoff_max
@@ -135,8 +137,6 @@ export function create(opts)
 		datapath: null,    // { backend, urb_size, mux_devs, ep_id } after INIT_DATAPATH
 		at: null,          // AT engine, best-effort
 		at_tty: null,
-		loc: null,         // LOC client when config.location is set
-		location: null,    // last position report
 		cells: null,       // last cell location info (telemetry collector)
 		active_sim: null,  // matched per-SIM override (config wwand_sim) for the
 		                   // inserted card: overrides pincode + apn/auth/pdp
@@ -189,7 +189,7 @@ export function create(opts)
 	// clients, which delivers a synchronous `cancelled` to everything in flight —
 	// so an outer set_opmode callback that ignores its error re-arms tm.settle
 	// AFTER the cancel pass. The new timer fires with self.dms already null
-	// (modem.uc:1644) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
+	// (modem.uc:1586) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
 	// which in ucode is a throw inside a uloop callback: the daemon dies and procd
 	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:668, step_sim), and
 	// every QMI site that re-arms tm.settle needs it too.
@@ -383,7 +383,10 @@ export function create(opts)
 	};
 
 	// A client of a service the core does not know, for a plugin (daemon dep
-	// `qmi_client`). cb(err, client). The MODEM owns it: teardown releases it
+	// `qmi_client`). cb(err, client). A plugin may set `client.before_release`
+	// (a function): it runs right before the client's RELEASE_CID, on teardown
+	// and on extra_release alike — the place to end a session the client
+	// opened. The MODEM owns it: teardown releases it
 	// with its own clients, because a CID left allocated on the modem stays in
 	// its client table until the stack resets, and a plugin cannot see the
 	// teardown coming. After that `client.destroyed` is true and the plugin
@@ -442,6 +445,9 @@ export function create(opts)
 			client?.destroy();
 			return cb ? cb(null) : null;
 		}
+
+		if (self.hub && !self.hub.closed)
+			modem_common.before_release([ client ], log);
 
 		self.release(client, cb);
 	};
@@ -541,7 +547,7 @@ export function create(opts)
 				// done() IS answered on the cancelled path. It is not only
 				// make_fail's internal continuation: the daemon passes a real
 				// caller's callback through note_connect_failure
-				// (daemon.uc:3959), and dropping it strands a ubus request.
+				// (daemon.uc:3968), and dropping it strands a ubus request.
 				// Restarting a torn-down modem is prevented where it belongs
 				// instead — make_fail now refuses a `cancelled` outright
 				// (modem_common.uc).
@@ -1469,7 +1475,6 @@ export function create(opts)
 						trim(self.reg.plmn.description ?? '')) : null,
 					self.reg.roaming, join(' ', self.reg.radio_ifs ?? [])));
 				enter_ready(() => {
-					self._start_loc();
 					self._start_telemetry();
 				});
 			}
@@ -1492,69 +1497,6 @@ export function create(opts)
 			notify_contexts('suspend', self.reg);
 			chain.register();
 		}
-	};
-
-	// start the LOC positioning session once (best-effort)
-	self._start_loc = function() {
-		if (self.loc || !self.config.location)
-			return;
-
-		// lazy-load the LOC schema only now (GPS enabled) — see the top-of-file note
-		let locmod = require('wwand.codec.schema.loc_lazy').s;
-
-		if (!self.services[sprintf('%d', locmod.default.service)]) {
-			log('info', 'location requested but loc service unavailable');
-			return;
-		}
-
-		self.alloc(locmod.default, (err, loc) => {
-			if (err) {
-				log('warn', sprintf('loc allocation failed: %J', err));
-				return;
-			}
-
-			self.loc = loc;
-
-			loc.on('POSITION_REPORT_IND', (data) => {
-				if (data.status != locmod.SESSION_STATUS_SUCCESS &&
-				    data.status != locmod.SESSION_STATUS_IN_PROGRESS)
-					return;
-
-				if (data.latitude == null)
-					return;
-
-				self.location = {
-					latitude: data.latitude,
-					longitude: data.longitude,
-					altitude: data.altitude,
-					speed: data.h_speed,
-					heading: data.heading,
-					uncertainty: data.h_uncertainty,
-					hdop: data.dop?.hdop,
-					technology: data.technology,
-					utc_ms: data.utc_ms,
-				};
-
-				emit('location', self.location);
-			});
-
-			loc.request('REGISTER_EVENTS', { mask: locmod.EVENT_POSITION_REPORT }, (e2) => {
-				if (e2)
-					return log('warn', sprintf('loc register events failed: %J', e2));
-
-				self._loc_session = true;
-				loc.request('START', {
-					session_id: 1,
-					intermediate_reports: 1,
-					min_interval_ms: 1000,
-				}, (e3) => {
-					if (e3)
-						log('warn', sprintf('loc start failed: %J', e3));
-					else
-						log('notice', 'location session started');
-				});
-			});
-		});
 	};
 
 	// telemetry subsystem (fast watch loop, CA, data-mode, slow log tick) —
@@ -1678,20 +1620,18 @@ export function create(opts)
 		// synchronously, and destroying ctl just below cancels the answers we do
 		// not need. ctl goes LAST, and is only destroyed — it is the implicit
 		// client (cid 0) and it is what carries RELEASE_CID for all the others.
-		// END THE POSITION SESSION before its client goes. START opens a
-		// session on the modem that reports every second, and RELEASE_CID only
-		// drops the client — nothing told the location engine to stop. On an
-		// EG25-G with `option location` the QMI side stopped answering three
-		// times in one afternoon, each time right after such a teardown and the
-		// CTL SYNC of the rebuild (EG25GGBR07A08M2G, 2026-10-01: CTL SYNC and
-		// GET_VERSION_INFO time out, AT answers); none before the option was
-		// set. Written before the release below, so it reaches the modem first.
-		if (self.loc && self._loc_session && self.hub && !self.hub.closed)
-			self.loc.request('STOP', { session_id: 1 }, (e) => null, { no_recovery: true });
+		// A PLUGIN'S CLIENT MAY OWE THE MODEM A GOODBYE before its CID goes:
+		// `before_release` (the extra_client contract) is written first, so it
+		// reaches the modem ahead of the RELEASE_CID below. RELEASE_CID only
+		// drops the client — a session the client opened (a QMI LOC position
+		// session reports every second) outlives it, and on an EG25-G the QMI
+		// side stopped answering three times in one afternoon right after such
+		// teardowns (EG25GGBR07A08M2G, 2026-10-01: CTL SYNC and
+		// GET_VERSION_INFO time out, AT answers).
+		if (self.hub && !self.hub.closed)
+			modem_common.before_release(self.extra_clients ?? [], log);
 
-		self._loc_session = false;
-
-		for (let c in [ self.dms, self.nas, self.uim, self.wda, self.loc, self.wds_cfg,
+		for (let c in [ self.dms, self.nas, self.uim, self.wda, self.wds_cfg,
 		               self.dsd, self.tmd, self.cat, self.wms, self.pdc,
 		               ...(self.extra_clients ?? []) ]) {
 			if (!c)
@@ -1705,7 +1645,7 @@ export function create(opts)
 
 		self.ctl?.destroy();
 
-		self.ctl = self.dms = self.nas = self.uim = self.wda = self.loc = self.wds_cfg = null;
+		self.ctl = self.dms = self.nas = self.uim = self.wda = self.wds_cfg = null;
 
 		// The releases above are still in flight and destroying CTL cancels
 		// their answers, so their cid_held(…, false) never runs. The CIDs die

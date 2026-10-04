@@ -184,6 +184,32 @@ const GNSS_START = [
 	{ vendors: /quectel|asr/, cmd: 'AT+QGPS=1', ok_errors: /504/ },
 ];
 
+// The extra_client contract's goodbye: run each plugin client's
+// `before_release(client)` once, right before the modem releases its CID —
+// the place to end a session the client opened, which RELEASE_CID alone does
+// not (QMI LOC: modem.uc teardown). Cleared before the call, so a teardown
+// that reaches the same client twice says goodbye once; guarded per client,
+// because a plugin's goodbye that throws must not cost the release burst it
+// precedes the CIDs of every client after it.
+export function before_release(clients, log)
+{
+	for (let c in clients) {
+		let f = c?.before_release;
+
+		if (type(f) != 'function')
+			continue;
+
+		c.before_release = null;
+
+		try {
+			f(c);
+		}
+		catch (e) {
+			log('warn', sprintf('a plugin client\'s before_release threw: %s', e));
+		}
+	}
+};
+
 export function start_gnss(self, log, cb)
 {
 	cb = cb ?? (() => null);

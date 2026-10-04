@@ -154,8 +154,10 @@ function run_next()
 		finish(modem);
 	});
 
+	// the third argument ends the scenario from the setup's own timers, for
+	// one whose last step is not a modem event (a plugin's session)
 	if (s.cfg.setup)
-		s.cfg.setup(mock, modem);
+		s.cfg.setup(mock, modem, () => finish(modem));
 
 	modem.start();
 }
@@ -2244,7 +2246,15 @@ scenario('lock-absent-no-write', {
 			'lock-absent: and no NV write');
 	});
 
-// --- 11: LOC positioning session ----------------------------------------------
+// --- 11: GNSS over QMI LOC (wwand-gps, as an extra_client plugin) ------------
+//
+// The core has no LOC of its own; wwand-gps asks for its client through
+// extra_client and sets `before_release`, which the modem runs ahead of the
+// RELEASE_CID — the LOC STOP. RELEASE_CID alone leaves the engine reporting
+// every second (an EG25-G's QMI side hung after such teardowns, 2026-10-01).
+
+let gpsmod = require('wwand.gps');
+let loc_lines = [], loc_states = [], loc_sess = null;
 
 scenario('loc', {
 	handlers: base_handlers({
@@ -2256,40 +2266,52 @@ scenario('loc', {
 			{ service: 16, major: 2, minor: 0 },
 		] },
 		'16:REGISTER_EVENTS': {},
+		SET_NMEA_TYPES: {},
 		START: {},
 		STOP: {},
 	}),
-	config: { location: true },
-	setup: (mock, modem) => {
-		let poll = null;
+	setup: (mock, modem, end) => {
+		let sent = false, poll = null;
+
 		poll = uloop.timer(10, () => {
-			if (modem.loc && length(mock.calls_for('START'))) {
-				mock.indicate(16, modem.loc.cid, 'POSITION_REPORT_IND', {
-					status: 1, session_id: 1,
-					latitude: 52.5, longitude: 13.375,
-					altitude: 34.5, h_speed: 1.25, heading: 90.5,
-					technology: 1, utc_ms: 1753000000000,
+			if (modem.state == 'READY' && !loc_sess) {
+				loc_sess = gpsmod.loc_session({
+					modem: modem,
+					on_line: (l) => push(loc_lines, l),
+					on_state: (ev, d) => push(loc_states, ev),
 				});
+				loc_sess.start();
+			}
+
+			if (loc_sess?.client && length(mock.calls_for('START')) && !sent) {
+				sent = true;
+				mock.indicate(16, loc_sess.client.cid, 'NMEA_IND', {
+					nmea: '$GPGGA,082112.00,5208.613543,N,00857.854813,E,1,08,0.5,102.9,M,47.0,M,,*60\r\n' +
+					      '$GPRMC,082112.00,A,5208.613543,N,00857.854813,E,0.0,,210925,,,A*79\r\n',
+				});
+				uloop.timer(20, end);
 				return;
 			}
 
 			poll.set(10);
 		});
 	},
-}, 'location',
+}, 'loc-done',
 	(modem, mock, events) => {
-		eq(modem.location.latitude, 52.5, 'loc: latitude');
-		eq(modem.location.longitude, 13.375, 'loc: longitude');
-		eq(modem.location.altitude, 34.5, 'loc: altitude');
-		eq(modem.location.utc_ms, 1753000000000, 'loc: timestamp');
+		eq(loc_states, [ 'started' ], 'loc: the session started');
+		eq(length(loc_lines), 2, 'loc: one indication, two sentences, each on its own');
+		ok(index(loc_lines[0], '$GPGGA') == 0 && index(loc_lines[0], '\r') < 0,
+			'loc: a sentence arrives whole, CR/LF stripped');
+		eq(filter(mock.calls, (c) => c.service == 16 && c.name == 'REGISTER_EVENTS')[0]?.args?.mask, 4, 'loc: registered for NMEA (1 << 2, libqmi 1.38)');
+		eq(mock.calls_for('SET_NMEA_TYPES')[0]?.args?.types, 0xFFFF, 'loc: ALL sentence types asked for — the five named ones are GPS-only');
 
 		let starts = mock.calls_for('START');
 		eq(starts[0].args.session_id, 1, 'loc: session id');
 		eq(starts[0].args.min_interval_ms, 1000, 'loc: report interval');
+		eq(starts[0].args.fix_recurrence, 1, 'loc: periodic fixes — an absent TLV is a single one');
 
-		// the session is ended before its client is released: releasing the
-		// client alone leaves the modem's location engine running
-		let loc_cid = modem.loc.cid;
+		// the session is ended before its client is released
+		let loc_cid = loc_sess.client.cid;
 
 		modem.stop();
 
@@ -2299,6 +2321,7 @@ scenario('loc', {
 		eq(names, [ 'STOP', 'RELEASE_CID' ], 'loc: STOP goes out before the client is released');
 		eq(mock.calls_for('STOP')[0]?.args?.session_id, 1, 'loc: ...for the session START opened');
 		ok(loc_cid != null, 'loc: the session had a client');
+		eq(loc_sess.alive(), false, 'loc: a torn-down client is not a live session — the next modem starts again');
 	});
 
 // --- 12: telemetry collector --------------------------------------------------

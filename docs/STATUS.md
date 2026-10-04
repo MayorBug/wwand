@@ -1243,6 +1243,25 @@ unanswered dial stays as the safety net.
   dialling — on every plain bring-up after a modem reset. Only an IDLE context
   behind a pending setup is an orphan now.
 
+- **GNSS over QMI LOC, in wwand-gps** (2026-10-04): a modem with `option gnss`
+  and no NMEA port gets the same NMEA over QMI LOC — natively, or over the
+  MBIM passthrough — into the same reader (`gps.uc loc_session`, feed-only
+  reader; `modem_gps` says `source: qmi_loc`). The core's own LOC
+  (`_start_loc`, `self.location`) is gone; `option location` is an alias of
+  `gnss`, `modem_location` a short view over the reader, and the LOC schema
+  ships in wwand-gps. New neutral hook for plugin clients:
+  `client.before_release`, run by the modem ahead of the RELEASE_CID on
+  teardown and extra_release (QMI and MBIM) — the LOC STOP rides it.
+  HW (NR7101 / RG502Q, 2026-10-04): port and LOC both 3D; LOC needed
+  periodic fixes (an absent Fix Recurrence TLV is a single fix — ~60
+  sentences, then silence) and NMEA types ALL (0x1F is GPS-only; ALL gave
+  GPS + GLONASS + Galileo, 33 in view instead of 14 — and the port emits them
+  too afterwards, the setting is the engine's). Two reader fixes it exposed:
+  a read longer than MAX_LINE (a second of multi-constellation sentences)
+  dropped its first sentence as `unparsed` — the limit is on the unfinished
+  tail now; and valid NMEA not interpreted (GNS, $PSTIS) counts as `ignored`.
+  Teardown STOP/RELEASE twice, QMI healthy. MBIM passthrough not HW-tested.
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

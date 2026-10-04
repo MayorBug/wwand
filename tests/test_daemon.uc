@@ -3280,6 +3280,58 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	d.shutdown();
 })();
 
+// GNSS SOURCE: the modem's NMEA port when it has one, else QMI LOC — asked
+// for on registration, with the modem object (LOC rides its extra_client).
+// modem_location is the short view over the same reader.
+(() => {
+	let hooks = {}, calls = [], the_modem = null, snap = null;
+	let fake = {
+		modem: { create: (o) => {
+			hooks[o.id] = o.deps.on_event;
+			return (the_modem = { id: o.id, state: 'READY', config: o.config, start: () => null,
+			                      stop: () => null, note_connect_success: () => null });
+		} },
+		context: { create: (o) => ({ state: 'IDLE', name: o.name, modem: o.modem, config: o.config,
+		                             down: (cb) => cb ? cb() : null, up: (cb) => null,
+		                             modem_event: () => null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: {
+		log: () => null, load_qmi: () => fake,
+		giveups_file: '/tmp/test-giveups-gnss.json', admin_downs_file: '/tmp/test-admin-downs-gnss.json',
+		gps_start: (ref, port, o) => push(calls, [ 'port', ref, port ]),
+		gps_start_loc: (ref, m, o) => push(calls, [ 'loc', ref, m === the_modem ]),
+		gps_status: (m, sn) => ({ modem: m.id }),
+		gps_snapshot: (ref) => snap,
+	} });
+
+	d.apply_config(config.parse({ network: {
+		m0: { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi', gnss: '1' },
+	} }));
+
+	eq(d.modem_location('m0'), { error: 'no_fix' }, 'gnss: no fix yet');
+
+	the_modem.gps_tty = '/dev/ttyUSB1';
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(calls, [ [ 'port', 'm0', '/dev/ttyUSB1' ] ], 'gnss: a modem with an NMEA port reads the port');
+
+	calls = [];
+	the_modem.gps_tty = null;
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(calls, [ [ 'loc', 'm0', true ] ], 'gnss: no port — QMI LOC, handed the modem itself');
+
+	snap = { valid: true, latitude: 52.1, longitude: 8.9, elevation: 102.9, source: 'qmi_loc' };
+	let loc = d.modem_location('m0');
+	eq([ loc.latitude, loc.altitude, loc.source ], [ 52.1, 102.9, 'qmi_loc' ],
+	   'gnss: modem_location is the short view over the reader');
+
+	calls = [];
+	the_modem.config = { ...the_modem.config, gnss: false };
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq([ calls, d.modem_location('m0').error ], [ [], 'location_disabled' ],
+	   'gnss: off — neither source, and modem_location says why');
+	d.shutdown();
+})();
+
 // WHO CLEARED AUTOSTART, after a restart. The in-memory _our_downs marker is
 // gone, so netifd's evidence decides: a `wwand` error on the interface is the
 // shim's failed setup (a block, or a reset of ours) — brought back; an ifdown

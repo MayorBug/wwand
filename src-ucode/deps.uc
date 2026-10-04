@@ -47,7 +47,7 @@ export function create(o)
 	// One NMEA reader per modem id. wwand.gps ships in the OPTIONAL wwand-gps
 	// package, so it is require()d lazily and remembered — including the
 	// failure, so a missing package is reported once rather than once a second.
-	let gps_readers = {}, gps_mod, gps_tried = false;
+	let gps_readers = {}, gps_loc_said = {}, gps_mod, gps_tried = false;
 
 	// retire_wan6: the last shape of a `<parent>_6` section we declined to
 	// park, per section name — so the reason is stated once and again only when
@@ -939,8 +939,13 @@ export function create(o)
 					return { started: false, error: 'port_in_use', owner: other };
 				}
 
-			if (cur)
+			// a LOC reader before it (the port was not there yet) goes whole:
+			// its session too, or the engine keeps reporting to a client
+			// nobody reads
+			if (cur) {
+				cur.loc?.stop();
 				cur.stop();
+			}
 
 			let r = gps.create({
 				path: port,
@@ -974,12 +979,73 @@ export function create(o)
 			return { started: true, port: port };
 		},
 
+		// NO NMEA PORT, BUT QMI: the same reader, fed by LOC's NMEA
+		// indications instead of a tty (gps.uc loc_session) — natively on a
+		// QMI modem, over the passthrough on an MBIM one. The daemon asks for
+		// this only when the modem has no port; a port wins, because it needs
+		// no QMI session and is the path that works on Quectel.
+		gps_start_loc: (ref, modem, opts) => {
+			let gps = load_gps();
+
+			if (!gps)
+				return null;
+
+			let cur = gps_readers[ref];
+
+			// a live session survives a re-registration; a destroyed client (the
+			// modem was torn down) does not, and starts again here
+			if (cur?.loc?.alive())
+				return { started: false, unchanged: true, source: 'qmi_loc' };
+
+			if (cur) {
+				cur.loc?.stop();
+				cur.stop();
+			}
+
+			let r = gps.create({
+				path: 'qmi-loc',
+				feed: true,
+				on_epoch: (opts?.adjust_time ?? false)
+					? (epoch) => set_clock(epoch, null, 'GNSS') : null,
+			});
+
+			r.start();
+
+			r.loc = gps.loc_session({
+				modem: modem,
+				on_line: (line) => r.push(line + '\n'),
+				on_state: (ev, detail) => {
+					if (ev == 'started') {
+						gps_loc_said[ref] = null;
+						logmod.log('notice', 'gps: %s: no NMEA port — reading NMEA over QMI LOC', ref);
+						return;
+					}
+
+					// said once per distinct reason: a modem without LOC answers
+					// the same on every registration
+					let why = sprintf('%J', detail);
+
+					if (gps_loc_said[ref] != why) {
+						gps_loc_said[ref] = why;
+						logmod.log('info', 'gps: %s: no NMEA port and no QMI LOC session (%s: %J)',
+							ref, detail?.stage, detail?.err);
+					}
+				},
+			});
+
+			gps_readers[ref] = r;
+			r.loc.start();
+
+			return { started: true, source: 'qmi_loc' };
+		},
+
 		gps_stop: (ref) => {
 			let r = gps_readers[ref];
 
 			if (!r)
 				return false;
 
+			r.loc?.stop();
 			r.stop();
 			gps_readers[ref] = null;
 			logmod.log('info', 'gps: %s: stopped reading', ref);
@@ -990,7 +1056,19 @@ export function create(o)
 		// the reader's own view, or null when there is none for this modem
 		// no clock argument: the reader stamps monotonically, and handing it a
 		// wall-clock `now` here would defeat that
-		gps_snapshot: (ref) => gps_readers[ref] ? gps_readers[ref].snapshot() : null,
+		gps_snapshot: (ref) => {
+			let r = gps_readers[ref];
+
+			if (!r)
+				return null;
+
+			let snap = r.snapshot();
+
+			if (r.loc)
+				snap.loc = { state: r.loc.state, error: r.loc.error, indications: r.loc.indications };
+
+			return snap;
+		},
 
 		// the shape of a modem_gps reply, which lives with the reader
 		gps_status: (modem, snap) => {

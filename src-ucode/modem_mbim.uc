@@ -2157,7 +2157,7 @@ export function create(opts)
 
 	// A plugin's client of a QMI service the core does not know, over the
 	// QMI-over-MBIM passthrough — the QMI modem's extra_client, same contract
-	// (modem.uc): the modem owns it, releases its CID on teardown and when the
+	// (modem.uc), `before_release` included: the modem owns it, releases its CID on teardown and when the
 	// passthrough is rebuilt, and `destroyed` tells the plugin to ask again.
 	// Which indications the passthrough carries depends on the service
 	// (qmi_over_mbim.uc:143-151): NAS pushes none on the EG06 and the RM520N,
@@ -2226,8 +2226,12 @@ export function create(opts)
 			return true;
 		});
 
-		if (owned)
+		if (owned) {
+			if (self._gen == client._pt_gen && self.pt?.ctl)
+				modem_common.before_release([ client ], log);
+
 			pt_release(client);
+		}
 		else
 			client?.destroy();
 
@@ -2627,10 +2631,15 @@ export function create(opts)
 			// — closing the HOST's MBIM session is not shown to reset the
 			// modem's embedded QMI client table, so every daemon reload leaked
 			// a NAS, a DSD and (once used) a UIM and a WMS. The E182E-class
-			// table has room for a handful. Same burst modem.uc:1620 does for
+			// table has room for a handful. Same burst modem.uc:1562 does for
 			// the native side, which the passthrough never had. ctl is NOT in this list: it is the
 			// implicit client (cid 0) and it is what carries RELEASE_CID for
 			// all the others, so it has to outlive them.
+			// a plugin client's goodbye first (modem_common.before_release):
+			// written ahead of the RELEASE_CID burst on the same shim
+			if (pt.ctl)
+				modem_common.before_release(extra, log);
+
 			for (let c in [ pt.nas, pt.dsd, uim, wms, ...extra, ...owed ]) {
 				if (!c || !pt.ctl)
 					continue;

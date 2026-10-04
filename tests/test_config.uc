@@ -40,6 +40,7 @@ eq(r.globals.failed_min_gap, 30, 'native: failed_min_gap defaults to 30s');
 eq(r.modems.m0.device, '/dev/cdc-wdm0', 'native: modem device');
 eq(r.modems.m0.at_init, [ 'ATI' ], 'native: at_init list');
 eq(r.modems.m0.location, true, 'native: location bool');
+eq(r.modems.m0.gnss, true, 'native: location is an alias of gnss — GNSS has one switch');
 eq(r.modems.m0.failreboot, 100, 'native: failreboot default');
 eq(r.modems.m0.serial, '99efe861', 'native: modem serial anchor');
 eq(r.modems.m0.imei, '350000000000000', 'native: modem imei anchor');
@@ -515,6 +516,7 @@ eq(m.zero_rx_timeout, 3600, 'compat: zero rx timeout');
 eq(m.failreboot, 50, 'compat: failreboot');
 eq(m.delay, 5, 'compat: delay');
 eq(m.location, true, 'compat: location>1 becomes true');
+eq(m.gnss, true, 'compat: ...and switches gnss on');
 // cell lock lives on the interface sections in old configs (LuCI writes it
 // there) — it must end up on the synthesized modem
 eq(m.lock_4g, [ '1300:246' ], 'compat: lock_4g moved to modem');

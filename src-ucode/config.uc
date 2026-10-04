@@ -457,7 +457,10 @@ function modem_from_section(s, warnings)
 		// release the secondary AT port ('at2') for external tools: wwand then
 		// never opens it and runs telemetry over the control channel instead
 		at2_external: bool_opt(s.at2_external, false),
-		gnss: bool_opt(s.gnss, false),
+		// `option location` (the former QMI LOC switch) is an alias: GNSS has
+		// one switch, and wwand-gps picks the source — the modem's NMEA port,
+		// else QMI LOC (natively or over the MBIM passthrough)
+		gnss: bool_opt(s.gnss, false) || bool_opt(s.location, false),
 		// step the system clock from the receiver's own time — through
 		// deps.set_clock, which only ever touches a clock that is plainly
 		// unset (pre-2021) and so cannot fight sysntpd. OFF by default: this
@@ -857,7 +860,13 @@ function merge_iface_modem_opts(modem, s, name, mkey, warnings)
 		// zero_rx_timeout silently turned the watchdog off. Warning-free, on
 		// this path only. The defaults match
 		// the native reader at :456-466 so the two cannot drift apart.
+	{
 		modem.location = num_opt(s.location, 0, 'location', warnings) > 1;   // old gate: location > 1
+
+		// the same alias as the native reader: location means gnss
+		if (modem.location)
+			modem.gnss = true;
+	}
 
 	if (s.delay != null)
 		modem.delay = num_opt(s.delay, 0, 'delay', warnings);

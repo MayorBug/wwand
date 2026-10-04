@@ -529,7 +529,7 @@ config wwand_modem 'm0'
 	list band_lte '20'
 	list band_nr '78'                # NR bands, one list for SA and NSA alike
 	# list band_umts '1'             # UMTS bands (rarely wanted, see below)
-	option location '0'              # start the QMI LOC positioning session
+	option location '0'              # old name of `gnss` (alias): GNSS has one switch
 	option stats_interval '60'       # telemetry period in seconds (0 = off)
 	option delay '0'                 # seconds to wait before the first init
 	option failreboot '100'          # attempts before the final reboot rung (0 = never reboot)
@@ -787,12 +787,30 @@ so ugps and an operator's own receiver — a hat GPS on a serial port — are
 unaffected by installing it. Nothing is opened for a modem without `option
 gnss`.
 
-Note `option location` is a DIFFERENT path: the QMI LOC service, QMI-only and
-documented as broken on Quectel. On those modems `option gnss` is the one that
-works. The LOC session is ended (LOC Stop) before its client is released on
-every teardown: releasing the client alone left the modem's location engine
-reporting every second, and an EG25-G with `option location` set hung its
-QMI side after such teardowns (2026-10-01).
+**A modem without an NMEA port** gets the same NMEA over QMI LOC instead:
+wwand-gps opens a LOC client through the modem's `extra_client` (natively on a
+QMI modem, over the QMI-over-MBIM passthrough on an MBIM one), registers for
+LOC's NMEA indications (`EVENT_NMEA`, 1 << 2; `NMEA` indication 0x0026; libqmi
+1.38) and starts a position session. The sentences go into the same reader, so
+`modem_gps` and the LuCI panel look the same — `source` says `qmi_loc` instead
+of `nmea_port`, and `loc` carries the session's state. The port wins where
+there is one: it needs no QMI session, and LOC is documented as broken on
+Quectel. The LOC session is ended (LOC Stop) before its client is released —
+the client's `before_release`, which the modem runs ahead of the RELEASE_CID:
+releasing the client alone left the modem's location engine reporting every
+second, and an EG25-G hung its QMI side after such teardowns (2026-10-01). Over
+the MBIM passthrough, whether LOC indications are forwarded is the firmware's
+choice; a session that runs and delivers nothing shows `sentences: 0`.
+The session asks for periodic fixes (START `Fix Recurrence Type` 1 — left
+out, an RG502Q gave one fix and fell silent) and for ALL NMEA sentence types
+(`QMI_LOC_NMEA_TYPE_ALL`; the five named types are GPS-only, ALL brought
+GLONASS and Galileo on the same modem). That setting is the ENGINE's, not the
+session's: on the RG502Q the NMEA port emitted the other constellations too
+afterwards. Valid NMEA the reader does not interpret (proprietary `$P…`, GNS)
+is counted as `ignored`; `unparsed` stays what says the stream is not NMEA.
+`option location`, the former QMI LOC switch, is now an alias of `option gnss`.
+All of this is in the `wwand-gps` package (`gps.uc`, `nmea.uc`, the LOC schema);
+the core has no GNSS. Cell location (LAC/TAC/cell id) is telemetry, not this.
 
 **Datapath plugins.** `option mux` also accepts the name of an add-on datapath
 package: `option mux 'vendorx'` makes the daemon load `wwand.datapath_vendorx`
@@ -1549,7 +1567,7 @@ every method to it.
 | `modem_signal` | `modem` | last raw signal info (LTE/NR5G/WCDMA/GSM metrics) |
 | `modem_telemetry` | `modem` (optional) | per-modem state, temperature, attempts and protocol errors, plus each context's state — **no subscriber identifiers**, so it can be granted to an unprivileged reader (see [Feeding collectd](#feeding-collectd-wwandctl-collectd)) |
 | `modem_cells` | `modem` | registration + `registration_detail` + signal + decoded cells + `dsd` + `ca` + `temperature` (also on `status`, which is the canonical place — same field, kept here for compatibility) |
-| `modem_location` | `modem` | last QMI LOC fix (when `location` is enabled) |
+| `modem_location` | `modem` | last GNSS fix, short form — a view over the `modem_gps` reader, whichever source feeds it (needs `option gnss` and `wwand-gps`) |
 | `modem_at` | `modem`, `command`, `timeout?` | run an AT command on the modem's AT port |
 | `modem_get_settings` / `modem_set_settings` | `modem`, `settings?` | NAS system-selection prefs (modes/bands) — the settings editor. Sets are **idempotent**: values the modem already carries are dropped; nothing left → `unchanged: true`, no NV write, no radio disturbance. On a Fibocom FM350/FM150 (NCM) the same calls speak `+GTACT` instead: the get adds `settable` (the keys a set may carry — band lists only, none on a tuple bands cannot be written for), `supported` (the module's own band catalogue), `nr_bands_shared: true` and `persistent: false`; a set refuses any other key, and an accepted band edit is also written to the modem's `band_*` options (see *Band allow-lists*) |
 | `modem_scan` / `modem_scan_start` / `modem_scan_status` | `modem` | visible-operator scan (sync, or async start+poll — a scan takes up to ~90 s) |
@@ -2417,7 +2435,11 @@ core knowing them by name (`plugins.uc`). A plugin is a plain script at
   without the passthrough). Which indications reach it over the passthrough
   depends on the service: NAS pushes none on the EG06 and the RM520N, UIM
   Remote pushes all of its own on the RM520N (a remote SIM works over MBIM
-  there; qmi_over_mbim.uc). The modem owns the client and
+  there; qmi_over_mbim.uc). A plugin may set `client.before_release` to a
+  function: the modem calls it (once, with the client) right before the
+  client's RELEASE_CID — on teardown and on `qmi_release` alike — which is the
+  place to end a session the client opened (wwand-gps sends LOC STOP there).
+  The modem owns the client and
   releases it on teardown; `client.destroyed` then tells the plugin to ask
   again. `qmi_release(ref, client)` gives it back earlier.
   `modem_at(ref, command, cb, timeout)` sends one AT command over the

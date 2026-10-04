@@ -1083,15 +1083,24 @@ assert_sim_poll_teardown();
 	m8.extra_client({ service: 0x99, messages: {} }, (e, c) => { err = e; });
 	eq(err?.error, 'service_unavailable', 'extra client (MBIM): a service the passthrough does not list is refused');
 
+	// the goodbye (before_release) runs ahead of the RELEASE_CID, once
+	let order = [];
+
+	xc.before_release = (c) => push(order, 'goodbye:' + c.cid);
+	let rel0 = length(released);
 	m8.extra_release(xc);
 	eq([ length(m8.extra_clients), released[0]?.cid ], [ 0, 7 ],
 	   'extra client (MBIM): given back, its CID released on the wire');
+	eq([ order, length(released) - rel0 ], [ [ 'goodbye:7' ], 1 ],
+	   'extra client (MBIM): before_release ran, then the release');
 
 	m8.extra_client({ service: 0x32, messages: {} }, (e, c) => { xc = c; });
+	xc.before_release = (c) => push(order, 'teardown-goodbye:' + length(filter(released, (r) => r.service == 0x32)));
 	released = [];
 	m8.teardown();
 	eq([ xc?.destroyed, length(filter(released, (r) => r.service == 0x32)) ], [ true, 1 ],
 	   'extra client (MBIM): teardown destroys it and releases its CID with the passthrough');
+	eq(order[1], 'teardown-goodbye:0', 'extra client (MBIM): ...saying goodbye before the burst');
 })();
 
 // --- the slow tick must read the serving cell BEFORE choosing a data mode ----

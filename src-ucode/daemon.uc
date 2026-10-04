@@ -478,7 +478,7 @@ export function create(opts)
 	// KEYED BY INTERFACE, NOT CARRIED ON THE ENTRY. The marker is evidence
 	// about an interface, and the context entry lives SHORTER than the
 	// interface. A config reload that cannot resolve an interface's modem
-	// produces no entry for it at all (config.uc:897-900 warns "references
+	// produces no entry for it at all (config.uc:906-909 warns "references
 	// unknown modem" and skips it), so a marker on the entry would have nothing
 	// to be carried over from. Re-adding the modem would then build a fresh
 	// entry with no marker, the status poll would see netifd's cleared
@@ -930,10 +930,19 @@ export function create(opts)
 		// OPEN THE NMEA PORT. wwand found it during enumeration (`gps_tty`)
 		// and `option gnss` started the receiver; reading it is the last of
 		// the three and the only one that used to be somebody else's job.
-		if (deps.gps_start && (modem.config?.gnss ?? false) && modem.gps_tty)
-			deps.gps_start(modem.id, modem.gps_tty, {
-				adjust_time: modem.config?.gnss_set_time ?? false,
-			});
+		// No port: the same NMEA over QMI LOC (wwand-gps, natively or over the
+		// MBIM passthrough). The port wins where there is one — it needs no
+		// QMI session, and LOC is the path that is broken on Quectel.
+		if (modem.config?.gnss ?? false) {
+			let gopts = { adjust_time: modem.config?.gnss_set_time ?? false };
+
+			if (modem.gps_tty) {
+				if (deps.gps_start)
+					deps.gps_start(modem.id, modem.gps_tty, gopts);
+			}
+			else if (deps.gps_start_loc)
+				deps.gps_start_loc(modem.id, modem, gopts);
+		}
 
 		// write the resolved l3 device name onto each interface as `option device`
 		// (one explicit handle for VRF/firewall/LuCI). Idempotent; never clobbers a
@@ -1383,7 +1392,7 @@ export function create(opts)
 	//
 	// COMPARED HERE rather than trusted from the event. modem_mbim filters its
 	// own emit on a change (modem_mbim.uc:968-977) while the shared reapply
-	// tail emits on every re-read (modem_common.uc:577-583); one comparison, in
+	// tail emits on every re-read (modem_common.uc:603-609); one comparison, in
 	// the place that acts on it, cannot disagree with itself.
 	let modem_sim_refresh = (modem, data) => {
 		let entry = self.modems[modem.id];
@@ -2453,7 +2462,7 @@ export function create(opts)
 			};
 
 		// TELL THE CONTEXTS FIRST, then stop the modem — the order _device_gone
-		// uses (modem_common.uc:604). Dropping `centry.ctx` below only releases
+		// uses (modem_common.uc:630). Dropping `centry.ctx` below only releases
 		// the daemon's HANDLE: the context object itself lives on with its
 		// monitor timers armed and its WDS clients alive, polling a hub that
 		// entry.modem.stop() has just closed. One orphan per removal, and its
@@ -4949,23 +4958,37 @@ export function create(opts)
 		return out;
 	};
 
+	// The last GNSS fix, short form (`wwandctl location`). A view over the
+	// wwand-gps reader — the same one modem_gps reports in full — whichever
+	// source feeds it, NMEA port or QMI LOC. Cell location is not this: that
+	// is telemetry (`cells`).
 	self.modem_location = function(ref) {
 		let entry = self.modems[ref];
 
 		if (!entry?.modem)
 			return { error: 'no_such_modem', ref: ref };
 
-		if (!entry.modem.loc) {
-			// distinguish "not configured" from "configured but the backend
-			// cannot do it" — 'location_disabled' on an MBIM/NCM modem WITH
-			// `option location` set was misleading
-			if (entry.cfg?.location && entry.modem.protocol != 'qmi')
-				return { error: 'unsupported_on_backend' };
-
+		if (!(entry.modem.config?.gnss ?? false))
 			return { error: 'location_disabled' };
-		}
 
-		return entry.modem.location ?? { error: 'no_fix' };
+		if (!deps.gps_status || deps.gps_status(entry.modem, null) == null)
+			return { error: 'package_not_installed', detail: 'wwand-gps is not installed' };
+
+		let snap = deps.gps_snapshot ? deps.gps_snapshot(ref) : null;
+
+		if (!snap?.valid || snap.latitude == null)
+			return { error: 'no_fix' };
+
+		return {
+			latitude: snap.latitude,
+			longitude: snap.longitude,
+			altitude: snap.elevation,
+			speed_kmh: snap.speed_kmh,
+			course: snap.course,
+			hdop: snap.hdop,
+			satellites_used: snap.satellites_used,
+			source: snap.source,
+		};
 	};
 
 	// GNSS as this daemon sees it: the port and receiver state wwand knows,

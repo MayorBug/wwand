@@ -438,6 +438,15 @@ config wwand_modem 'm0'
 	                                 #   the modem accepts the new format but
 	                                 #   latches the old one while a session is
 	                                 #   up, and the downlink goes silent.
+	                                 #   A version the modem refuses — by echoing
+	                                 #   another one or with a QMI error — makes
+	                                 #   the ladder try the next lower one.
+	option ep_type ''                # WDA/WDS data endpoint override: type
+	option ep_id ''                  #   (2 HSUSB, 3 PCIE, 4 EMBEDDED) and
+	                                 #   interface. Normally derived from the data
+	                                 #   netdev (USB: the QMI interface; PCIe: 4).
+	                                 #   Set them only for a modem that refuses the
+	                                 #   derived endpoint.
 	list at_init 'ATE0'              # extra AT commands, sent once before registration
 	option at2_external '0'          # 1: reserve the secondary AT port for external tools
 	option gnss '0'                  # 1: start the modem's GNSS receiver, so its NMEA port
@@ -1323,8 +1332,11 @@ full throughput — this is why the examples above set `option mux_id '1'`.
 - Aggregation is **bidirectional**: downlink (the modem batches packets into the
   host's rx URB) *and* uplink (the host batches IP packets into QMAP frames —
   WDA-negotiated `ul_max_datagrams`/`ul_max_size` plus the rmnet egress coalesce).
-  The **endpoint type** (USB vs PCIe) is auto-detected from the netdev's bus, so
-  PCIe/MHI modems negotiate the data format correctly. It is capability-gated —
+  The **endpoint** (type and interface) is derived from the netdev's bus, so
+  PCIe/MHI modems negotiate the data format correctly: USB gives HSUSB and the
+  QMI function's interface, PCIe gives PCIE and interface 4, the fixed number
+  Qualcomm firmware expects there (ModemManager uses the same). Without an
+  endpoint an MHI modem refuses the data format with QMI error 70. It is capability-gated —
   a modem that does not confirm QMAP simply runs plain framing.
 - Tune the aggregation buffer per modem with `option dl_datagram_max_size` on the
   `wwand_modem` section (default from a per-model table, ~31 KB): larger buffers

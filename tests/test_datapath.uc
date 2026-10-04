@@ -688,8 +688,27 @@ eq(netlink.ep_type_number('wwan0m1', epfx), 2, 'ep: lower_0 bus type');
 // PCIe/MHI modem: PCI BDF, no usb component -> PCIE (3), no iface number
 eplinks = { '/sys/class/net/mhi0/device':
 	'../../../devices/pci0001:00/0001:00:00.0/0001:01:00.0' };
-eq(netlink.ep_iface_number('mhi0', epfx), null, 'ep: PCIe device has no usb iface number');
+eq(netlink.ep_iface_number('mhi0', epfx), 4, 'ep: PCIe -> interface 4, the fixed Qualcomm number (as ModemManager)');
 eq(netlink.ep_type_number('mhi0', epfx), 3, 'ep: PCI BDF -> PCIE (3)');
+
+// the form an mhi_net netdev really has: a short link to the MHI client
+// device, the PCI address only in the resolved path (mhi_net.c:363,
+// bus/mhi/host/init.c:1254-1260, linux 6.18.41)
+let epreal = {};
+let epfx2 = { readlink: (p) => eplinks[p] ?? null, realpath: (p) => epreal[p] ?? null };
+eplinks = { '/sys/class/net/mhi_hwip0/device': '../../../mhi0_IP_HW0' };
+eq(netlink.ep_type_number('mhi_hwip0', epfx), null, 'ep: the link text alone cannot tell an MHI netdev\'s bus');
+epreal = { '/sys/class/net/mhi_hwip0/device':
+	'/sys/devices/platform/soc/80000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0/mhi0/mhi0_IP_HW0' };
+eq([ netlink.ep_type_number('mhi_hwip0', epfx2), netlink.ep_iface_number('mhi_hwip0', epfx2) ], [ 3, 4 ],
+	'ep: ...the resolved path does: PCIE, interface 4');
+
+// USB through realpath: the resolved path carries /usbN and the interface
+eplinks = { '/sys/class/net/wwan0/device': '../../../3-1:1.4' };
+epreal = { '/sys/class/net/wwan0/device': '/sys/devices/platform/soc/8af8800.usb/usb3/3-1/3-1:1.4' };
+eq([ netlink.ep_type_number('wwan0', epfx2), netlink.ep_iface_number('wwan0', epfx2) ], [ 2, 4 ],
+	'ep: a usbnet netdev resolves to HSUSB and its own interface');
+epreal = {};
 
 // xHCI-on-PCI: the sysfs path contains BOTH a PCI BDF (the xHCI parent) and a
 // /usbN component — usb must win (the regression the code comment warns about)

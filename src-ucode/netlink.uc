@@ -1683,18 +1683,72 @@ export function setup(fx, opts)
 	         parent: netdev };
 };
 
-// endpoint interface number for WDA/bind-mux (e.g. .../1-1.2:1.4 -> 4)
-export function ep_iface_number(netdev, fx)
+// The device a netdev hangs off, as paths to match against: the RESOLVED path
+// first, then the bare link text. The link the kernel writes is short and
+// relative — "../../../3-1:1.4" for a usbnet device, "../../../mhi0_IP_HW0"
+// for an mhi_net one — and only the resolved path shows the bus above it. For
+// MHI that matters: the netdev's device is the MHI client, whose parent is the
+// controller, whose parent is the PCI function (mhi_net.c:363,
+// bus/mhi/host/init.c:1254-1260, linux 6.18.41), so the PCI address appears in
+// the resolved path and never in the link. The link text stays as the second
+// candidate because the USB interface token is in it either way.
+function ep_dev_paths(netdev, fx)
 {
 	let rl = fx?.readlink ?? fs.readlink;
+	// an injected fx without realpath means "no resolution" — a test seam
+	// must not fall through to the host's real /sys
+	let rp = fx ? fx.realpath : fs.realpath;
+	let out = [];
 
 	for (let link in [ sprintf('/sys/class/net/%s/device', netdev),
 	                   sprintf('/sys/class/net/%s/lower_0/device', netdev) ]) {
+		let full = rp ? rp(link) : null;
 		let target = rl(link);
 
-		if (target == null)
-			continue;
+		if (full != null)
+			push(out, full);
 
+		if (target != null)
+			push(out, target);
+
+		// the first link that exists is the device; lower_0 is only the
+		// fallback for a mux child that has no device of its own
+		if (length(out))
+			break;
+	}
+
+	return out;
+}
+
+const EP_HSUSB = 2, EP_PCIE = 3;
+
+// the bus type of one device path, or null
+function ep_type_of(path)
+{
+	// a USB device's path always carries a `/usbN` component — checked first,
+	// because xHCI on PCI puts a PCI address in the same path
+	if (match(path, /\/usb[0-9]/))
+		return EP_HSUSB;
+
+	if (match(path, /[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]/))
+		return EP_PCIE;
+
+	return null;
+}
+
+// endpoint interface number for WDA/bind-mux (e.g. .../1-1.2:1.4 -> 4)
+//
+// USB: the interface of the QMI function. PCIe: always 4, the fixed number
+// Qualcomm firmware expects there — ModemManager uses the same constant
+// ("Qualcomm magic number", src/mm-port-qmi.c:156-158, ModemManager main,
+// 2026-10-04), and without an endpoint an MHI modem refuses WDA
+// SET_DATA_FORMAT with InvalidOperation (QMI error 70, RG520N on an IPQ5018,
+// ddimension/wwand#46).
+export function ep_iface_number(netdev, fx)
+{
+	let paths = ep_dev_paths(netdev, fx);
+
+	for (let target in paths) {
 		// USB interface component is the `<bus>-<port>[.<port>]:<cfg>.<iface>`
 		// form (e.g. "3-1:1.4", possibly as the bare relative symlink target
 		// "../../../3-1:1.4"). Require the `-`-bearing bus-port token so a bare
@@ -1705,6 +1759,10 @@ export function ep_iface_number(netdev, fx)
 		if (m)
 			return +m[1];
 	}
+
+	for (let target in paths)
+		if (ep_type_of(target) == EP_PCIE)
+			return 4;
 
 	return null;
 };
@@ -1717,21 +1775,11 @@ export function ep_iface_number(netdev, fx)
 // modem has only the PCI BDF. Returns 2 (HSUSB), 3 (PCIE), or null.
 export function ep_type_number(netdev, fx)
 {
-	const EP_HSUSB = 2, EP_PCIE = 3;
-	let rl = fx?.readlink ?? fs.readlink;
+	for (let target in ep_dev_paths(netdev, fx)) {
+		let t = ep_type_of(target);
 
-	for (let link in [ sprintf('/sys/class/net/%s/device', netdev),
-	                   sprintf('/sys/class/net/%s/lower_0/device', netdev) ]) {
-		let target = rl(link);
-
-		if (target == null)
-			continue;
-
-		if (match(target, /\/usb[0-9]/))
-			return EP_HSUSB;
-
-		if (match(target, /[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]/))
-			return EP_PCIE;
+		if (t != null)
+			return t;
 	}
 
 	return null;

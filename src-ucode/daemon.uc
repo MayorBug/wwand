@@ -2869,11 +2869,12 @@ export function create(opts)
 		if (ep_type == null && deps.resolve_ep_type)
 			ep_type = deps.resolve_ep_type(cfg, device, entry.netdev);
 
-		// A QRTR/MHI modem exposes no sysfs path for the WDA data endpoint, so
-		// resolve_ep_* can't derive it. Default the Quectel-on-MHI endpoint
-		// (PCIE type 3, iface 4 — HW-accepted on the RG520N); a config ep_type/
-		// ep_id still wins when set. Without an endpoint the modem answers WDA
-		// SET_DATA_FORMAT with InvalidOperation (QMI err 70).
+		// A QRTR modem has no control node, so its endpoint can only come from
+		// the data netdev (netlink.ep_iface_number: PCIe -> 4). When that does
+		// not resolve either — no netdev configured yet — fall back to the
+		// same PCIE/4 instead of sending no endpoint, which the modem refuses
+		// with InvalidOperation (QMI error 70, RG520N, ddimension/wwand#46). A
+		// config ep_type/ep_id still wins.
 		if (cfg.device == 'qrtr') {
 			if (ep_type == null) ep_type = 3;
 			if (ep_id == null) ep_id = 4;

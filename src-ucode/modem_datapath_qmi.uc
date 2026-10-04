@@ -337,6 +337,22 @@ export function setup(self, dp, o, next)
 					args.endpoint = { type: dp.ep_type ?? wdamod.ENDPOINT_TYPE_HSUSB, iface: dp.ep_id };
 
 				wda.request('SET_DATA_FORMAT', args, (werr, wdata) => {
+					// A QMI ERROR for one QMAP version is a refusal of that
+					// version, the same as echoing another one: the RG520N on
+					// MHI answers v5 with InvalidOperation (error 70) and takes
+					// v1 (ddimension/wwand#46). So step down while there is a
+					// rung below; only the last rung's error fails. A transport
+					// error (timeout, no answer) is not about the version and
+					// fails at once — retrying it per rung would only multiply
+					// the wait.
+					if (werr && werr.error == 'qmi' && caps.qmap && length(rungs)) {
+						let next_v = shift(rungs);
+
+						log('notice', sprintf('modem refused qmap v%d with qmi error %d, trying qmap v%d',
+							ver, werr.code ?? -1, next_v));
+						return negotiate(DAP_FOR[sprintf('%d', next_v)], next_v);
+					}
+
 					if (werr)
 						return fail('wda_format', werr);
 

@@ -1095,7 +1095,28 @@ service the firmware lacks must not put the mandatory ones at risk. The
 zone is a guint32 on the wire, read as signed; `0xFFFFFFFF` means no zone.
 Host-tested against hand-built buffers; not yet seen on hardware.
 
-## Known open
+## QMI over QRTR, and what it showed about PCIe (2026-10-04)
+
+ddimension/wwand#46 (xhudan) is merged: `option device 'qrtr'` runs the QMI
+stack over AF_QIPCRTR for an SDX modem whose QMI lives only on the QRTR bus
+(`qmi_over_qrtr.uc`, `wwand_io` qrtr_open/qsend/qread/qdiscover; HW-tested by
+the author on an RG520N-EB on an IPQ5018). Fixed alongside, both generic:
+- **The PCIe endpoint.** `netlink.ep_iface_number` returned nothing for a PCI
+  path, so an MHI modem got no endpoint at all and refused WDA with error 70.
+  PCIe now gives interface 4 (ModemManager's constant), and both endpoint
+  helpers read the RESOLVED sysfs path: the kernel's link from an mhi_net
+  netdev is `../../../mhi0_IP_HW0`, with the PCI address only above it. This
+  reaches the existing MHI path (`/dev/wwan0qmi0`) as well — not yet seen on
+  hardware.
+- **The QMAP ladder** steps down on a QMI error for a version, not only on an
+  echoed other version; only the last rung's error fails.
+Still open on the QRTR hub (ranked): one client id per service, while wwand
+runs several WDS clients at once — needs a socket per client; no
+NEW_SERVER/DEL_SERVER handling, so a modem restart is never seen; presence
+and the 2 s blocking discovery at start; `qrtr_node` for two QRTR modems;
+tests for the hub. The feed must install `qmi_over_qrtr.uc` in `wwand-qmi`
+(modem.uc imports it) before any bump that carries #46.
+
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now
   carries it beside `pincode`/`apn`/`auth`/credentials, case-folded and

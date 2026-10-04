@@ -1205,6 +1205,62 @@ scenario('datapath-all-declined', {
 			'alld: links with deaggregation only');
 	});
 
+// a QMI ERROR for a QMAP version is a refusal of that version too: the
+// RG520N on MHI answers v5 with InvalidOperation (70) and takes v1
+// (ddimension/wwand#46). The ladder steps down instead of failing.
+let dpfx_qe = fakefx.create({ present: {
+	'/sys/class/net/wwan0/qmi/pass_through': true,
+	'/sys/class/net/wwan0/qmi/raw_ip': true,
+	'/sys/module/rmnet': true,
+} });
+
+scenario('datapath-qmi-error-steps-down', {
+	handlers: base_handlers({
+		SET_DATA_FORMAT: (args, meta) => {
+			if (args.dl_protocol == 9 || args.dl_protocol == 8)
+				return { __error: 70 };
+
+			return { qos: 0, llp: 2,
+				ul_protocol: args.ul_protocol, dl_protocol: args.dl_protocol,
+				dl_max_datagrams: 32, dl_max_size: args.dl_max_size };
+		},
+	}),
+	datapath: {
+		netdev: 'wwan0', ep_id: 4, mux: 'auto',
+		mux_links: [ { id: 1 } ], dgram_size: 0, fx: dpfx_qe,
+	},
+}, 'registered',
+	(modem, mock, events) => {
+		eq(length(mock.calls_for('SET_DATA_FORMAT')), 3, 'qmierr: v5 and v4 refused with an error, v1 asked');
+		eq(modem.datapath.qmap_version, 1, 'qmierr: settled on plain QMAP');
+		eq(length(filter(events, (e) => e.event == 'error')), 0, 'qmierr: no bring-up failure');
+	});
+
+// ...but an error on the LAST rung still fails the format stage, with the error
+let dpfx_qe2 = fakefx.create({ present: {
+	'/sys/class/net/wwan0/qmi/pass_through': true,
+	'/sys/class/net/wwan0/qmi/raw_ip': true,
+	'/sys/module/rmnet': true,
+} });
+
+scenario('datapath-qmi-error-every-rung', {
+	handlers: base_handlers({
+		SET_DATA_FORMAT: (args, meta) => ({ __error: 70 }),
+	}),
+	datapath: {
+		netdev: 'wwan0', ep_id: 4, mux: 'auto',
+		mux_links: [ { id: 1 } ], dgram_size: 0, fx: dpfx_qe2,
+	},
+}, 'error',
+	(modem, mock, events) => {
+		eq(length(mock.calls_for('SET_DATA_FORMAT')), 3, 'qmierr-all: every rung tried once');
+
+		let errs = filter(events, (e) => e.event == 'error');
+
+		eq(errs[0]?.data?.stage, 'wda_format', 'qmierr-all: fails in the format stage');
+		eq(errs[0]?.data?.err?.code, 70, '...carrying the modem\'s error');
+	});
+
 // --- an UNMUXED modem must never be asked for QMAP -------------------------
 //
 // The datapath probe claims the box for `rmnet` whether or not channels are

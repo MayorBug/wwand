@@ -769,6 +769,46 @@ scenario('suspend-abort', {
 	uloop.timer(50, () => ctx.modem_event('suspend', {}));
 });
 
+// --- C3: a CID whose allocation lands after the abort is released, not lost --
+// The suspend abort empties self.families; the WDS client the in-flight
+// ALLOCATE_CID hands back afterwards belongs to no attempt. Kept, the next
+// attempt overwrote families['4'] and the CID leaked — one per abort.
+
+scenario('suspend-abort-alloc', {
+	config: { apn: 'web', pdp_type: 'ipv4' },
+}, (ctx, mock, events, next) => {
+	let wds_before = length(ctx.modem.qmi_clients['1'] ?? []);
+	let real_alloc = ctx.modem.alloc;
+	let parked = null;
+
+	// hold the WDS allocation answer back until the attempt was aborted
+	ctx.modem.alloc = (schema, cb) => real_alloc(schema, (err, c) => {
+		if (schema.service == 1 && !parked)
+			parked = () => cb(err, c);
+		else
+			cb(err, c);
+	});
+
+	ctx.up((err, settings) => {
+		eq(err?.error, 'suspended', 'salloc: aborted with suspended');
+
+		parked();   // the late answer for the aborted attempt
+
+		uloop.timer(30, () => {
+			ctx.modem.alloc = real_alloc;
+			eq(length(mock.calls_for('START_NETWORK')), 0, 'salloc: the orphaned client never dials');
+			eq(keys(ctx.families), [], 'salloc: no family adopted the late client');
+			eq(length(ctx.modem.qmi_clients['1'] ?? []), wds_before, 'salloc: the late WDS cid was released');
+			next();
+		});
+	});
+
+	uloop.timer(50, () => {
+		eq(parked != null, true, 'salloc: allocation answer parked');
+		ctx.modem_event('suspend', {});
+	});
+});
+
 // --- G1b: internal 241 (profile in use) is reclaimed over AT and retried -----
 
 scenario('reclaim-241', {

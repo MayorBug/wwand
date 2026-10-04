@@ -537,11 +537,24 @@ export function create(opts)
 
 	// --- ACTIVATING --------------------------------------------------------
 
-	activate_family = (family, profile, done) => {
+	// `live()` says whether the attempt that asked is still the current one.
+	// The CID allocation is the one step whose answer can land AFTER a
+	// suspend abort has already emptied self.families: the client it hands
+	// back then belongs to nobody, and the next attempt overwrites
+	// families['4'] with its own — one WDS CID lost per abort, until the
+	// modem runs out (HW-observed on an MC7710, SWI9200X_03.05.29,
+	// 2026-10-04: held 1:[8,17,21,25,27] after five aborted dials).
+	activate_family = (family, profile, done, live) => {
 		// fresh WDS CID per attempt (preserved)
 		self.modem.alloc(wds_schema, (err, client) => {
 			if (err)
 				return done({ stage: 'alloc', err: err });
+
+			if (live && !live()) {
+				log('info', sprintf('ipv%d attempt aborted while allocating, releasing wds client %d',
+					family, client.cid));
+				return self.modem.release(client);
+			}
 
 			let fam = { client: client, pdh: null, settings: null };
 			self.families[sprintf('%d', family)] = fam;
@@ -963,7 +976,7 @@ export function create(opts)
 
 						next();
 					});
-				});
+				}, () => gen == up_gen && self.state == 'ACTIVATING');
 			};
 
 			finish = () => {

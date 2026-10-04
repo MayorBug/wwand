@@ -1208,6 +1208,16 @@ unanswered dial stays as the safety net.
   any uqmi check alongside a running wwand: both read the same cdc-wdm, and
   wwand swallows the other's CTL answers — "Failed to connect to service"
   there is the test, not the modem.
+- **A CID leak did exist, on a different path:** the same bookkeeping, under
+  a flapping registration (the box's `wwand_sim` set `pdp_type ipv4v6`, which
+  this card only gets limited service for), showed `1:[8,17,21,25,27]` — one
+  WDS CID more with every dial that registration loss aborted. The suspend
+  abort empties `self.families`, but an ALLOCATE_CID still in flight answers
+  afterwards; that client belonged to no attempt and the next one overwrote
+  `families['4']`. `activate_family` now asks whether its attempt is still
+  live and releases a late client instead (`test_context` suspend-abort-alloc,
+  failing without the fix). So exhaustion WAS reachable on a long flap — just
+  not the cause of the ifdown/ifup hang above.
 
 ## Known open
 

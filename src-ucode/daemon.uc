@@ -2147,6 +2147,28 @@ export function create(opts)
 			// lost registration mid-attempt: no service isn't a fault the ladder fixes
 			if (ctx.modem.state == 'READY')
 				ctx.modem.note_connect_failure();
+
+			// A START_NETWORK the modem never ANSWERS (a timeout, not a refusal)
+			// on a registered modem means its WDS side hangs. An MC7710
+			// (SWI9200X_03.05.29) does exactly that after a STOP_NETWORK: every
+			// later dial times out, not even a new WDS client is handed out, and
+			// the ladder's radio cycle comes only at attempt 8 — ~16 min of
+			// 120 s timeouts. One radio cycle (DMS low_power -> online) frees it
+			// and the next dial connects in seconds (deborah-3, 2026-10-04). So
+			// cycle at once, at most every 10 min per modem; a QMI error or a
+			// network rejection keeps going the ladder's way.
+			if (data?.stage == 'start_network' && data?.err?.error == 'timeout' &&
+			    ctx.modem.state == 'READY' && type(ctx.modem.reattach) == 'function') {
+				let mentry = self.modems[entry?.cfg?.modem];
+				let now = context_common.mono();
+
+				if (mentry && (mentry._wds_bounce_at == null || now - mentry._wds_bounce_at >= 600)) {
+					mentry._wds_bounce_at = now;
+					log('notice', sprintf('interface %s: the modem did not answer the dial at all — cycling its radio once to free its data service',
+						entry?.cfg?.interface ?? name));
+					ctx.modem.reattach();
+				}
+			}
 			emit('wwand.context', { context: name, interface: entry?.cfg?.interface, event: event });
 			if (entry?.wanted)
 				enter_reconnecting(name);
@@ -3881,6 +3903,21 @@ export function create(opts)
 		// the teardown settles (its up() callback never fires, so nothing else does).
 		if (entry._reset_pending) {
 			entry._reset_pending = false;
+
+			// Our own reset of a setup netifd holds 'pending'. Meant for an
+			// IDLE context (an orphaned setup); but the status answer that
+			// decides it arrives asynchronously, and by then the queued
+			// activation may already be dialling or connected. Stopping THAT
+			// session throws away a working connection — and on some firmware
+			// is not survivable: an MC7710 (SWI9200X_03.05.29) answered no
+			// START_NETWORK after a stop followed at once by a new dial, until
+			// the modem was reset (deborah-3, 2026-10-04). So a live session
+			// stays; the `up` that follows takes it over through setup.
+			if (entry.ctx.state != 'IDLE') {
+				log('info', sprintf('interface %s: reset of a pending setup — keeping the %s session for the setup that follows',
+					entry.cfg.interface, lc(entry.ctx.state)));
+				return cb(null, {});
+			}
 
 			return entry.ctx.down(() => {
 				cb(null, {});

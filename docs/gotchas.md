@@ -77,6 +77,21 @@ HW-proven on the EG06. Structurally blocked in `qmi_over_mbim.send`.
 
 ---
 
+### A STOP_NETWORK that answered success has ended the session
+**Not on every firmware.** A Sierra MC7710 (SWI9200X_03.05.29) acknowledges
+the stop, and afterwards its WDS side hangs: every later START_NETWORK goes
+unanswered, no new WDS client is handed out, and the modem still reports the
+session `connected`. A radio cycle (DMS low_power -> online) frees it; nothing
+on the WDS side does. So an unanswered dial on a registered modem cycles the
+radio at once (daemon `error` handling), and wwand never stops a live session
+for its own bookkeeping (context_down on a reset).
+
+*Evidence:* deborah-3, 2026-10-04 — uqmi on the same modem hung the same way,
+`wwandctl reattach` freed it (dial connected in 3 s). Guarded in
+`tests/test_daemon` ("unanswered dial", "reset of a pending setup").
+
+---
+
 ### A netdev's `device` link shows which bus the modem is on
 **Only after resolving it.** The link the kernel writes is short and relative:
 `../../../3-1:1.4` for a usbnet netdev, `../../../mhi0_IP_HW0` for an mhi_net

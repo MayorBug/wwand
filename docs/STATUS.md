@@ -1172,6 +1172,27 @@ changed nothing until a restart. Now, decided with the user:
 Tests: test_context, test_modem_mbim, test_autosetup, test_deps, test_daemon
 (each new check fails without its change). Not yet on hardware.
 
+## A dial the modem never answers frees itself; our reset keeps a live session (2026-10-04)
+
+deborah-3 again (Sierra MC7710, SWI9200X_03.05.29): after a STOP_NETWORK
+the modem's WDS side hangs — every later START_NETWORK times out (120 s), not
+even a new WDS client is handed out (uqmi: "Failed to connect to service"),
+the modem keeps reporting the session `connected`, and only a modem reset or
+a radio cycle frees it. Two ways into that, both fixed and HW-verified there:
+- **wwand's own reset hit a live session.** A setup netifd held 'pending'
+  (an early `busy` before the modem was ready) is reset with down+up; the
+  status answer that triggers it arrives after the queued activation has
+  dialled, and the down stopped that fresh session. `context_down` now keeps
+  a session that is not IDLE on our own reset; the `up` takes it over.
+  After a modem reset the interface comes up on the first dial.
+- **ifdown -> ifup.** The stop is the operator's, so it stays; the dial that
+  follows times out. A START_NETWORK that is not answered at all on a
+  registered modem now cycles the radio once at once (`modem.reattach`, at
+  most every 10 min per modem) instead of waiting for the ladder's cycle at
+  attempt 8 (~16 min). ifdown, 10 s, ifup: connected after 126 s, by itself.
+Possible follow-up: probe WDS right after a stop and cycle before the 120 s
+timeout — only worth it if more firmware turns out to do this.
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

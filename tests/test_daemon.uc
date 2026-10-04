@@ -4188,4 +4188,50 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	d.shutdown();
 }
 
+// --- deborah-3 (MC7710): never stop a live session for our own reset, and an
+// unanswered dial frees the modem's data service with one radio cycle ------
+{
+	let ctx_ev = null, downs = 0, reattaches = 0;
+	let the_ctx = null;
+	let fake = {
+		modem: { create: (o) => ({ id: o.id, state: 'READY', config: o.config,
+			start: () => null, stop: () => null, note_connect_failure: () => null,
+			reattach: () => reattaches++ }) },
+		context: { create: (o) => (ctx_ev = o.deps.on_event,
+			the_ctx = { state: 'CONNECTED', name: o.name, modem: o.modem,
+			            down: (cb) => { downs++; cb ? cb() : null; },
+			            up: (cb) => cb ? cb(null) : null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: { log: () => null, load_qmi: () => fake } });
+	d.apply_config(config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', apn: 'a' },
+	} }));
+
+	// A: the reset's down reaches context_down while the context is connected
+	d.contexts.wan._reset_pending = true;
+	let res = null;
+	d.context_down('wan', (e, r) => { res = [ e, r ]; });
+	eq([ downs, res?.[0], d.contexts.wan._reset_pending ], [ 0, null, false ],
+		'reset of a pending setup: a connected session is kept, not stopped');
+
+	// ...an IDLE one is torn down as before (the orphaned-setup case)
+	the_ctx.state = 'IDLE';
+	d.contexts.wan._reset_pending = true;
+	d.context_down('wan', () => null);
+	eq(downs, 1, 'reset of a pending setup: an idle context still goes down');
+
+	// B: an unanswered START_NETWORK cycles the radio once per 10 min
+	let fail = (err) => ctx_ev(the_ctx, 'error', { stage: 'start_network', err: err });
+	fail({ error: 'timeout' });
+	eq(reattaches, 1, 'unanswered dial: one radio cycle at once');
+	fail({ error: 'timeout' });
+	eq(reattaches, 1, 'unanswered dial: ...not again within 10 min');
+
+	d.modems.m0._wds_bounce_at = null;
+	fail({ error: 'qmi', code: 14 });
+	eq(reattaches, 1, 'a dial the modem REFUSED does not cycle the radio');
+	d.shutdown();
+}
+
 done('test_daemon');

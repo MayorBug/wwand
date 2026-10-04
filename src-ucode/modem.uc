@@ -541,7 +541,7 @@ export function create(opts)
 				// done() IS answered on the cancelled path. It is not only
 				// make_fail's internal continuation: the daemon passes a real
 				// caller's callback through note_connect_failure
-				// (daemon.uc:3904), and dropping it strands a ubus request.
+				// (daemon.uc:3947), and dropping it strands a ubus request.
 				// Restarting a torn-down modem is prevented where it belongs
 				// instead — make_fail now refuses a `cancelled` outright
 				// (modem_common.uc).
@@ -1706,6 +1706,12 @@ export function create(opts)
 		self.ctl?.destroy();
 
 		self.ctl = self.dms = self.nas = self.uim = self.wda = self.loc = self.wds_cfg = null;
+
+		// The releases above are still in flight and destroying CTL cancels
+		// their answers, so their cid_held(…, false) never runs. The CIDs die
+		// with this QMI session anyway; kept, a rebuilt modem would report
+		// them beside its new ones.
+		self.qmi_clients = {};
 
 		self.dsd = self.tmd = self.cat = self.wms = self.pdc = null;
 		self.extra_clients = [];

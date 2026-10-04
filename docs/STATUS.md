@@ -1218,6 +1218,18 @@ unanswered dial stays as the safety net.
   live and releases a late client instead (`test_context` suspend-abort-alloc,
   failing without the fix). So exhaustion WAS reachable on a long flap — just
   not the cause of the ifdown/ifup hang above.
+- **The radio cycle on an unanswered dial now owns the reconnect:** the
+  daemon sets `modem._reattaching` around it (released by its callback, or a
+  60 s guard) and starts the reconnect when it ends — before, the next dial
+  ran into the radio-off window and was aborted by the deregistration. And
+  `qmi_clients` is cleared on teardown: the in-flight releases' answers die
+  with CTL, so a rebuilt modem listed the old session's CIDs beside its own.
+- **Left as is, by decision (Codex review 2026-10-04):** the pre-dial adoption
+  trusts any CONNECTED an unmuxed WDS client reports while no other context is
+  up — a bearer someone else started (modem autoconnect, a uqmi beside wwand)
+  would be adopted; and the QMI attach profile writes credentials only when
+  configured, so clearing or changing the APN keeps an old login there (MBIM
+  writes them in full).
 
 ## Known open
 

@@ -451,6 +451,11 @@ export function create(opts)
 	// that never came stops blocking the interface's renews.
 	const PROBE_STALE_S = 30;
 
+	// Upper bound on the radio cycle a dial timeout starts: low_power, the
+	// settle wait, online — seconds normally. Only a backstop for a callback
+	// that never comes; the reconnect it releases is idempotent.
+	const REATTACH_GUARD_MS = 60000;
+
 	const LLA_WAIT_MS = 250;
 	const LLA_WAIT_TRIES = 12;      // ~3 s, then start anyway
 
@@ -2157,8 +2162,17 @@ export function create(opts)
 			// and the next dial connects in seconds (deborah-3, 2026-10-04). So
 			// cycle at once, at most every 10 min per modem; a QMI error or a
 			// network rejection keeps going the ladder's way.
+			//
+			// The reconnect waits for the cycle. Started beside it, the next
+			// dial lands in the radio-off window, registration loss aborts it,
+			// and every such abort is one more CID allocation in flight
+			// (HW-observed, deborah-3 2026-10-04). `_reattaching` is the flag
+			// the down/suspend handler already honours for netsel's AT reattach.
+			let cycling = false;
+
 			if (data?.stage == 'start_network' && data?.err?.error == 'timeout' &&
-			    ctx.modem.state == 'READY' && type(ctx.modem.reattach) == 'function') {
+			    ctx.modem.state == 'READY' && !ctx.modem._reattaching &&
+			    type(ctx.modem.reattach) == 'function') {
 				let mentry = self.modems[entry?.cfg?.modem];
 				let now = context_common.mono();
 
@@ -2166,11 +2180,40 @@ export function create(opts)
 					mentry._wds_bounce_at = now;
 					log('notice', sprintf('interface %s: the modem did not answer the dial at all — cycling its radio once to free its data service',
 						entry?.cfg?.interface ?? name));
-					ctx.modem.reattach();
+
+					let m = ctx.modem;
+					let settled = false;
+					let guard;
+
+					// One exit for the callback and the guard: a reattach whose
+					// callback never comes (a teardown between its steps) must
+					// not leave the flag set, or no down would reconnect again.
+					let finish = (err) => {
+						if (settled)
+							return;
+
+						settled = true;
+						m._reattaching = false;
+						guard?.cancel();
+
+						if (err)
+							log('warn', sprintf('interface %s: radio cycle failed: %J',
+								entry?.cfg?.interface ?? name, err));
+
+						let e = self.contexts[name];
+
+						if (e?.wanted && e.ctx?.state == 'IDLE')
+							enter_reconnecting(name);
+					};
+
+					m._reattaching = true;
+					cycling = true;
+					guard = uloop.timer(REATTACH_GUARD_MS, () => finish({ error: 'no answer from the radio cycle' }));
+					m.reattach((err) => finish(err));
 				}
 			}
 			emit('wwand.context', { context: name, interface: entry?.cfg?.interface, event: event });
-			if (entry?.wanted)
+			if (entry?.wanted && !cycling)
 				enter_reconnecting(name);
 			break;
 

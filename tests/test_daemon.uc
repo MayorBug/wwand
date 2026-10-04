@@ -4194,12 +4194,12 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 // --- deborah-3 (MC7710): never stop a live session for our own reset, and an
 // unanswered dial frees the modem's data service with one radio cycle ------
 {
-	let ctx_ev = null, downs = 0, reattaches = 0;
+	let ctx_ev = null, downs = 0, reattaches = 0, reattach_cb = null;
 	let the_ctx = null;
 	let fake = {
 		modem: { create: (o) => ({ id: o.id, state: 'READY', config: o.config,
 			start: () => null, stop: () => null, note_connect_failure: () => null,
-			reattach: () => reattaches++ }) },
+			reattach: (cb) => { reattaches++; reattach_cb = cb; } }) },
 		context: { create: (o) => (ctx_ev = o.deps.on_event,
 			the_ctx = { state: 'CONNECTED', name: o.name, modem: o.modem,
 			            down: (cb) => { downs++; cb ? cb() : null; },
@@ -4226,8 +4226,14 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 
 	// B: an unanswered START_NETWORK cycles the radio once per 10 min
 	let fail = (err) => ctx_ev(the_ctx, 'error', { stage: 'start_network', err: err });
+	d.contexts.wan.wanted = true;
 	fail({ error: 'timeout' });
 	eq(reattaches, 1, 'unanswered dial: one radio cycle at once');
+	eq([ the_ctx.modem._reattaching, d.contexts.wan.hold_timer == null ], [ true, true ],
+		'unanswered dial: the reconnect waits for the radio cycle');
+	reattach_cb(null, { ok: true });
+	eq([ the_ctx.modem._reattaching, d.contexts.wan.hold_timer != null ], [ false, true ],
+		'unanswered dial: ...and starts when it ends');
 	fail({ error: 'timeout' });
 	eq(reattaches, 1, 'unanswered dial: ...not again within 10 min');
 

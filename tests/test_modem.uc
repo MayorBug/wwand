@@ -858,6 +858,7 @@ scenario('e182e', {
 		modem.stop();
 		eq(length(mock.calls_for('RELEASE_CID')), 3,
 			'e182e: teardown released dms/nas/wds on the modem');
+		eq(modem.qmi_clients, {}, 'e182e: no CID of the ended session stays listed');
 	});
 
 // --- 5c: exhausted client table (ClientIdsExhausted, CTL error 5) ------------

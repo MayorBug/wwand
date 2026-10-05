@@ -40,8 +40,44 @@ import * as modeswitch from 'wwand.modeswitch';
 import * as netlink from 'wwand.netlink';
 import * as transport from 'wwand.transport';
 
+// netifd device detour placeholder (netifd_device_detour): a name no device
+// ever carries — netifd keeps an interface on it waiting, harmlessly
+const DETOUR_DEVICE = 'wwand-detour';
+
+// A netifd device detour the daemon did not finish (it died between the two
+// reloads, netifd_device_detour): put every interface's device back. Run by
+// main.uc BEFORE the first config read, so the daemon never parses the
+// placeholder as a device. Returns the section names restored; commits only
+// when there is one.
+export function detour_restore(c)
+{
+	let done = [];
+
+	c.foreach('network', 'interface', (sec) => {
+		if (sec.wwand_detour == null)
+			return;
+
+		c.set('network', sec['.name'], 'device', sec.wwand_detour);
+		c.delete('network', sec['.name'], 'wwand_detour');
+		push(done, sec['.name']);
+	});
+
+	if (length(done))
+		c.commit('network');
+
+	return done;
+};
+
 export function create(o)
 {
+	// a cursor whose commits carry only its own changes (main.uc gives it a
+	// private delta directory); the shared one where none was handed in
+	let isolated_cursor = () => {
+		let mk = o.cursor_isolated ?? o.cursor;
+
+		return mk();
+	};
+
 	let conn = o.conn;
 
 	// One NMEA reader per modem id. wwand.gps ships in the OPTIONAL wwand-gps
@@ -68,7 +104,7 @@ export function create(o)
 	// A LOCAL, not just a property of the returned object. It is called from
 	// two places — NITZ, and the GNSS reader's epoch callback — and the second
 	// one used to reach for `o.set_clock`, which nothing ever sets: main.uc
-	// builds deps without it (main.uc:294), so `option gnss_set_time` was a
+	// builds deps without it (main.uc:308), so `option gnss_set_time` was a
 	// silent no-op and the test that "proved" it passed only because it
 	// injected the property the production path does not have.
 	//
@@ -853,6 +889,49 @@ export function create(o)
 		},
 
 		network_reload: () => conn.defer('network', 'reload', {}, netifd_cb('reload')),
+
+		// THE NETIFD DEVICE DETOUR. netifd records a simple device's parent
+		// once (device.c:197-201) and drops it only when the device object is
+		// freed (device.c:238-240, simple_device_free) — never while an
+		// interface's `option device` names it, down or not. A name that was a
+		// mux child and is now a renamed parent (a datapath that went from QMAP
+		// to raw-IP) is therefore claimed through a parent that is gone, and
+		// every claim fails with DEVICE_CLAIM_FAILED (interface.c:1349-1353;
+		// netifd 2026.07.08~6088f7b3). Releasing or downing it does not help;
+		// only freeing does, and netifd frees a device once nothing uses it.
+		//
+		// So: point the interface at a placeholder and reload — the old object
+		// loses its last user and goes, stale parent and all — then point it
+		// back and reload again, which builds a fresh object that reads its
+		// parent from sysfs. Only this interface's section changes, through a
+		// cursor with its OWN delta directory, so an operator's staged but
+		// uncommitted network changes stay theirs. The original device is kept
+		// in `option wwand_detour` while the placeholder is in; a daemon that
+		// dies between the two reloads is undone at the next start
+		// (detour_restore).
+		netifd_device_detour: (iface, cb) => {
+			let c = isolated_cursor();
+			let dev = c.get('network', iface, 'device');
+
+			if (dev == null || dev == DETOUR_DEVICE)
+				return cb({ error: 'no_device', interface: iface });
+
+			c.set('network', iface, 'wwand_detour', dev);
+			c.set('network', iface, 'device', DETOUR_DEVICE);
+			c.commit('network');
+
+			conn.defer('network', 'reload', {}, (r1) => {
+				let c2 = isolated_cursor();
+
+				c2.set('network', iface, 'device', dev);
+				c2.delete('network', iface, 'wwand_detour');
+				c2.commit('network');
+
+				conn.defer('network', 'reload', {}, (r2) =>
+					cb((r1 == 0 && r2 == 0) ? null : { error: 'reload_failed', first: r1, second: r2 }));
+			});
+		},
+
 		set_clock: set_clock,
 		resolve_netdev: discovery.resolve_netdev,
 		resolve_protocol: discovery.protocol_of,

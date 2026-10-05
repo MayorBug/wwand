@@ -1262,6 +1262,22 @@ unanswered dial stays as the safety net.
   tail now; and valid NMEA not interpreted (GNS, $PSTIS) counts as `ignored`.
   Teardown STOP/RELEASE twice, QMI healthy. MBIM passthrough not HW-tested.
 
+- **netifd device detour** (2026-10-04): on `DEVICE_CLAIM_FAILED` for a wwand
+  interface (netifd's stale parent record after a mux child became the
+  renamed parent) the daemon points the interface at a placeholder, reloads,
+  points it back, reloads — netifd frees the old record with its last user
+  (`deps.uc netifd_device_detour`, `daemon.uc heal_device_claim`, at most once
+  per 5 min per interface; isolated uci delta dir; an unfinished one is undone
+  at start, `detour_restore`). Also: a QMI config without any mux channel
+  removes the old QMAP child holding the stable name before renaming the
+  parent (it was pruned only after the rename had given up — NO_DEVICE).
+  HW (NR7101, mux_id 1 → 0): DEVICE_CLAIM_FAILED, detour, up 1 s later.
+  Seen on the way back (mux 0 → 1 + a second interface, two rebuilds within a
+  minute): the RG502Q's QMI stopped answering ALLOCATE_CID (CTL still
+  answered) for 9 init attempts until a modem reset — not caused by this
+  change, not yet explained; the "AT reset for a hung QMI side" did not fire.
+  New checker `tools/check-ucode-pitfalls.py` (see docs/gotchas.md).
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

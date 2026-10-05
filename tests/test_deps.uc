@@ -676,4 +676,41 @@ function mkdeps(u, extra) {
 	eq([ u.state.wwan0.apn, u.state.wwan0.autosetup ], [ 'mine', null ], 'autosetup_fill: ...and the run is over');
 }
 
+// --- the netifd device detour ----------------------------------------------
+//
+// netifd frees a device object only once nothing uses it, and that is the one
+// way its stale parent record goes: point the interface elsewhere, reload,
+// point it back, reload. The device seen by netifd at each reload is recorded
+// here, and so is what a half-done detour leaves for the next start.
+{
+	let u = fake_uci({ wan: { '.type': 'interface', proto: 'wwand', device: 'wwand0' } });
+	let seen = [];
+	let conn = { defer: (o, m, a, cb) => { push(seen, [ m, u.state.wan.device, u.state.wan.wwand_detour ]); cb(0); } };
+	let iso = 0;
+	let d = mkdeps(u, { conn: conn, cursor_isolated: () => { iso++; return u.cursor(); } });
+	let res = 'pending';
+
+	d.netifd_device_detour('wan', (err) => { res = err; });
+	eq(seen, [ [ 'reload', 'wwand-detour', 'wwand0' ], [ 'reload', 'wwand0', null ] ],
+	   'detour: reload with the placeholder (original kept aside), then with the device back');
+	eq([ res, u.state.wan.device, u.state.wan.wwand_detour, u.commits ], [ null, 'wwand0', null, 2 ],
+	   'detour: done — the device is back, the marker gone, two commits');
+	ok(iso >= 2, 'detour: through the isolated cursor, never the shared one');
+
+	// a daemon that died between the reloads: the next start puts it back
+	u = fake_uci({ wan: { '.type': 'interface', device: 'wwand-detour', wwand_detour: 'wwand0' },
+	               lan: { '.type': 'interface', device: 'br-lan' } });
+	eq(depsmod.detour_restore(u.cursor()), [ 'wan' ], 'detour_restore: the half-done interface is named');
+	eq([ u.state.wan.device, u.state.wan.wwand_detour, u.state.lan.device, u.commits ], [ 'wwand0', null, 'br-lan', 1 ],
+	   'detour_restore: its device is back, nothing else touched');
+	eq(depsmod.detour_restore(u.cursor()), [], 'detour_restore: nothing to do is nothing done');
+	eq(u.commits, 1, 'detour_restore: ...and no commit for it');
+
+	// no device to detour around
+	u = fake_uci({ wan: { '.type': 'interface', proto: 'wwand' } });
+	d = mkdeps(u, { conn: conn });
+	d.netifd_device_detour('wan', (err) => { res = err; });
+	eq([ res?.error, u.commits ], [ 'no_device', 0 ], 'detour: an interface without a device is refused, untouched');
+}
+
 done('test_deps');

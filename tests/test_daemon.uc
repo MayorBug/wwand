@@ -2741,6 +2741,56 @@ eq(am3.modems.m0?.l3_name, false,
 	eq(del4, [], 'reclaim: a vlan on another parent is left alone');
 })();
 
+// THE QMI CASE: a config that dropped its mux altogether (mux_id 1 -> 0) finds
+// the old QMAP child holding the stable name. It is ours on the datapath
+// prune's own proof — its iflink is this parent's ifindex — so it goes, and
+// the parent takes the name. A child of another parent, or any configured
+// channel, leaves it alone.
+(function() {
+	let mk = (files, deleted, mux_id) => {
+		let renamed = [];
+		let d = daemon_mod.create({ timing: TIMING, deps: {
+			log: () => null,
+			datapath_fx: {
+				exists: (p) => (p == '/sys/class/net/l3q')
+					? !length(filter(deleted, (x) => x == 'l3q'))
+					: exists(files, p),
+				read: (p) => files[p],
+				link_del: (dev) => { push(deleted, dev); return true; },
+				link_set: (dev, o) => { push(renamed, dev + '->' + (o.rename ?? '')); return true; },
+			},
+			resolve_netdev: (cfg, dev) => 'wwan0',
+			load_qmi: () => am_qmi,
+		} });
+
+		d.apply_config(config.parse({ network: {
+			m0: { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+			q:  { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3q', apn: 'a',
+			      ...(mux_id != null ? { mux_id: mux_id } : {}) },
+		} }));
+
+		return renamed;
+	};
+
+	let child = {};
+	child['/sys/class/net/wwan0/ifindex'] = '7\n';
+	child['/sys/class/net/l3q/iflink'] = '7\n';
+
+	let del1 = [];
+	eq([ mk(child, del1, '0'), del1 ], [ [ 'wwan0->l3q' ], [ 'l3q' ] ],
+	   'qmi reclaim: no channel configured — our old QMAP child goes and the parent takes the name');
+
+	let other = { ...child };
+	other['/sys/class/net/l3q/iflink'] = '9\n';
+
+	let del2 = [];
+	eq([ mk(other, del2, '0'), del2 ], [ [], [] ], 'qmi reclaim: a device on another parent is left alone');
+
+	let del3 = [];
+	mk(child, del3, '1');
+	eq(del3, [], 'qmi reclaim: a configured channel keeps its child');
+})();
+
 // ...and a pinned channel beside an auto one is not demotable either: the
 // modem needs QMAP for the pinned one regardless.
 am_opts = {};
@@ -3329,6 +3379,55 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	hooks.m0(d.modems.m0.modem, 'registered', {});
 	eq([ calls, d.modem_location('m0').error ], [ [], 'location_disabled' ],
 	   'gnss: off — neither source, and modem_location says why');
+	d.shutdown();
+})();
+
+// NETIFD CANNOT CLAIM THE DEVICE (a stale parent record from when the name was
+// a mux child): kicking repeats the failed claim, so the daemon takes the
+// device detour instead — on DEVICE_CLAIM_FAILED and nothing else, once per
+// DETOUR_MIN_S per interface — and kicks after it.
+(() => {
+	let hooks = {}, calls = [];
+	let st = { up: false, pending: false, autostart: true,
+	           errors: [ { subsystem: 'interface', code: 'DEVICE_CLAIM_FAILED' } ] };
+	let fake = {
+		modem: { create: (o) => {
+			hooks[o.id] = o.deps.on_event;
+			return { id: o.id, state: 'READY', config: o.config, start: () => null, stop: () => null,
+			         note_connect_success: () => null };
+		} },
+		context: { create: (o) => ({ state: 'IDLE', name: o.name, modem: o.modem, config: o.config,
+		                             down: (cb) => cb ? cb() : null, up: (cb) => null,
+		                             modem_event: () => null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: {
+		log: () => null, load_qmi: () => fake,
+		giveups_file: '/tmp/test-giveups-detour.json', admin_downs_file: '/tmp/test-admin-downs-detour.json',
+		kick_interface: (i) => push(calls, 'kick:' + i),
+		down_interface: (i) => push(calls, 'down:' + i),
+		netifd_device_detour: (i, cb) => { push(calls, 'detour:' + i); cb(null); },
+		iface_status: (i, cb) => cb(st),
+	} });
+
+	d.apply_config(config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'wwand0', apn: 'a' },
+	} }));
+	d.contexts.wan.wanted = true;
+
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(calls, [ 'detour:wan', 'kick:wan' ], 'claim failed: the device detour, then the kick');
+
+	calls = [];
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(calls, [ 'kick:wan' ], 'claim failed again within DETOUR_MIN_S: no second detour, a plain kick');
+
+	// counter-proof: a down interface WITHOUT that error is kicked, no detour
+	calls = [];
+	st.errors = [];
+	d.contexts.wan._detour_at = null;
+	hooks.m0(d.modems.m0.modem, 'registered', {});
+	eq(calls, [ 'kick:wan' ], 'no DEVICE_CLAIM_FAILED: kicked as ever, no detour');
 	d.shutdown();
 })();
 

@@ -876,3 +876,16 @@ as no model.
 *Evidence:* ddimension/wwand#45, reporter logs 2026-09-29/30 (`vendor recipe:
 generic — no manufacturer and model ?`, `cgmi -, cgmm FM350-GL`, `cgmm Fibocom
 Wireless Inc.`); #32 for the same refusal after a slot switch.
+
+## `let x = (a ?? b)()` is null when `a` is set
+
+An assignment of a parenthesized `??` that is called — `let c =
+(o.cursor_isolated ?? o.cursor)();`, `x = (a ?? b)(args);` — yields **null**
+whenever the left operand is set: no error, the value is simply gone. With the
+left operand null it works, so a test that only exercises the fallback passes.
+`return (a ?? b)()` and the bare statement `(a ?? b)();` are fine. Verified on
+the host ucode and on ucode-2026.07.09~b885dd0f (NR7101, 2026-10-04); found
+when the netifd device detour in deps.uc got a null cursor. Write it as two
+statements (`let mk = a ?? b; let c = mk();`), as transport.uc already did.
+`tools/check-ucode-pitfalls.py` fails on the assignment form and runs in
+`run_tests.sh`.

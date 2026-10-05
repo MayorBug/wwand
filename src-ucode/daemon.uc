@@ -723,6 +723,54 @@ export function create(opts)
 	// caller leaves the interface down on true, so a true that only the
 	// first-start guess gave is recorded here — the next start trusts the
 	// record and has no guess left to make.
+	// NETIFD CLAIMS THE DEVICE THROUGH A PARENT THAT IS GONE. A name that was a
+	// mux child and is now the renamed parent itself (a datapath that went
+	// from QMAP to raw-IP, a config that dropped its mux) keeps netifd's old
+	// parent record, and every claim then fails: the interface sits down with
+	// DEVICE_CLAIM_FAILED in its errors while the session behind it is fine
+	// (LTE3301 apntest box, 2026-10-03; GL-X3000/RM520N, 2026-09-20). Only a
+	// netifd restart or the device detour (deps.uc netifd_device_detour)
+	// clears the record. The detour is taken on that evidence and nothing
+	// else, at most once per DETOUR_MIN_S per interface — a claim that still
+	// fails after it has another cause, and repeating it would only reload
+	// netifd in a loop.
+	const DETOUR_MIN_S = 300;
+
+	let claim_failed = (st) =>
+		length(filter(st?.errors ?? [], (e) => e?.code == 'DEVICE_CLAIM_FAILED')) > 0;
+
+	// true when the detour was started (`then` runs once it is through)
+	let heal_device_claim = (entry, then) => {
+		let iface = entry?.cfg?.interface;
+
+		if (!deps.netifd_device_detour || !iface)
+			return false;
+
+		let now = time();
+
+		if (entry._detour_at != null && (now - entry._detour_at) < DETOUR_MIN_S)
+			return false;
+
+		entry._detour_at = now;
+		log('notice', sprintf('interface %s: netifd cannot claim its device (DEVICE_CLAIM_FAILED — it still holds the parent of an earlier mux child) — re-creating netifd\'s record of it',
+			iface));
+
+		deps.netifd_device_detour(iface, (err) => {
+			if (err) {
+				log('warn', sprintf('interface %s: the netifd device detour failed (%J) — `/etc/init.d/network restart` clears the record',
+					iface, err));
+				return;
+			}
+
+			log('info', sprintf('interface %s: netifd re-created its device record', iface));
+
+			if (then)
+				then();
+		});
+
+		return true;
+	};
+
 	let operator_down = (entry, st) => {
 		if (st?.autostart !== false || our_down(entry))
 			return false;
@@ -1092,6 +1140,11 @@ export function create(opts)
 					// probe: nothing is orphaned, there is nothing to reset.
 					log('debug', sprintf('interface %s: setup pending on a running activation (%s), not kicking',
 						centry.cfg.interface, centry.ctx.state));
+				}
+				else if (claim_failed(st) && heal_device_claim(centry,
+				         () => deps.kick_interface?.(centry.cfg.interface))) {
+					// a kick would only fail the same claim again; the detour
+					// kicks once netifd has a fresh device record
 				}
 				else if (deps.kick_interface) {
 					// our own down is being undone here; the kick re-arms
@@ -1889,6 +1942,12 @@ export function create(opts)
 					if (!deps.kick_interface)
 						return;
 
+					// the claim itself fails: kicking repeats it, the detour
+					// clears what makes it fail and kicks afterwards
+					if (claim_failed(st) &&
+					    heal_device_claim(entry, () => deps.kick_interface(entry.cfg.interface)))
+						return;
+
 					let kick = () => {
 						log('notice', sprintf('interface %s is down with a connected session, kicking it up instead of renewing',
 							entry.cfg.interface));
@@ -2618,11 +2677,34 @@ export function create(opts)
 				// DEVICE_CLAIM_FAILED and the interface sits down with a
 				// perfectly good session behind it (netifd interface.c:1349-1353,
 				// 2026.07.08~6088f7b3). A `reload` does not clear the record; a
-				// restart does. Nothing wwand can do from here, so say it
-				// rather than leave it to be found — HW-confirmed on the
-				// GL-X3000/RM520N, 2026-09-20.
-				log('notice', sprintf('modem %s: netifd still holds a device record for %s from when it was a mux child — if %s stays down, restart the network (`/etc/init.d/network restart`); a reload does not clear it',
-					name, want, entry.l3_name ?? want));
+				// restart does, and so does the device detour the status paths
+				// take when netifd reports exactly that (heal_device_claim) —
+				// HW-confirmed on the GL-X3000/RM520N, 2026-09-20.
+				log('notice', sprintf('modem %s: netifd still holds a device record for %s from when it was a mux child — should the claim fail, wwand re-creates that record (netifd device detour)',
+					name, want));
+			}
+		}
+
+		// THE SAME FOR A QMI MODEM WHOSE CONFIG NOW HAS NO CHANNEL AT ALL (a
+		// mux_id that went from 1 to 0, a muxed sibling deleted): the old QMAP
+		// child still holds the stable name, the datapath prunes it a second
+		// later (netlink.uc prune_mux_children), and this rename has already
+		// given up by then and is not retried — the parent kept its kernel
+		// name and netifd reported NO_DEVICE for good (HW-seen on the NR7101,
+		// 2026-10-04: mux_id 1 -> 0). Taken now, on the prune's own proof: a
+		// device whose iflink is this parent's ifindex is its mux child
+		// (rmnet_vnd_get_iflink returns real_dev's, rmnet_vnd.c:97-102, Linux
+		// 6.18.41). Never with a channel configured — that child is wanted.
+		if (entry.protocol == 'qmi' && !length(entry.muxinfo?.list ?? []) &&
+		    !(entry.muxinfo?.demotable ?? false) && fx.link_del && fx.read &&
+		    fx.exists(sprintf('/sys/class/net/%s', want))) {
+			let idx = trim(fx.read(sprintf('/sys/class/net/%s/ifindex', entry.netdev)) ?? '');
+			let link = trim(fx.read(sprintf('/sys/class/net/%s/iflink', want)) ?? '');
+
+			if (length(idx) && link == idx) {
+				log('notice', sprintf('modem %s: %s is a leftover mux child of %s and this modem runs without mux — removing it to take the name',
+					name, want, entry.netdev));
+				fx.link_del(want);
 			}
 		}
 

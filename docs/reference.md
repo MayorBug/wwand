@@ -849,15 +849,25 @@ session 1 and keeps it. `wwandctl status` and the LuCI status page both print
 this as `auto → untagged`, so what `auto` settled on is visible without
 guessing.
 
-> **Changing a modem's mux configuration on a running system needs
-> `/etc/init.d/network restart`, not a reload.** Switching between a tagged
-> session and the untagged parent moves the stable L3 name from the mux child to
-> the parent device, and netifd still holds a device record for that name in its
-> old shape — claiming it re-runs that record's setup against a parent that is
-> gone, so `interface_set_up()` reports `DEVICE_CLAIM_FAILED` and the interface
-> stays down behind a perfectly good session (netifd `interface.c:1349-1353`,
-> 2026.07.08~6088f7b3). A `reload` does not clear the record; a restart does.
-> wwand logs a notice naming the interface and this remedy when it happens. A
+> **Changing a modem's mux configuration on a running system** moves the stable
+> L3 name between the mux child and the parent device, and netifd still holds a
+> device record for that name in its old shape: it claims the device through a
+> parent that is gone, `interface_set_up()` reports `DEVICE_CLAIM_FAILED` and the
+> interface stays down behind a perfectly good session (netifd
+> `interface.c:1349-1353`, 2026.07.08~6088f7b3). A `reload` does not clear the
+> record; netifd frees it only with the device object (`device.c:238-240`), and
+> only once nothing uses it. **wwand heals this itself** when netifd reports
+> exactly that error for one of its interfaces: it points the interface at a
+> placeholder device and reloads (the old record loses its last user and is
+> freed), then points it back and reloads again (a fresh record reads its
+> parent from sysfs) — the *netifd device detour*, at most once per 5 min per
+> interface, through its own uci delta directory so an operator's staged
+> changes are not committed with it. A detour cut short by a daemon restart is
+> undone at the next start (`option wwand_detour` keeps the original device
+> meanwhile). HW: NR7101, mux_id 1 → 0, up again one second after the error.
+> A QMI config that drops its last mux channel also has the old QMAP child
+> removed before the parent is renamed (it held the stable name, and the rename
+> was not retried). `/etc/init.d/network restart` remains the manual remedy. A
 > fresh boot is unaffected. A plugin that ships no probe is
 never self-selected. `ubus call wwand status` reports the datapath each modem
 actually came up on (`modems.<name>.datapath`), and the choice is logged. The

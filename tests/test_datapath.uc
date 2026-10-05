@@ -207,6 +207,28 @@ ok(fx.action_index('link_add_rmnet wwand0 link wwan0 mux_id 1 flags 0x1') >= 0,
 	'collision: child created on the moved parent');
 eq(res.mux_devs, [ 'wwand0' ], 'collision: child owns the stable L3 name');
 
+// A RAW-IP PARENT LEFT WITH pass_through=Y by an earlier rmnet config: cleared,
+// and BEFORE raw_ip is written — qmi_wwan refuses raw_ip=N while pass_through is
+// set, and changes pass_through only on a raw-IP device (qmi_wwan.c:340, :488,
+// Linux 6.18.41). Seen on 245 after mux_id auto -> 0 (2026-10-05).
+fx = fakefx.create({
+	present: { '/sys/class/net/wwand0/qmi/pass_through': true, '/sys/class/net/wwand0/qmi/raw_ip': true },
+	files: { '/sys/class/net/wwand0/qmi/pass_through': 'Y\n' },
+});
+res = netlink.setup(fx, { netdev: 'wwand0', backend: 'raw_ip', mux: [], dgram_size: 0 });
+eq(res.ok, true, 'stale pass_through: raw_ip setup ok');
+let i_ptoff = fx.action_index('write /sys/class/net/wwand0/qmi/pass_through N');
+let i_raw = fx.action_index('write /sys/class/net/wwand0/qmi/raw_ip Y');
+ok(i_ptoff >= 0 && i_raw > i_ptoff, 'stale pass_through: cleared, before raw_ip is written');
+
+// ...and a parent that never had it is not written at all
+fx = fakefx.create({
+	present: { '/sys/class/net/wwand0/qmi/pass_through': true, '/sys/class/net/wwand0/qmi/raw_ip': true },
+	files: { '/sys/class/net/wwand0/qmi/pass_through': 'N\n' },
+});
+netlink.setup(fx, { netdev: 'wwand0', backend: 'raw_ip', mux: [], dgram_size: 0 });
+eq(fx.action_index('write /sys/class/net/wwand0/qmi/pass_through N'), -1, 'stale pass_through: an N stays untouched');
+
 // rmnet with negotiated MAPv5: checksum offload flags on the links
 fx = fakefx.create({ present: caps_rmnet });
 res = netlink.setup(fx, {

@@ -1538,6 +1538,19 @@ export function setup(fx, opts)
 	// raw-ip config on the same modem, and an 802.3 link with the raw-ip flag
 	// set carries garbage.
 	if (programs_parent) {
+		// A PARENT THAT CARRIES NO CHILD MUST NOT PASS FRAMES THROUGH. rmnet's
+		// `pre` sets qmi_wwan's pass_through, and nothing cleared it when the
+		// config left the mux behind: qmi_wwan then hands every frame to an rx
+		// handler that is gone (raw-IP parent after a QMAP config, 2026-10-05
+		// on 245). Cleared FIRST, because the driver refuses raw_ip=N while
+		// pass_through is set and only changes pass_through on a raw-IP device
+		// (qmi_wwan.c:340 raw_ip_store, :488 pass_through_store, Linux 6.18.41) — the
+		// 802.3 fallback could not even be selected after a QMAP config.
+		let pt = sprintf('%s/pass_through', sys);
+
+		if (!impl?.pre && fx.exists(pt) && trim(fx.read(pt) ?? '') == 'Y')
+			write_attr(fx, pt, 'N', 'pass-through off');
+
 		if (fx.exists(sys)) {
 			if (!write_attr(fx, sprintf('%s/raw_ip', sys),
 			                (backend == 'ethernet') ? 'N' : 'Y', 'driver format'))

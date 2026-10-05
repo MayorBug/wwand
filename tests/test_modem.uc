@@ -1334,8 +1334,11 @@ scenario('datapath-unmuxed', {
 		let sdf = mock.calls_for('SET_DATA_FORMAT');
 		eq(length(sdf), 1, 'nomux: one format request, no ladder');
 		eq(sdf[0].args.llp, 2, 'nomux: raw-IP link layer still requested');
-		eq(sdf[0].args.ul_protocol, null, 'nomux: no uplink QMAP protocol asked for');
-		eq(sdf[0].args.dl_protocol, null, 'nomux: no downlink QMAP protocol asked for');
+		// never QMAP — and SAID: aggregation DISABLED in both directions, because
+		// leaving the TLVs out keeps whatever the modem had, which after a QMAP
+		// config is QMAP (the RG650E then never answered the dial, 2026-10-05)
+		eq(sdf[0].args.ul_protocol, 0, 'nomux: uplink aggregation explicitly DISABLED, never QMAP');
+		eq(sdf[0].args.dl_protocol, 0, 'nomux: downlink aggregation explicitly DISABLED, never QMAP');
 		eq(sdf[0].args.dl_max_datagrams, null, 'nomux: no aggregation requested');
 		eq(modem.datapath.qmap_version, null, 'nomux: nothing QMAP was negotiated');
 
@@ -1961,6 +1964,36 @@ scenario('settings-deferred-reset', {
 	(modem, mock, events) => {
 		ok(index(at_tr_deferred.written, 'AT+CFUN=1,1') >= 0,
 			'settings-deferred: the deferred reset reaches the modem');
+	});
+
+// A RESET THE DAEMON ASKED FOR BEFORE INIT (the datapath left QMAP) is taken at
+// the first collection point, once — the same refused-reset transport as above
+// lets init resume, so the scenario reaches `registered` and can count it.
+
+let at_tr_leftqmap = fake_at_transport();
+
+at_tr_leftqmap.write = (data) => {
+	let cmd = trim(data);
+
+	push(at_tr_leftqmap.written, cmd);
+	uloop.timer(1, () => at_tr_leftqmap.data_cb(cmd == 'AT+CFUN=1,1' ? 'ERROR\r\n' : 'OK\r\n'));
+
+	return length(data);
+};
+
+scenario('left-qmap-reset', {
+	handlers: base_handlers({ GET_MODEL: { model: 'RG650E-EU' } }),
+	config: { tty: '/dev/ttyUSB2' },
+	at: {
+		fx: fakefx.create(),
+		open_transport: (path, baud, log) => at_tr_leftqmap,
+	},
+	setup: (mock, modem) => { modem._pending_init_reset = 'the datapath left QMAP'; },
+}, 'registered',
+	(modem, mock, events) => {
+		eq(length(filter(at_tr_leftqmap.written, (c) => c == 'AT+CFUN=1,1')), 1,
+			'left-qmap: the daemon-requested reset reaches the modem, once');
+		eq(modem._pending_init_reset, null, 'left-qmap: ...and is consumed, not repeated by a later init');
 	});
 
 // AN ACKNOWLEDGED RESET THAT NEVER HAPPENS DOES NOT PARK THE MODEM EITHER.

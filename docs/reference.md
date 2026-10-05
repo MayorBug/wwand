@@ -867,7 +867,11 @@ guessing.
 > meanwhile). HW: NR7101, mux_id 1 → 0, up again one second after the error.
 > A QMI config that drops its last mux channel also has the old QMAP child
 > removed before the parent is renamed (it held the stable name, and the rename
-> was not retried). `/etc/init.d/network restart` remains the manual remedy. A
+> was not retried), and the modem is **reset once** early in its next init: an
+> RG650E kept enough of its muxed data-session state to never answer a raw-IP
+> dial — sessions stopped cleanly, aggregation explicitly disabled and
+> confirmed, pass-through off, the data port bound to mux 0, a radio cycle —
+> until it was reset (245, 2026-10-05). The way back (raw → mux) needs no reset. `/etc/init.d/network restart` remains the manual remedy. A
 > fresh boot is unaffected. A plugin that ships no probe is
 never self-selected. `ubus call wwand status` reports the datapath each modem
 actually came up on (`modems.<name>.datapath`), and the choice is logged. The

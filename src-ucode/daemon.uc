@@ -399,6 +399,7 @@ export function create(opts)
 	// forward-declared: ucode closures capture only already-declared vars, and
 	// these self-reference (the TDZ trap — see CLAUDE.md ucode gotchas)
 	let derive_netdev;
+	let start_modem, start_context;   // forward-declared: stop_modem restarts a retired modem
 	let detach_modem;   // forward-declared: used by modem_removed above its definition
 	let maybe_autosetup_fill;
 	let note_unholdable;   // defined beside plugin_radio; the registered handler uses it
@@ -491,6 +492,14 @@ export function create(opts)
 	// at 18:47:49 between the two, and the first refusal at 18:49:57 is 115 s
 	// later — well inside OUR_DOWN_TTL, so the TTL is not what lost it.
 	self._our_downs = {};
+
+	// modems whose sessions are being stopped before their backend goes
+	// (stop_modem): name -> { start: the restart apply_config asked for }
+	self._retiring = {};
+
+	// modems that left QMAP and still owe the reset that clears it (rename_l3,
+	// start_modem): name -> true until an init has taken the reset
+	self._left_qmap = {};
 
 	// THE INTERFACES WE GAVE UP ON, and reconnect when the modem registers
 	// again (reconnect_on_register: a reconnect-hold give-up, a SIM block).
@@ -2555,11 +2564,14 @@ export function create(opts)
 	// Idempotent-reload teardown of a SINGLE context: cancel its reconnect, fail
 	// pending waiters, down it if up, and drop it from the map. (detach_modem
 	// above keeps the entry as a "modem gone" placeholder; this removes it fully.)
-	let stop_context = (name) => {
+	// `done` (optional) is called once the context's own teardown is through —
+	// STOP_NETWORK answered and its clients released — or at once when it had
+	// nothing to tear down.
+	let stop_context = (name, done) => {
 		let entry = self.contexts[name];
 
 		if (!entry)
-			return;
+			return done ? done() : null;
 
 		clear_reconnect(name);
 		cancel_confirm(entry);
@@ -2568,7 +2580,9 @@ export function create(opts)
 			p({ error: 'reload' });
 
 		if (entry.ctx && entry.ctx.state != 'IDLE')
-			entry.ctx.down(() => null);
+			entry.ctx.down(() => done ? done() : null);
+		else if (done)
+			done();
 
 		// unhook from the modem's context list — else the dead ctx is retained
 		// and keeps receiving notify_contexts events (leak + latent misbehavior)
@@ -2580,15 +2594,76 @@ export function create(opts)
 
 	// Idempotent-reload teardown of a SINGLE modem: stop its contexts, cancel a
 	// pending mode-switch watchdog, stop the backend, and drop it from the map.
+	//
+	// THE BACKEND GOES AFTER ITS SESSIONS, not beside them. A context's down
+	// sends STOP_NETWORK and then releases its WDS clients; the modem's stop
+	// closes the control channel those travel on. Done in one breath, the
+	// STOP was never answered (a timeout, then "send" on the closed hub) and
+	// the session stayed in the modem: after a reload from a muxed to an
+	// unmuxed datapath the new dial got no answer at all, radio cycle or not
+	// (RG650E on 245, 2026-10-05). So the backend stops once every active
+	// context reports its teardown done, or after RETIRE_MAX_MS whatever
+	// happened — a modem that does not answer STOP must not hold the reload.
+	// Meanwhile the modem is RETIRING: apply_config's restart of the same
+	// modem waits for it (self._retiring), because the new backend would open
+	// the device the old one still holds.
+	const RETIRE_MAX_MS = 5000;
+
 	let stop_modem = (name) => {
 		let entry = self.modems[name];
 
 		if (!entry)
 			return;
 
-		for (let cname in keys(self.contexts))
-			if (self.contexts[cname].cfg.modem == name)
+		let ret = { start: null };
+		let pending = 0, finished = false, timer = null;
+
+		let finish = () => {
+			if (finished)
+				return;
+
+			finished = true;
+
+			if (timer)
+				timer.cancel();
+
+			if (entry.modem)
+				entry.modem.stop();
+
+			if (self._retiring[name] === ret)
+				delete self._retiring[name];
+
+			// the restart apply_config asked for while this one was retiring
+			if (ret.start && !self.modems[name]) {
+				start_modem(name, ...ret.start);
+
+				// its contexts were built while it was absent: bind them now,
+				// as the waiting-modem tick and hotplug add do
+				if (self.modems[name]?.modem)
+					for (let cname, centry in self.contexts)
+						if (centry.cfg.modem == name && !centry.ctx)
+							start_context(cname, centry.cfg);
+			}
+		};
+
+		self._retiring[name] = ret;
+
+		for (let cname in keys(self.contexts)) {
+			let ce = self.contexts[cname];
+
+			if (ce.cfg.modem != name)
+				continue;
+
+			if (ce.ctx && ce.ctx.state != 'IDLE') {
+				pending++;
+				stop_context(cname, () => {
+					if (--pending <= 0)
+						finish();
+				});
+			}
+			else
 				stop_context(cname);
+		}
 
 		// ...and close its NMEA port. Otherwise the reader holds an fd on a
 		// device that is gone — or worse, on whatever the kernel hands that
@@ -2599,10 +2674,12 @@ export function create(opts)
 		if (entry.modeswitch_liveness)
 			entry.modeswitch_liveness.cancel();
 
-		if (entry.modem)
-			entry.modem.stop();
-
 		delete self.modems[name];
+
+		if (pending <= 0)
+			finish();
+		else if (!finished)
+			timer = uloop.timer(RETIRE_MAX_MS, finish);
 	};
 
 	// stable L3 names (non-mux datapath): rename the kernel netdev to the
@@ -2705,6 +2782,10 @@ export function create(opts)
 				log('notice', sprintf('modem %s: %s is a leftover mux child of %s and this modem runs without mux — removing it to take the name',
 					name, want, entry.netdev));
 				fx.link_del(want);
+
+				// ...and the MODEM still carries the QMAP session it had: see
+				// _left_qmap at the modem's creation below
+				self._left_qmap[name] = true;
 			}
 		}
 
@@ -2777,7 +2858,7 @@ export function create(opts)
 		return null;
 	};
 
-	let start_modem = (name, cfg, muxinfo, l3name) => {
+	start_modem = (name, cfg, muxinfo, l3name) => {
 		// decide how this modem is controlled (qmi/mbim/ncm/ppp). resolve_control
 		// classifies EVERY modem, incl. NCM modems with no cdc-wdm.
 		let control = deps.resolve_control ? deps.resolve_control(cfg) : null;
@@ -3193,6 +3274,25 @@ export function create(opts)
 
 		entry.modem = be.modem.create({ ...common, datapath: datapath,
 		                                known_ident: entry._ident ?? null });
+
+		// A MODEM THAT LEAVES QMAP AT RUNTIME IS RESET ONCE, early in its init.
+		// Coming from a muxed config, an RG650E answered no raw-IP dial at all
+		// — sessions stopped cleanly, aggregation explicitly DISABLED and
+		// confirmed, pass_through off, the data port bound to mux 0, a radio
+		// cycle: START_NETWORK still timed out every time. The same config
+		// dialled at once after a reset (245, 2026-10-05). What survives in
+		// the modem is not visible over QMI, so the reset is taken whenever
+		// the leftover QMAP child proves the modem was muxed a moment ago.
+		// Kept on the DAEMON, not on this entry, until an init has actually
+		// taken it: the modem object built right after the rename can go
+		// ABSENT before its init runs, and the next one is a new entry (HW:
+		// 245, the first attempt never reached SYNC). One-shot from there:
+		// after the reset the kernel name comes back without a child, and
+		// nothing sets this again.
+		if (self._left_qmap[name]) {
+			entry.modem._pending_init_reset = 'the datapath left QMAP — a modem keeps its muxed data session state until it is reset';
+			entry.modem.on_init_reset_taken = () => delete self._left_qmap[name];
+		}
 		// what optional packages add to the AT init sequence (plugins.uc
 		// at_init), with the control protocol: a plugin can tell a Qualcomm
 		// modem (QMI) from others without an identity of its own
@@ -3230,7 +3330,7 @@ export function create(opts)
 		entry.modem.start();
 	};
 
-	let start_context = (name, cfg) => {
+	start_context = (name, cfg) => {
 		let mentry = self.modems[cfg.modem];
 
 		// interface-bound contexts default wanted=true so the daemon (re)establishes
@@ -3491,8 +3591,15 @@ export function create(opts)
 
 		// 3) (re)start whatever is now missing — new sections and the ones just
 		//    stopped. Untouched modems/contexts are already present and skipped.
+		// a modem still retiring (its sessions being stopped) restarts when it
+		// is through — stop_modem's finish runs the latest request; one that
+		// is gone from the config now is not restarted at all
+		for (let name, ret in self._retiring)
+			ret.start = parsed.modems[name]
+				? [ parsed.modems[name], mux_by_modem[name], l3_by_modem[name] ] : null;
+
 		for (let name, cfg in parsed.modems)
-			if (!self.modems[name])
+			if (!self.modems[name] && !self._retiring[name])
 				start_modem(name, cfg, mux_by_modem[name], l3_by_modem[name]);
 
 		for (let name, cfg in parsed.contexts)

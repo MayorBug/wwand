@@ -2747,6 +2747,7 @@ eq(am3.modems.m0?.l3_name, false,
 // the parent takes the name. A child of another parent, or any configured
 // channel, leaves it alone.
 (function() {
+	let last_modem = null;
 	let mk = (files, deleted, mux_id) => {
 		let renamed = [];
 		let d = daemon_mod.create({ timing: TIMING, deps: {
@@ -2769,6 +2770,7 @@ eq(am3.modems.m0?.l3_name, false,
 			      ...(mux_id != null ? { mux_id: mux_id } : {}) },
 		} }));
 
+		last_modem = d.modems.m0?.modem;
 		return renamed;
 	};
 
@@ -2779,12 +2781,17 @@ eq(am3.modems.m0?.l3_name, false,
 	let del1 = [];
 	eq([ mk(child, del1, '0'), del1 ], [ [ 'wwan0->l3q' ], [ 'l3q' ] ],
 	   'qmi reclaim: no channel configured — our old QMAP child goes and the parent takes the name');
+	ok(last_modem?._pending_init_reset != null,
+	   'qmi reclaim: ...and the modem, which still carries the muxed session state, is reset once at init');
+	ok(type(last_modem?.on_init_reset_taken) == 'function',
+	   'qmi reclaim: ...the debt kept until an init actually takes it');
 
 	let other = { ...child };
 	other['/sys/class/net/l3q/iflink'] = '9\n';
 
 	let del2 = [];
 	eq([ mk(other, del2, '0'), del2 ], [ [], [] ], 'qmi reclaim: a device on another parent is left alone');
+	eq(last_modem?._pending_init_reset, null, 'qmi reclaim: no leftover of ours — no reset');
 
 	let del3 = [];
 	mk(child, del3, '1');
@@ -3428,6 +3435,54 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	d.contexts.wan._detour_at = null;
 	hooks.m0(d.modems.m0.modem, 'registered', {});
 	eq(calls, [ 'kick:wan' ], 'no DEVICE_CLAIM_FAILED: kicked as ever, no detour');
+	d.shutdown();
+})();
+
+// THE BACKEND GOES AFTER ITS SESSIONS. A reload that changes a modem stops its
+// contexts — STOP_NETWORK, client release — and only then the modem, whose
+// stop closes the channel those travel on; the new backend for the same
+// device starts after that. Done together, STOP was never answered and the
+// session stayed in the modem (RG650E on 245, 2026-10-05).
+(() => {
+	let order = [], downs = [], created = 0;
+	let fake = {
+		modem: { create: (o) => {
+			let id = ++created;
+
+			push(order, 'create:' + id);
+			return { id: o.id, state: 'READY', config: o.config, start: () => null,
+			         stop: () => push(order, 'stop:' + id), note_connect_success: () => null };
+		} },
+		context: { create: (o) => ({ state: 'CONNECTED', name: o.name, modem: o.modem, config: o.config,
+		                             down: (cb) => { push(order, 'ctx-down'); push(downs, cb); },
+		                             up: (cb) => null, modem_event: () => null }) },
+	};
+	let d = daemon_mod.create({ timing: TIMING, deps: {
+		log: () => null, load_qmi: () => fake,
+		giveups_file: '/tmp/test-giveups-retire.json', admin_downs_file: '/tmp/test-admin-downs-retire.json',
+	} });
+	let net = (mux) => config.parse({ network: {
+		m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi' },
+		wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'wwand0', apn: 'a', mux_id: mux },
+	} });
+
+	d.apply_config(net('1'));
+	order = [];
+
+	d.apply_config(net('0'));
+	eq(order, [ 'ctx-down' ], 'retire: the session is stopped first — the old backend stays, no new one yet');
+	ok(d._retiring.m0 != null, 'retire: ...the modem is retiring');
+
+	downs[0]();
+	eq(order, [ 'ctx-down', 'stop:1', 'create:2' ], 'retire: its teardown done, THEN the backend stops and the new one starts');
+	ok(d.contexts.wan?.ctx != null, 'retire: ...and the context is bound to the new modem');
+	eq(d._retiring.m0, null, 'retire: nothing left retiring');
+
+	// an idle context has nothing to stop: the old order, at once
+	d.contexts.wan.ctx.state = 'IDLE';
+	order = [];
+	d.apply_config(net('1'));
+	eq(order, [ 'stop:2', 'create:3' ], 'retire: no active session — stopped and restarted at once');
 	d.shutdown();
 })();
 

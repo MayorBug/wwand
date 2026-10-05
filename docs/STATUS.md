@@ -1278,6 +1278,25 @@ unanswered dial stays as the safety net.
   change, not yet explained; the "AT reset for a hung QMI side" did not fire.
   New checker `tools/check-ucode-pitfalls.py` (see docs/gotchas.md).
 
+- **A QMI modem leaving QMAP at runtime** (245 / RG650E, 2026-10-05;
+  mux_id auto -> 0 on a running modem). Four fixes on the way, then the one
+  that made it dial:
+  - a reload stopped a modem's backend in the same breath as its contexts:
+    STOP_NETWORK went unanswered and the session stayed in the modem.
+    stop_modem now waits for the active contexts' teardown (at most 5 s) and
+    restarts the modem after it (`_retiring`);
+  - WDA without QMAP left the aggregation TLVs out, so the modem kept QMAP;
+    raw-IP now asks for DISABLED explicitly (as qmicli does, qmicli-wda.c:561);
+  - qmi_wwan's pass_through stayed Y from rmnet on a parent with no child;
+    raw-IP/ethernet clear it first (the driver refuses raw_ip=N while it is set);
+  - the "QMAP v1 … requested proto 5" log line for a no-QMAP request;
+  - none of that made the RG650E answer the dial (a BIND_MUX_DATA_PORT to mux
+    0 did not either) — only a modem reset did. So the daemon resets a QMI
+    modem once, at its next init, when rename_l3 finds its own leftover QMAP
+    child (`_left_qmap`, kept until an init actually issues the reset). HW:
+    up with v4 + v6 85 s after the config change; E392 (raw-IP only)
+    unaffected by all of it (rebuild, ifdown/ifup, revert).
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

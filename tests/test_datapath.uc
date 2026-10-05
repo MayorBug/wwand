@@ -736,6 +736,15 @@ epreal = {};
 eplinks = { '/sys/class/net/odd0/device': '../../../virtual-endpoint',
             '/sys/class/net/odd0/lower_0/device': '../../../3-1:1.4' };
 eq(netlink.ep_iface_number('odd0', epfx), 4, 'ep: a /device that names no bus does not hide lower_0');
+// Quectel's vendor MHI netdev points at an MHI channel, not the PCI BDF.
+// Resolve its device path to recover the PCIe bus and endpoint interface.
+let mhi_epfx = { readlink: (p) => ({
+	'/sys/class/net/rmnet_mhi0/device': '../../../0309_01.01.00_IP_HW0',
+})[p], realpath: (p) => ({
+	'/sys/class/net/rmnet_mhi0/device': '/sys/devices/pci0001:00/0001:00:00.0/0001:01:00.0/0309_01.01.00_IP_HW0',
+})[p] };
+eq(netlink.ep_iface_number('rmnet_mhi0', mhi_epfx), 4, 'ep: vendor MHI data interface -> 4');
+eq(netlink.ep_type_number('rmnet_mhi0', mhi_epfx), 3, 'ep: vendor MHI driver -> PCIE (3)');
 
 // xHCI-on-PCI: the sysfs path contains BOTH a PCI BDF (the xHCI parent) and a
 // /usbN component — usb must win (the regression the code comment warns about)

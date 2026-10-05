@@ -110,6 +110,12 @@ function mac(fx, netdev)
 	return trim(fx.read(sprintf('/sys/class/net/%s/address', netdev)) ?? '');
 }
 
+// A QMAP child's device link names its PARENT NETDEV: the driver registers
+// it with SET_NETDEV_DEV(qmap_net, &real_dev->dev), real_dev being the
+// parent's struct net_device (mhi_netdev_quectel.c:1608,1619 in 1.3.8,
+// :1615 in 1.6.0; checked 2026-10-05), so /sys/class/net/<child>/device
+// resolves to .../net/<parent>. true/false when the link exists, null when
+// there is none to ask (then the MAC prefix decides).
 function child_of(fx, child, parent)
 {
 	let target = fx.readlink
@@ -133,13 +139,17 @@ function qmap_versions(fx, netdev)
 	if (info?.qmap_version == 5)
 		return [ 1 ];
 
-	// If the ioctl is unavailable, use the PCI ids for which the vendor driver
-	// sets qmap_version = 9 (QMAP v5).
+	// Without the ioctl, the PCI ids for which the vendor driver sets
+	// qmap_version = 9 (QMAP v5) — mhi_netdev_quectel.c:3283-3294 in 1.6.0,
+	// which adds the four SDX35 ids (0x1eac:0x1012-0x1015) to the six of
+	// 1.3.8 (checked 2026-10-05). Every other id is driven at QMAP v1.
 	let id = pci_id(fx, netdev);
 	let key = sprintf('%s:%s', id?.vendor ?? '', id?.device ?? '');
 
 	if (index([ '0x17cb:0x0306', '0x17cb:0x0308', '0x17cb:0x011a',
-	            '0x17cb:0x0309', '0x1eac:0x1004', '0x1eac:0x100b' ], key) >= 0)
+	            '0x17cb:0x0309', '0x1eac:0x1004', '0x1eac:0x100b',
+	            '0x1eac:0x1012', '0x1eac:0x1013', '0x1eac:0x1014',
+	            '0x1eac:0x1015' ], key) >= 0)
 		return [ 5 ];
 
 	return [ 1 ];
@@ -230,8 +240,11 @@ return {
 				// Already renamed. Match the parent device link, or use the
 				// first five MAC octets when no usable link exists.
 				if (fx.exists(sprintf('/sys/class/net/%s', child))) {
-					// The final MAC octet holds the channel number. An all-zero
-					// parent prefix cannot identify a child.
+					// The driver copies the parent's address and overwrites the
+					// LAST octet with offset_id + 1 (mhi_netdev_quectel.c:
+					// 1627-1636 in 1.6.0; checked 2026-10-05), so the first five
+					// octets identify the parent. An all-zero prefix (the raw-IP
+					// default) identifies nothing and is refused.
 					let pmac = mac(fx, ctx.netdev);
 					let parent_match = child_of(fx, child, ctx.netdev);
 

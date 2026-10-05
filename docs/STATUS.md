@@ -1297,6 +1297,21 @@ unanswered dial stays as the safety net.
     up with v4 + v6 85 s after the config change; E392 (raw-IP only)
     unaffected by all of it (rebuild, ifdown/ifup, revert).
 
+- **PR #49 merged (MayorBug): vendor Quectel MHI** (`pcie_mhi`, Cudy P5 /
+  RM551E-GL / MHI 1.6.0): control ports under /sys/class/mhi_uci_q,
+  rmnet_nss_mhi selectable after a restart (renamed children matched by
+  their device link, which names the parent netdev), QMAP version from the
+  driver ioctl or its PCI-ID list. Review fixes on top (checked against the
+  driver source, 1.3.8 and 1.6.0): the port name is "mhi_" + channel
+  ("QMI0"/"MBIM") + the controller index from the second controller on, so
+  mhi_QMI01 -> rmnet_mhi1 and mhi_MBIM -> rmnet_mhi0 (the PR mapped
+  QMI only, and QMI01 to rmnet_mhi01); one name grammar for discovery and
+  autosetup (`discovery.mhi_uci_control`); the four SDX35 ids of 1.6.0 in
+  the QMAP-v5 list; dated driver anchors. A Codex finding that the child's
+  device link names the MHI device rather than the parent netdev was wrong:
+  SET_NETDEV_DEV(qmap_net, &real_dev->dev) with real_dev the parent
+  net_device (mhi_netdev_quectel.c:1608,1619).
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

@@ -1588,7 +1588,7 @@ export function migrate_plan(raw, opts)
 				// THE ANCHORS BELONG TO THE INTERFACE THE MODEM WAS CREATED
 				// FROM. `device` is the obvious one; `netdev` is the same
 				// thing by another name — discovery resolves the modem and
-				// picks its datapath from it (discovery.uc:1018,1027), so a
+				// picks its datapath from it (discovery.uc:1041,1027), so a
 				// second interface supplying a different one would bind the
 				// section to the wrong hardware. Everything else in
 				// MIGRATE_MODEM_OPTS is modem POLICY (pincode, modes, mux,

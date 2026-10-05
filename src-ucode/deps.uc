@@ -341,7 +341,8 @@ export function create(o)
 			// USB, kernel WWAN, and vendor MHI hotplug events use bare control
 			// names. Store their character-device paths under /dev.
 			let dev = (substr(devname ?? '', 0, 1) == '/') ? devname
-				: (match(devname ?? '', /^(cdc-wdm|wwan[0-9]+(qmi|mbim)|mhi_.*(QMI|MBIM))/i)
+				: ((match(devname ?? '', /^(cdc-wdm|wwan[0-9]+(qmi|mbim))/) ||
+				    discovery.mhi_uci_control(devname))
 					? '/dev/' + devname : devname);
 
 			// device blocklist: even on an otherwise unconfigured box, a
@@ -373,7 +374,7 @@ export function create(o)
 			// name is only the fallback when the path can't be resolved
 			let clink = (substr(devname ?? '', 0, 7) == 'cdc-wdm')
 				? '/sys/class/usbmisc/' + devname + '/device'
-				: (match(devname ?? '', /^mhi_/)
+				: (discovery.mhi_uci_control(devname)
 					? '/sys/class/mhi_uci_q/' + devname
 					: '/sys/class/net/' + devname + '/device');
 			let spath = discovery.sysfs_path_of(clink);

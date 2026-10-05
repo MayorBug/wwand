@@ -717,8 +717,15 @@ function mkdeps(u, extra) {
 {
 	let u = fake_uci({});
 	let d = mkdeps(u);
-	ok(d.autosetup_create('mhi_QMI7', {}), 'autosetup: vendor MHI control accepted');
-	eq(u.state.wwmodem_auto?.device, '/dev/mhi_QMI7', 'autosetup: vendor MHI /dev path');
+	ok(d.autosetup_create('mhi_QMI01', {}), 'autosetup: vendor MHI control accepted');
+	eq(u.state.wwmodem_auto?.device, '/dev/mhi_QMI01', 'autosetup: vendor MHI /dev path');
+
+	// a name the driver does not give a control port is not turned into one
+	u = fake_uci({});
+	d = mkdeps(u);
+	d.autosetup_create('mhi_QMI_debug', {});
+	ok(u.state.wwmodem_auto?.device != '/dev/mhi_QMI_debug',
+		'autosetup: a non-control vendor MHI node is not stored as a /dev control device');
 }
 
 done('test_deps');

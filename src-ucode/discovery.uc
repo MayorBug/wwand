@@ -104,12 +104,31 @@ function wwan_port_protocol(name, fx)
 }
 
 // Quectel's vendor pcie_mhi driver predates the kernel wwan class. It exposes
-// control character devices through /sys/class/mhi_uci_q instead, with names
-// such as mhi_QMI0 and mhi_MBIM0.
+// its control character devices through /sys/class/mhi_uci_q instead, named
+// "mhi_" + the channel name + the controller index — the index only from the
+// SECOND controller on (mhi_uci.c:752-761 in 1.3.8, :766-774 in 1.6.0). The
+// channel names are fixed in its table: "QMI0" and "MBIM" (mhi_init.c:
+// 1790-1794, both versions; checked 2026-10-05). So controller 0 gives
+// mhi_QMI0 / mhi_MBIM, controller 1 gives mhi_QMI01 / mhi_MBIM1 — the digits
+// after the channel name are the controller, and a trailing "0" of "QMI0" is
+// not one.
+const MHI_UCI_CONTROL = /^mhi_(QMI0|MBIM)([0-9]*)$/;
+
+// { protocol, controller } for a vendor MHI control-port name, else null
+export function mhi_uci_control(name)
+{
+	let m = match(name ?? '', MHI_UCI_CONTROL);
+
+	if (!m)
+		return null;
+
+	return { protocol: (m[1] == 'MBIM') ? 'mbim' : 'qmi',
+	         controller: length(m[2]) ? +m[2] : 0 };
+};
+
 function legacy_mhi_protocol(name)
 {
-	return match(name ?? '', /^mhi_.*QMI[0-9]*$/i) ? 'qmi'
-		: (match(name ?? '', /^mhi_.*MBIM[0-9]*$/i) ? 'mbim' : null);
+	return mhi_uci_control(name)?.protocol;
 }
 
 // A vendor fork of qmi_wwan speaks QMI just the same: Quectel ships qmi_wwan_q
@@ -199,10 +218,14 @@ export function netdev_for_device(device, fx)
 	fx = fx ?? default_fx();
 
 	let name = basename(device);
-	let legacy = match(name ?? '', /^mhi_.*QMI([0-9]+)$/i);
 
-	if (legacy) {
-		let netdev = sprintf('rmnet_mhi%s', legacy[1]);
+	// the vendor MHI data netdev is "rmnet_mhi" + the CONTROLLER index
+	// (mhi_netdev_quectel.c:2669-2670 in 1.3.8, :2667 in 1.6.0) — the same
+	// index the control port carries, for QMI and MBIM alike
+	let mhi = mhi_uci_control(name);
+
+	if (mhi) {
+		let netdev = sprintf('rmnet_mhi%d', mhi.controller);
 
 		if (fx.access(sprintf('/sys/class/net/%s', netdev)))
 			return netdev;

@@ -114,6 +114,9 @@ export function create(opts)
 	// protocol-neutral scaffolding (set_state / attach_context /
 	// note_connect_success / trip_zero_rx on self; emit + notify_contexts here)
 	let scaffold = modem_common.scaffolding(self, { deps: deps, log: log, rec: rec });
+	// the LTE attach configuration is not a numbered profile (modem_common
+	// attach_owner): the scaffolding's owner check follows the same rule
+	self.attach_numbered = false;
 	let emit = scaffold.emit;
 	let notify_contexts = scaffold.notify_contexts;
 	let sim_block = scaffold.sim_block;
@@ -1306,7 +1309,9 @@ export function create(opts)
 	// already-completed attach with the stale profile re-runs. Best-effort:
 	// firmware without the CID (or any error) just proceeds to step_register.
 	self._apply_attach = function(next) {
-		let ctx = self.contexts[0];
+		// the LTE attach configuration is not a numbered profile: session 1
+		// owns nothing here
+		let ctx = modem_common.attach_owner(self.contexts, self.attach_numbered);
 
 		// no interface bound yet: the first one to bind programs it
 		// (modem_common attach_context, via reapply_sim)

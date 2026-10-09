@@ -1570,4 +1570,56 @@ eq(mc.resolve_diag_port({ config: {}, device: '/dev/cdc-wdm0' }, diag_fx(), null
 	uloop.run();
 }
 
+// --- attach_owner: whose settings the attach profile (profile 1) follows ----
+{
+	let wwand0 = { config: { interface: 'wwand0', mux_id: 1 } };
+	let wwand1 = { config: { interface: 'wwand1', mux_id: 2, profile: 2, auto: false } };
+
+	// the NR7101 case: the auto-0 interface on profile 2 bound first
+	eq(mc.attach_owner([ wwand1, wwand0 ]), wwand0,
+		'attach_owner: the interface dialling profile 1 wins over bind order');
+	// both automatic: only the profile decides
+	let p2 = { config: { interface: 'p2', profile: 2 } };
+	let p1 = { config: { interface: 'p1', mux_id: 1 } };
+	eq(mc.attach_owner([ p2, p1 ]), p1, 'attach_owner: profile 1 decides when both come up automatically');
+	eq(mc.attach_owner([ { config: { apn: '#1', mux_id: 3 } } ])?.config?.apn, '#1',
+		'attach_owner: an apn #1 names profile 1');
+	eq(mc.attach_owner([ { config: { profile: 1, mux_id: 4 } } ])?.config?.profile, 1,
+		'attach_owner: an explicit profile 1 does too');
+
+	// nobody dials profile 1: an automatic interface before an auto-0 one
+	let a = { config: { interface: 'a', profile: 3, auto: false } };
+	let b = { config: { interface: 'b', profile: 4 } };
+	eq(mc.attach_owner([ a, b ]), b, 'attach_owner: then an interface brought up automatically');
+	eq(mc.attach_owner([ a ]), a, 'attach_owner: then the first bound');
+	eq(mc.attach_owner([]), null, 'attach_owner: nothing bound');
+
+	// the EFFECTIVE apn: a wwand_sim `#N` decides which profile is dialled
+	let card = { active_sim: { apn: '#1' } };
+	let sim_p1 = { config: { interface: 's1', apn: '#2' }, modem: card };
+	let raw_p1 = { config: { interface: 's2', apn: '#1' }, modem: { active_sim: { apn: '#2' } } };
+	eq(mc.attach_owner([ raw_p1, sim_p1 ]), sim_p1, 'attach_owner: the per-SIM #N decides, not the interface\'s');
+
+	// MBIM: the attach configuration is no numbered profile — session 1 owns nothing
+	let m_down = { config: { mux_id: 1, auto: false } };
+	let m_auto = { config: { mux_id: 2 } };
+	eq(mc.attach_owner([ m_down, m_auto ], false), m_auto, 'attach_owner: unnumbered (MBIM) skips the profile rule');
+	eq(mc.attach_owner([ m_down, m_auto ]), m_down, 'attach_owner: ...which numbered backends apply');
+}
+
+// a later interface that takes the attach profile over reprograms it: the
+// first one to bind is only provisional
+{
+	let reapplied = 0;
+	let m = { state: 'REGISTERING', contexts: [], reapply_sim: () => reapplied++ };
+	mc.scaffolding(m, { deps: {}, log: () => null, rec: {} });
+
+	m.attach_context({ config: { interface: 'w1', profile: 2, auto: false }, modem_event: () => null });
+	eq(reapplied, 0, 'attach owner: the first bind needs no reapply (nothing pending)');
+	m.attach_context({ config: { interface: 'w0', mux_id: 1 }, modem_event: () => null });
+	eq(reapplied, 1, 'attach owner: a later profile-1 interface reprograms the attach profile');
+	m.attach_context({ config: { interface: 'w2', profile: 3 }, modem_event: () => null });
+	eq(reapplied, 1, 'attach owner: a bind that does not change the owner does not');
+}
+
 done('test_modem_common');

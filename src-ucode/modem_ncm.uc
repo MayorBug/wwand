@@ -611,16 +611,11 @@ export function create(opts)
 			return e;
 		};
 
-		let bound = null;
+		// the interface that owns attach context 1 (modem_common
+		// attach_owner), not merely the first one bound
+		let owner = modem_common.attach_owner(self.contexts);
 
-		for (let ctx in self.contexts) {
-			if (ctx.config?.interface)
-				return eff(ctx.config);
-
-			bound = bound ?? eff(ctx.config);
-		}
-
-		return bound ?? eff(self.config);
+		return eff(owner?.config ?? self.config);
 	};
 
 	// --- recovery / failure ------------------------------------------------
@@ -1285,7 +1280,7 @@ export function create(opts)
 		// down and re-enumerates it, so `self.at` can be null by the time the
 		// call lands. Reading `.send` off it throws inside a uloop callback,
 		// which does not fail the call: it takes the daemon with it. Field-seen
-		// at modem_ncm.uc:1139, and only with `sim_slot` configured — that is
+		// at modem_ncm.uc:1134, and only with `sim_slot` configured — that is
 		// what makes step_simslot walk the second pass at all
 		// (ddimension/wwand#32).
 		if (!self.at)

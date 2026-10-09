@@ -16,6 +16,7 @@ import * as ratmod from 'wwand.codec.schema.rat';
 import * as merge from 'wwand.codec.schema.merge';
 import * as arfcn_bands from 'wwand.codec.arfcn_bands';
 import * as discovery from 'wwand.discovery';
+import * as context_common from 'wwand.context_common';
 
 // scrub NAS cell-info sentinel metrics (-32768 = "not measured") to null so
 // consumers never render the sentinel as a real dBm value.
@@ -191,6 +192,51 @@ const GNSS_START = [
 // that reaches the same client twice says goodbye once; guarded per client,
 // because a plugin's goodbye that throws must not cost the release burst it
 // precedes the CIDs of every client after it.
+// The profile index a context dials, the way the QMI and NCM contexts
+// resolve it (context.uc resolve_profile, context_ncm.uc resolve_cid): an
+// `apn '#N'` names profile N, else `option profile`, else the mux channel,
+// else 1. The APN is the EFFECTIVE one — a matching wwand_sim overrides the
+// interface's (context_common.conn_cfg), and its `#N` is what gets dialled.
+function dialled_profile(ctx)
+{
+	let cfg = ctx?.config;
+	let apn = context_common.conn_cfg(ctx ?? {}, 'apn');
+
+	if (type(apn) == 'string' && substr(apn, 0, 1) == '#')
+		return +substr(apn, 1);
+
+	return +(cfg?.profile ?? 0) || +(cfg?.mux_id ?? 0) || 1;
+}
+
+// The interface whose settings the modem's ATTACH profile follows. The attach
+// bearer the modem brings up on its own is profile 1 (QMI ensure_attach_profile
+// (1), NCM step_attach cid 1), and it IS the data connection of the interface
+// that dials profile 1 — so that interface's APN, IP family and profile flags
+// have to win. Bind order did not: after a modem reset on an NR7101 the
+// `auto 0`, administratively-down `wwand1`, which dials profile 2, bound first
+// and put its APN into the attach profile (2026-10-10). In order:
+//   1. an interface that dials profile 1 — only where the attach IS a
+//      numbered profile (QMI, NCM); MBIM's LTE attach configuration is not,
+//      and a session/mux 1 means nothing for it (`numbered` false);
+//   2. one that is brought up automatically (`auto` not 0);
+//   3. the first one bound, as before.
+// null when nothing is bound.
+export function attach_owner(contexts, numbered)
+{
+	let list = contexts ?? [];
+
+	if (numbered !== false)
+		for (let c in list)
+			if (dialled_profile(c) == 1)
+				return c;
+
+	for (let c in list)
+		if (c?.config?.auto !== false)
+			return c;
+
+	return list[0] ?? null;
+};
+
 export function before_release(clients, log)
 {
 	for (let c in clients) {
@@ -545,6 +591,8 @@ export function scaffolding(self, o)
 	};
 
 	self.attach_context = function(ctx) {
+		let before = attach_owner(self.contexts, self.attach_numbered);
+
 		push(self.contexts, ctx);
 
 		// The init chain reached its attach step before any interface was
@@ -556,6 +604,14 @@ export function scaffolding(self, o)
 			self._attach_pending = false;
 			self.reapply_sim();
 		}
+		// ...and AGAIN when a later interface takes the attach profile over
+		// (attach_owner): the first to bind is only provisional — an `auto 0`
+		// interface on profile 2 binding before the one on profile 1 would
+		// otherwise keep the attach APN for good. reapply_sim writes only what
+		// differs.
+		else if (before && before !== attach_owner(self.contexts, self.attach_numbered) &&
+		         type(self.reapply_sim) == 'function')
+			self.reapply_sim();
 
 		if (self.state == 'READY')
 			ctx.modem_event('ready');

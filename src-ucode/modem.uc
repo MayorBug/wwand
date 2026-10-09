@@ -191,7 +191,7 @@ export function create(opts)
 	// AFTER the cancel pass. The new timer fires with self.dms already null
 	// (modem.uc:1586) and set_opmode dereferences it unguarded (qmi_backend.uc:66),
 	// which in ucode is a throw inside a uloop callback: the daemon dies and procd
-	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:668, step_sim), and
+	// respawns it. The MBIM twin carries the same guard (modem_mbim.uc:671, step_sim), and
 	// every QMI site that re-arms tm.settle needs it too.
 	//
 	// `gen` is captured where the OPERATION begins, not read here — by the time a
@@ -757,7 +757,7 @@ export function create(opts)
 
 			scaffold.resolve_active_sim(id.iccid, id.imsi);
 
-			let ctx = self.contexts[0];
+			let ctx = modem_common.attach_owner(self.contexts);
 
 			if (!ctx?.ensure_attach_profile || !self.dms)
 				return cb ? cb(changed) : null;

@@ -780,7 +780,7 @@ export function install(self, o)
 	// in-flight attach with the stale profile re-runs. See context.uc
 	// ensure_attach_profile / the EMM #33 IPv4-only-attach finding.
 	step_attach_profile = () => {
-		let ctx = self.contexts[0];
+		let ctx = modem_common.attach_owner(self.contexts);
 
 		// no interface bound yet: the first one to bind programs it
 		// (modem_common attach_context) — said, because a skipped attach is

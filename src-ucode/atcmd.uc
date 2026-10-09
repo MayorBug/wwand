@@ -126,6 +126,37 @@ export function modes_fallback_command(model)
 //   lock_5g:  'pci:arfcn:scs:band' (SA only; NSA follows the locked LTE
 //             anchor, the modem answers +CME 902 there — treated as benign)
 //   lock_persist: also store the lock in modem NV (save_ctrl)
+// Quectel SIM hot-plug detection, `option sim_detect` on the modem
+// (ddimension/openwrt-repo#3): AT+QSIMDET=<enable>,<insert_level>, both 0/1
+// (`AT+QSIMDET=?` -> (0,1),(0,1) on the RG650E and RM520N-GL, 2026-10-10;
+// both ship with 1,1). 'high' / 'low' = detection on, a card counting as
+// inserted when the tray's detect pin is high / low; 'off' = detection off.
+// THE LEVEL IS THE BOARD'S, not a preference: with the wrong one the modem
+// takes an inserted card for removed, so it is never guessed — unset leaves
+// the modem's value alone. A setting step (read first, written only when it
+// differs), so it can run on every start. Quectel only — but skipped only for
+// a manufacturer KNOWN to be another one: MBIM and NCM learn it (AT+CGMI) only
+// after this init list has run, and gating on it there would make the option
+// do nothing on exactly those backends. Whoever sets it knows the modem; a
+// non-Quectel answers ERROR and the step logs one warning.
+const SIM_DETECT = {
+	high: { set: 'AT+QSIMDET=1,1', want: '\\+QSIMDET: *1, *1' },
+	low:  { set: 'AT+QSIMDET=1,0', want: '\\+QSIMDET: *1, *0' },
+	off:  { set: 'AT+QSIMDET=0,1', want: '\\+QSIMDET: *0,' },
+};
+
+export function sim_detect_commands(info, cfg)
+{
+	let d = SIM_DETECT[cfg?.sim_detect];
+	let mfr = lc(sprintf('%s', info?.manufacturer ?? ''));
+
+	if (!d || (mfr != '' && !match(mfr, /quectel/)))
+		return [];
+
+	return [ { check: 'AT+QSIMDET?', want: d.want, set: d.set,
+	           note: sprintf('SIM detection %s', cfg.sim_detect) } ];
+};
+
 export function cell_lock_commands(cfg)
 {
 	let cmds = [];

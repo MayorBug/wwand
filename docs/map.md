@@ -66,6 +66,7 @@ row. That is the whole maintenance rule.
 
 | Question | Answer |
 |---|---|
+| How is a SIM re-read without a modem reset, and who keeps the modem watching for a swapped card? | `simops.uc modem_sim_reinit` (ubus `modem_sim_reinit`: `sim.uc power_cycle`, then `simops.uc card_changed`); hot-plug detection on a Quectel is the modem option `sim_detect`, applied as an init setting by `atcmd.uc sim_detect_commands`. |
 | How many slots are there, and is that the modem's answer or ours? | `sim.uc slot_status` builds the rows; `sim.uc enumerated` says whether any row is a placeholder. A caller that ACTS on slot topology must ask the second. |
 | Why was the SIM power-cycled with "sim … did not complete" in the log? | `sim.uc refresh_fallback`: the card announced a re-initialisation (QMI: `sim.uc install_refresh`, UIM REFRESH START; MBIM: `modem_mbim.uc _install_indications`, ready-state leaving INITIALIZED) and did not finish it within `refresh_end`; it gets the eSIM switch's apply. |
 | Where does the status page's eUICC / IPA row come from? | `daemon.uc probe_euicc` (once per modem object, from the status tick) → `sim.uc card_euicc_info` (ISD-R SELECT answer, `fci_iot_info`; GetEUICCInfo1 6985 = IPAe) → status `euicc`. |

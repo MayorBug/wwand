@@ -719,6 +719,29 @@ eq(rd.repower_plan('m0').error, 'multi_modem_needs_reset_gpio',
 eq(rd.repower_modem('m0').error, 'multi_modem_needs_reset_gpio',
 	'plan: the action agrees with the plan');
 
+// --- modem_sim_reinit (ddimension/openwrt-repo#3): the card in the ACTIVE
+// slot is power-cycled and then re-read like after a slot switch
+{
+	let uim_calls = [];
+	let fm = {
+		stop: () => null, active_slot: 2,
+		uim: { request: (name, args, cb) => { push(uim_calls, [ name, args.slot ]); cb(null, {}); } },
+	};
+
+	rd.modems = { m0: { cfg: {}, modem: fm } };
+	fm._esim_be = 'stale';
+	rd.modem_sim_reinit('m0', (err, res) => {
+		eq(err, null, 'sim reinit: no error');
+		eq(res.slot, 2, 'sim reinit: the active slot');
+	});
+	eq(uim_calls, [ [ 'POWER_OFF_SIM', 2 ], [ 'POWER_ON_SIM', 2 ] ], 'sim reinit: card powered off and on');
+	eq(fm._esim_be, null, 'sim reinit: card caches dropped, as after a slot switch');
+
+	// no way to reset the card: a clean error, nothing else touched
+	rd.modems = { m0: { cfg: {}, modem: { stop: () => null } } };
+	rd.modem_sim_reinit('m0', (err) => eq(err?.error, 'sim_transport', 'sim reinit: no reset path -> clean error'));
+}
+
 rd.shutdown();
 
 // --- the recovery ladder, as status reports it ------------------------------

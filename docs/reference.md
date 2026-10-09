@@ -84,7 +84,11 @@ wwand section types plus the netifd interface — no separate config file:
   and **`repower_time`** (seconds, default 30) — how long the modem is held
   de-powered during a recovery power-cycle, or held in reset when `reset_gpio` is used —
   and **`reset_fallback`** (seconds, default 30) — how long an admin `modem_reset` waits
-  for the modem's own reset to take it off the bus before the reset line is pulsed.
+  for the modem's own reset to take it off the bus before the reset line is pulsed —
+  and **`sim_detect`** (`high`\|`low`\|`off`, Quectel only) — SIM hot-plug detection
+  (`AT+QSIMDET`): on with the tray's detect pin high / low meaning "card inserted", or
+  off. The level is the board's wiring, so unset leaves the modem's value alone; with
+  the wrong level the modem takes an inserted card for removed.
 - **`config wwand_sim '<name>'`** *(optional)* — a per-SIM override, matched at
   runtime to the inserted card by `option modem` + `option iccid`: overrides the
   modem's `pincode` and, optionally, `apn`/`auth`/`username`/`password` and
@@ -1652,6 +1656,7 @@ every method to it.
 | `modem_carrier_config` | `modem`, `op`, `id` | carrier configuration (MBN) over QMI PDC. `op` = `list` (every config with its description and version) \| `get` (the active one, plus `pending` when a switch is waiting for a reset) \| `set` (select `id`). A selection takes effect only after a **modem reset** and is reported as `pending` until then. The protocol-native form of what `AT+QMBNCFG` does on Quectel alone; wwand selects among the blobs the vendor shipped and never writes or deletes one |
 | `modem_probe` | — | detected modems for the stable-binding picker: `managed[]` (live IMEI/model/device) + `present[]` (every control device in sysfs with its iSerial, read pre-open) |
 | `modem_sim_switch_slot` | `modem`, `slot` | switch the active physical SIM slot (drops the connection) |
+| `modem_sim_reinit` | `modem` | re-initialise the card in the active slot without a modem reset: power it off and on (QMI UIM, MBIM UICC reset, or an AT CFUN cycle), then re-read it as after a slot switch — for a card swapped in a slot the modem does not watch. The connection drops and comes back. Result `{ slot }` |
 | `modem_sim_pin_lock` | `modem`, `pin`, `enable` | enable/disable the SIM PIN lock (QMI first, AT fallback; idempotent) |
 | `modem_sim_pin_verify` | `modem`, `pin?` | manual PIN release past the low-retry safety block (the daemon refuses to auto-enter with ≤1 attempt left, to avoid a PUK lock); `pin` overrides the configured one for this attempt (write ACL) |
 | `modem_sim_puk` | `modem`, `puk`, `new_pin` | **PUK entry**: unblock a PUK-locked SIM and set a NEW PIN in one operation (UIM Unblock PIN → native MBIM PIN/PUK1 → `AT+CPIN="puk","pin"`; the chain never re-tries a PUK on a second transport — wrong PUKs brick the SIM). PUK = 8 digits, new PIN 4–8 digits. On success the modem restarts its bring-up with the new PIN as one-shot override; **update the configured `pincode` afterwards** (write ACL) |

@@ -313,6 +313,24 @@ eq(atcmd.cell_lock_commands({ lock_4g: [ '1300:246', '1444:100' ] }),
 eq(atcmd.cell_lock_commands({ lock_5g: '242:431070:15:1' }),
 	[ 'AT+QNWLOCK="common/5g",242,431070,15,1' ], 'lock: 5g sa');
 eq(atcmd.cell_lock_commands({}), [], 'lock: nothing configured');
+
+// SIM hot-plug detection (openwrt-repo#3): a read-first setting step on a
+// Quectel, nothing anywhere else and nothing when unset
+{
+	let q = { manufacturer: 'Quectel' };
+	let st = atcmd.sim_detect_commands(q, { sim_detect: 'low' });
+	eq([ st[0]?.check, st[0]?.set ], [ 'AT+QSIMDET?', 'AT+QSIMDET=1,0' ], 'simdet: low = on, level 0');
+	ok(match('+QSIMDET: 1,0', regexp(st[0].want)) && !match('+QSIMDET: 1,1', regexp(st[0].want)),
+		'simdet: the held value is recognised, the other level is not');
+	ok(match('+QSIMDET: 0,1', regexp(atcmd.sim_detect_commands(q, { sim_detect: 'off' })[0].want)),
+		'simdet: off matches whatever level is stored');
+	eq(atcmd.sim_detect_commands(q, {}), [], 'simdet: unset leaves the modem alone');
+	eq(atcmd.sim_detect_commands({ manufacturer: 'Fibocom' }, { sim_detect: 'high' }), [],
+		'simdet: a vendor known to be another gets nothing sent');
+	// MBIM/NCM run the AT init before AT+CGMI identified the modem
+	eq(length(atcmd.sim_detect_commands({}, { sim_detect: 'high' })), 1,
+		'simdet: a manufacturer not known yet is no reason to skip');
+}
 eq(atcmd.cell_lock_commands({ lock_4g: 'garbage' }), [], 'lock: malformed ignored');
 eq(atcmd.cell_lock_commands({ lock_persist: true }), [], 'lock: persist alone is no-op');
 

@@ -234,6 +234,32 @@ export function install(self, o)
 		});
 	};
 
+	// Re-initialise the SIM in the active slot without resetting the modem:
+	// power the card off and on (sim.power_cycle — QMI UIM, MBIM UICC reset,
+	// or an AT CFUN cycle), then re-read it as after a slot switch. For a card
+	// swapped in a slot the modem does not watch (ddimension/openwrt-repo#3);
+	// far lighter than a modem reset. A data session drops and comes back by
+	// the normal transient-loss path.
+	self.modem_sim_reinit = function(ref, cb) {
+		let entry = check_modem(ref, cb);
+
+		if (!entry)
+			return;
+
+		let m = entry.modem;
+		let slot = +(m.active_slot ?? m.config?.sim_slot ?? 1) || 1;
+
+		log('notice', sprintf('modem %s: re-initialising the SIM in slot %d', ref, slot));
+
+		sim.power_cycle(m, slot, (err) => {
+			if (err)
+				return cb({ error: 'sim_transport', detail: err });
+
+			self.card_changed(ref, sprintf('SIM slot %d re-initialised', slot));
+			cb(null, { slot: slot });
+		});
+	};
+
 	self.modem_sim_pin_lock = function(ref, pin, enable, cb) {
 		let entry = check_modem(ref, cb);
 

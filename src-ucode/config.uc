@@ -245,6 +245,7 @@ export function modem_defaults(over)
 {
 	return {
 		device: null, netdev: null, usb_path: null, reset_gpio: null, reset_fallback: null,
+		sim_detect: null,
 		serial: null, imei: null,   // stable identity anchors (USB iSerial / IMEI)
 		repower_time: null,         // recovery power-cycle off / reset hold seconds
 		pincode: null, modes: null, mcc: null, mnc: null,
@@ -333,7 +334,7 @@ function apply_globals(s, result)
 // instead of 'pincode' cost a HW debugging session — the daemon saw "PIN
 // required but none configured" and safety-blocked the SIM).
 const MODEM_KNOWN_OPTS = [ 'protocol', 'device', 'netdev', 'path', 'usb_path', 'serial',
-	'imei', 'repower_time', 'reset_gpio', 'reset_fallback', 'pincode', 'modes', 'mcc', 'mnc',
+	'imei', 'repower_time', 'reset_gpio', 'reset_fallback', 'sim_detect', 'pincode', 'modes', 'mcc', 'mnc',
 	'mux', 'dl_datagram_max_size', 'tty', 'diag_port', 'at2_external', 'gnss', 'gnss_set_time', 'nitz_time', 'fcc_auth',
 	'at_init', 'location', 'delay', 'failreboot', 'proto_error_limit',
 	'unarmed_reset_after', 'card_hold',
@@ -465,6 +466,10 @@ function modem_from_section(s, warnings)
 		// seconds a soft reset may take before the reset line is pulsed
 		// (hwops.modem_reset); unset = 30
 		reset_fallback: (s.reset_fallback != null && s.reset_fallback != '') ? +s.reset_fallback : null,
+		// Quectel SIM hot-plug detection: 'high' | 'low' | 'off' (atcmd.uc
+		// sim_detect_commands); anything else is dropped, never guessed
+		sim_detect: (index([ 'high', 'low', 'off' ], lc(sprintf('%s', s.sim_detect ?? ''))) >= 0)
+			? lc(s.sim_detect) : null,
 		pincode: s.pincode,
 		modes: s.modes,
 		mcc: s.mcc,

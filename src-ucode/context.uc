@@ -57,6 +57,27 @@ const PDP_MAP = {
 	ipv4v6: wdsmod.PDP_TYPE_IPV4V6,
 };
 
+// The optional settings an interface may put into the modem profile it dials.
+// Each is a stored 3GPP profile setting — WDS Modify Profile input and Get
+// Profile Settings output, both since libqmi 1.36 (qmi-service-wds.json:
+// 372-377 Address Allocation Preference, 417-422 CLAT Enabled, 424-428 IPv6
+// Prefix Delegation; libqmi 1.38). All TRI-STATE in the config: an option
+// left unset leaves whatever the profile holds, because the write goes to
+// modem NV and a user who never asked should not get one. `key` is the schema
+// field (wds.uc), `opt` the interface option (config.uc), `v6` limits a flag to
+// a connection that carries IPv6, `map` turns a word option into the enum.
+const PROFILE_FLAGS = [
+	{ key: 'prefix_delegation', opt: 'ipv6_pd', label: 'IPv6 prefix delegation', v6: true },
+	// 464XLAT in the modem (RFC 6877) — only an IPv6 bearer has something to
+	// translate onto
+	{ key: 'clat', opt: 'clat', label: 'CLAT', v6: true },
+	// QmiWdsAddressAllocationPreference (qmi-enums-wds.h:2107-2110, 1.38):
+	// how the IPv4 address reaches the UE — in the PDN setup (NAS) or by DHCP
+	// over the bearer afterwards
+	{ key: 'address_allocation', opt: 'address_allocation', label: 'address allocation',
+	  map: { nas: 0, dhcp: 1 } },
+];
+
 // The same three PDP types as PDP_MAP, spelled the way 3GPP TS 27.007 AT+CGDCONT
 // wants them. Used only by the AT fallback below. (Deliberately a local copy and
 // not an import of ncm_vendors' PDP_STR: that module ships in wwand-ncm, this
@@ -328,6 +349,37 @@ export function create(opts)
 		}, { timeout: AT_DEFINE_TIMEOUT_MS });
 	};
 
+	// The profile flag wanted for IPv6 prefix delegation: 1/0, or null for
+	// "leave it". An IPv4-only connection has no prefix to delegate, so the
+	// flag is not touched there either way.
+	// The optional profile flags this connection asks for (PROFILE_FLAGS),
+	// as [ { key, label, want } ] — only the ones set, and only those that
+	// apply to the connection's IP family.
+	let flags_wanted = () => {
+		let v6 = (context_common.effective_pdp(self) != 'ipv4');
+		let out = [];
+
+		for (let f in PROFILE_FLAGS) {
+			let v = self.config?.[f.opt];
+
+			if (v == null || (f.v6 && !v6))
+				continue;
+
+			push(out, { key: f.key, label: f.label, want: f.map ? f.map[v] : (v ? 1 : 0) });
+		}
+
+		return filter(out, (f) => f.want != null);
+	};
+
+	// The prefix-delegation flag alone: 1/0, or null when not asked for.
+	let pd_wanted = () => {
+		for (let f in flags_wanted())
+			if (f.key == 'prefix_delegation')
+				return f.want;
+
+		return null;
+	};
+
 	check_pdp_type = (profile, done, pre) => {
 		let wds = self.modem.wds_cfg;
 		let want = PDP_MAP[context_common.effective_pdp(self)];
@@ -354,26 +406,61 @@ export function create(opts)
 					profile.index));
 			}
 
-			if (data.pdp_type == want) {
+			let req = { profile: { type: wdsmod.PROFILE_TYPE_3GPP, index: profile.index } };
+
+			if (data.pdp_type == want)
 				log('debug', sprintf('profile pdp type %d unchanged', want));
-				return done();
+			else {
+				log('notice', sprintf('changing profile %d pdp type %J -> %d',
+					profile.index, data.pdp_type, want));
+				req.pdp_type = want;
 			}
 
-			log('notice', sprintf('changing profile %d pdp type %J -> %d',
-				profile.index, data.pdp_type, want));
+			// An absent TLV in the read is compared as "differs": a stack that
+			// does not report the flag cannot be shown to hold it already.
+			let flags = flags_wanted();
 
-			wds.request('MODIFY_PROFILE', {
-				profile: { type: wdsmod.PROFILE_TYPE_3GPP, index: profile.index },
-				pdp_type: want,
-			}, (e2) => {
+			for (let f in flags) {
+				if (data[f.key] !== f.want) {
+					log('notice', sprintf('changing profile %d %s %J -> %d',
+						profile.index, f.label, data[f.key], f.want));
+					req[f.key] = f.want;
+				}
+				else
+					log('debug', sprintf('profile %s %d unchanged', f.label, f.want));
+			}
+
+			let sent = filter(flags, (f) => req[f.key] != null);
+
+			if (req.pdp_type == null && !length(sent))
+				return done();
+
+			let write;
+			write = (r) => wds.request('MODIFY_PROFILE', r, (e2) => {
 				if (torn_down(e2, wds))
 					return;
+
+				// A stack that predates a TLV may refuse the whole message for
+				// it. The pdp type is what the dial depends on, so it gets a
+				// second write of its own; the flags are reported, not retried
+				// one by one — which of them it was, the answer does not say.
+				if (e2 && length(filter(sent, (f) => r[f.key] != null))) {
+					log('warn', sprintf('profile %d: %s not accepted: %J', profile.index,
+						join(', ', map(sent, (f) => f.label)), e2));
+
+					if (r.pdp_type == null)
+						return done();
+
+					return write({ profile: r.profile, pdp_type: r.pdp_type });
+				}
 
 				if (e2)
 					log('warn', sprintf('pdp type change failed: %J', e2));
 
 				done();
 			});
+
+			write(req);
 		};
 
 		// reuse the profile data the guard in prepare() already fetched
@@ -481,7 +568,14 @@ export function create(opts)
 			                          (c_user != null && data.username != c_user) ||
 			                          pass_pending);
 
-			if (!need_apn && !need_pdp && !need_auth) {
+			// When the attach profile is the data profile (no init_apn), the
+			// data bearer IS the one brought up at attach, before wwand dials:
+			// a profile flag (PROFILE_FLAGS) written only at dial time reaches
+			// the network at the NEXT attach. Written here it rides the
+			// re-attach this function already triggers.
+			let flags = init ? [] : filter(flags_wanted(), (f) => data[f.key] !== f.want);
+
+			if (!need_apn && !need_pdp && !need_auth && !length(flags)) {
 				log('debug', sprintf('attach profile %d up to date (apn %J pdp %J)',
 					index, data.apn, data.pdp_type));
 				return done(false);
@@ -508,30 +602,53 @@ export function create(opts)
 			if (want_pdp != null)
 				mod.pdp_type = want_pdp;
 
-			log('notice', sprintf('attach profile %d: apn %s%s, pdp %J->%J%s',
+			for (let f in flags)
+				mod[f.key] = f.want;
+
+			log('notice', sprintf('attach profile %d: apn %s%s, pdp %J->%J%s%s',
 				index, need_apn
 					? sprintf('%s (was %s)', want_apn == '' ? '(network default)' : sprintf('%J', want_apn),
 						card_apn == '' ? '(network default)' : sprintf('%J', card_apn))
 					: sprintf('%J', card_apn),
 				init ? ' (init_apn — distinct from the data APN)' : '',
 				data.pdp_type, want_pdp,
-				need_auth ? sprintf(', auth %J%s', c_auth ?? '(kept)', c_user != null ? sprintf(' user %J', c_user) : '') : ''));
+				need_auth ? sprintf(', auth %J%s', c_auth ?? '(kept)', c_user != null ? sprintf(' user %J', c_user) : '') : '',
+				join('', map(flags, (f) => sprintf(', %s %J->%d', f.label, data[f.key], f.want)))));
 
-			wds.request('MODIFY_PROFILE', mod, (e2) => {
+			let write;
+			write = (m) => wds.request('MODIFY_PROFILE', m, (e2) => {
 				if (torn_down(e2, wds))
 					return;
 
+				// the flags must not cost the attach its APN: a stack that
+				// refuses one of the TLVs gets the same write again without them
+				if (e2 && length(filter(flags, (f) => m[f.key] != null))) {
+					log('warn', sprintf('attach profile %d: %s not accepted: %J', index,
+						join(', ', map(flags, (f) => f.label)), e2));
+					let rest = { ...m };
+
+					for (let f in flags)
+						delete rest[f.key];
+
+					if (length(rest) == 1)
+						return done(false);
+
+					return write(rest);
+				}
+
 				if (e2)
 					log('warn', sprintf('attach profile %d modify failed: %J', index, e2));
-				else if (mod.password != null)
+				else if (m.password != null)
 					// Latch only on SUCCESS. Set before the answer, a rejected
 					// or cancelled write suppressed the password on every later
 					// retry with this modem object — the credential would then
 					// never reach the profile at all.
-					self.modem._attach_pass = mod.password;
+					self.modem._attach_pass = m.password;
 
 				done(!e2);
 			});
+
+			write(mod);
 		});
 	};
 
@@ -783,6 +900,63 @@ export function create(opts)
 		});
 	};
 
+	// The prefix the network DELEGATED to this PDN, as the modem holds it
+	// (wds.uc GET_DELEGATED_PREFIX, vendor message 0x00AC). Not a DHCPv6
+	// exchange of the router's own: on these modems the bearer's DHCPv6 is the
+	// modem's business, and a Solicit with IA_PD from the host on the rmnet
+	// link went unanswered for as long as anyone watched (31 sent, 0 back,
+	// RM520N-GL on a PD APN, 2026-10-09). Read on every settings fetch, so a
+	// prefix the network hands out later — or takes back — reaches netifd
+	// through the ordinary settings-change renew.
+	//
+	// ONLY when the interface asked for PD (`ipv6_pd '1'`). INTERNAL (3) is
+	// the modem's "no prefix on this PDN", not a fault; INVALID_QMI_COMMAND
+	// (71) means the modem has no such message, remembered per modem object
+	// so it is asked once. Neither feeds the recovery ladder. `bearer` is the
+	// modem's own address for the PDN (TLV 0x25), which is what its apps side
+	// passes. cb(err) with err only for a cancelled read, which the settings
+	// poll must see (context_monitor_qmi.uc refresh_settings).
+	let read_delegated = (fam, bearer, cb) => {
+		if (pd_wanted() != 1 || !bearer || self.modem._pd_unsupported)
+			return cb(null);
+
+		fam.client.request('GET_DELEGATED_PREFIX', { requestor: bearer }, (err, data) => {
+			if (err?.error == 'cancelled')
+				return cb(err);
+
+			let p = (!err && data?.prefix?.addr && data.prefix.plen)
+				? sprintf('%s/%d', data.prefix.addr, data.prefix.plen) : null;
+
+			if (err?.error == 'qmi' && err.code == 71) {
+				self.modem._pd_unsupported = true;
+				log('info', 'IPv6 prefix delegation: this modem cannot report a delegated prefix (no QMI WDS 0x00AC) — only the profile flag is set');
+			}
+			else if (err && !(err.error == 'qmi' && err.code == 3))
+				log('debug', sprintf('delegated prefix read failed: %J', err));
+
+			if (p != fam._pd_last) {
+				if (p)
+					log('notice', sprintf('ipv6 delegated prefix %s', p));
+				else if (fam._pd_last)
+					log('notice', sprintf('ipv6 delegated prefix %s withdrawn', fam._pd_last));
+
+				fam._pd_last = p;
+			}
+			// the first answer of a call is logged even when it is "none" —
+			// otherwise a working read and a read that never happened look
+			// the same on the device
+			else if (!fam._pd_read && !p && !self.modem._pd_unsupported)
+				log('debug', 'ipv6 delegated prefix: none on this PDN (the network delegated nothing)');
+
+			fam._pd_read = true;
+
+			if (p)
+				fam.settings.delegated = p;
+
+			cb(null);
+		}, { no_recovery: true, timeout: 10000 });
+	};
+
 	fetch_settings = (family, done) => {
 		let fam = self.families[sprintf('%d', family)];
 
@@ -826,6 +1000,9 @@ export function create(opts)
 				log_family_config(fam, sprintf('ipv6 config: %s/%d gw %s dns [%s] mtu %J',
 					fam.settings.addr, fam.settings.plen, fam.settings.gateway,
 					join(' ', fam.settings.dns), fam.settings.mtu));
+
+				return read_delegated(fam, data.ipv6?.addr,
+					(cerr) => done(cerr ? { stage: 'settings', err: cerr } : null));
 			}
 
 			done(null);

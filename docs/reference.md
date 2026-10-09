@@ -109,7 +109,7 @@ wwand section types plus the netifd interface — no separate config file:
   off; on a reconnect that changes the IP, do a netifd link down→up instead of an
   in-place renew so dependent tunnels/xfrm/IPsec re-follow the new local address —
   costs the WAN's own IPv6-PD/VRF a rebuild + a brief blip; WireGuard doesn't need
-  it) + the usual netifd knobs. Several interfaces referencing one `wwand_modem` =
+  it), `ipv6_pd`, `clat`, `address_allocation` (see below) + the usual netifd knobs. Several interfaces referencing one `wwand_modem` =
   multiple mux contexts on one modem.
 - **`config wwand_globals 'globals'`** — `log_level`, `hold_max`, `write_device`
   (write the resolved L3 name back onto interfaces, default on), `autosetup`
@@ -665,7 +665,8 @@ config interface 'wan'
 	option mux_id '1'                # QMAP channel: 1-254, or 'auto'
 	option profile '1'               # 3GPP profile (CID) for the attach + bearer
 	                                 #   (default: mux_id, else 1)
-	option apn 'internet'            # or '#2' = use modem profile 2 untouched
+	option apn 'internet'            # or '#2' = keep profile 2's APN/login; pdp_type
+	                                 #   and the profile flags below still apply
 	option pdp_type 'ipv4v6'         # ipv4|ipv6|ipv4v6
 	option auth 'none'               # none|pap|chap|both
 	option username ''
@@ -674,9 +675,66 @@ config interface 'wan'
 	option use_pushed_mtu '1'        # apply the network-advertised MTU
 	option use_pushed_prefix '0'     # keep the pushed IPv4 prefix (default: /32 p-t-p)
 	option settings_poll '300'       # re-check pushed IP/DNS/MTU every N s (0 = off)
+	option ipv6_pd ''                # QMI + NCM/Quectel: profile flag "IPv6 prefix
+	                                 #   delegation", 1 = allow, 0 = clear, unset = leave it
+	option clat ''                   # QMI: profile flag "CLAT Enabled" (464XLAT in
+	                                 #   the modem), same tri-state, IPv6 bearers only
+	option address_allocation ''     # QMI + NCM: profile preference nas|dhcp, unset = leave it
 	option metric '10'               # metric / peerdns / defaultroute / ip4table /
 	                                 #   ip6table / VRF are handled by netifd as usual
 ```
+
+**IPv6 prefix delegation (`ipv6_pd`; QMI, and NCM on Quectel).** Two halves, both on the
+modem side; the router runs no DHCPv6 client of its own on the bearer, because
+on these modems the bearer's DHCPv6 is the modem's business (a host Solicit
+with IA_PD on the rmnet link went unanswered: RM520N-GL, 2026-10-09).
+
+- **The request** is a flag in the 3GPP profile the modem dials (WDS Modify /
+  Get Profile Settings TLV 0xDF, libqmi 1.38 `qmi-service-wds.json:424-428`;
+  Quectel shows the same flag as `AT+QIP6CFG="PD_enable",<cid>`). With
+  `ipv6_pd '1'` wwand writes it on the dialled profile and on the attach
+  profile (when that is also the data profile, its bearer comes up at attach,
+  before any dial), read first and only when it differs; `'0'` clears it;
+  unset leaves whatever the profile holds. An `ipv4` connection does not touch
+  it. A modem that rejects the TLV gets a warning and the dial goes on.
+- **The prefix** is read back from the modem with Qualcomm's vendor message
+  WDS `0x00AC` ("get delegated IPv6 prefix" — not in libqmi; layout from the
+  RG650E firmware, see `codec/schema/wds.uc` GET_DELEGATED_PREFIX), on every
+  settings fetch, so a prefix delegated later — or withdrawn — reaches netifd
+  through the ordinary renew. The shim then hands netifd the delegated prefix
+  instead of the RFC 7278 /64 extension, and, with source routing on, a
+  default route sourced from it. A PDN with nothing delegated answers
+  `INTERNAL` (logged at debug, not an error); a modem without the message is
+  remembered and not asked again. `AT+QIP6CFG="PD_addr",<cid>` reports the
+  same state (`::/0` = none).
+
+The flag is necessary, not sufficient: the subscription has to delegate.
+
+**On NCM** (AT-driven) the same two halves exist only where the vendor has
+them: on Quectel, `AT+QIP6CFG="PD_enable",<cid>` is the flag (written read-first
+on the attach context and on the dialled cid, before the dial) and
+`AT+QIP6CFG="PD_addr",<cid>` the delegated prefix (`::/0` = none), read after
+connecting and on every settings refresh. Other NCM vendors have no AT command
+for it, and the option does nothing there. **MBIM** has no such field at all —
+neither its provisioned contexts nor the LTE attach configuration carry one
+(libmbim 1.32) — so the option has no effect on an MBIM modem.
+
+**CLAT and address allocation (`clat`, `address_allocation`).** The
+same kind of stored profile setting as the PD flag, through the same code
+(`context.uc PROFILE_FLAGS`): read first, written only when they differ, on the
+dialled profile and on the attach profile, unset = left alone. `clat` is the
+profile's "CLAT Enabled" (TLV 0xDE, libqmi 1.38 `qmi-service-wds.json:417-422`):
+464XLAT done by the modem on an IPv6-only bearer, so it is not touched for an
+`ipv4` connection. `address_allocation` is "Address Allocation Preference"
+(TLV 0x2D, json:372-377): `nas` = the IPv4 address comes with the PDN setup,
+`dhcp` = by DHCP over the bearer afterwards. Whether a modem and network honour
+either is theirs to decide; wwand only puts the setting into the profile.
+
+On **NCM**, `address_allocation` is the standard `<IPv4AddrAlloc>` of
+`AT+CGDCONT` (the 7th parameter, 3GPP TS 27.007), so it works for every vendor;
+it is compared on the `AT+CGDCONT?` read-back like the APN. `clat` has no AT
+equivalent and is QMI only. **MBIM** carries neither (libmbim 1.32: no field in
+the provisioned contexts or the LTE attach configuration).
 
 **Attach profile.** Before registration, wwand programs the LTE **attach
 profile** (CID `profile`, normally 1) from the primary context's `apn` +
@@ -926,7 +984,8 @@ config interface 'wan'
 `apn` empty to attach with the network's default APN — wwand writes the
 configured APN into the modem's attach profile, an unset one as empty, so a
 stale APN in profile 1 (from the modem's previous life, say) never stays. A
-`#N` APN alone leaves profile N as the modem has it. A changed APN, PDP type
+`#N` APN leaves profile N's APN and login as the modem has them (the
+configured PDP type and explicit profile flags still apply). A changed APN, PDP type
 or login takes effect on the running modem at once (the attach profile is
 re-programmed on reload). The L3 device gets
 the next free `wwandN` name and is written back as `option device`.
@@ -1331,9 +1390,19 @@ so the DMZ's `ip6assign '64'` takes addresses from that same `/64`. One shared
 `/64` is enough for a single downstream network.
 
 For a **separately delegated** prefix (a real IA_PD — e.g. a `/56` the carrier
-delegates so the DMZ gets its own `/64`), run a DHCPv6-PD client **on top of** the
-wwand interface. wwand keeps managing the WAN GUA; a stacked `dhcpv6` logical
-interface requests only the prefix:
+delegates so the DMZ gets its own `/64`) on a **QMI** modem, set
+`option ipv6_pd '1'` on the wwand interface. wwand puts the request into the
+modem profile and reads the prefix back from the modem (vendor WDS `0x00AC`, see
+"IPv6 prefix delegation" above); netifd then has it as the interface's prefix,
+and the DMZ draws its `/64` from it exactly as above (`option ip6assign '64'`),
+advertised by odhcpd. No stacked DHCPv6 client is needed — and on these modems
+one does not help: a Solicit with IA_PD sent by the router on the rmnet link was
+never answered (RM520N-GL on a PD APN, 31 sent / 0 back, 2026-10-09), because
+the bearer's DHCPv6 is the modem's business. Where the network delegates
+nothing, you keep the shared `/64` above — nothing breaks.
+
+On **MBIM and NCM** there is no such readback. The one thing to try there is a
+stacked `dhcpv6` interface on the wwand device:
 
 ```
 config interface 'wan6'
@@ -1343,22 +1412,10 @@ config interface 'wan6'
 	option reqprefix 'auto'
 ```
 
-The DMZ then draws its `/64` from the delegated prefix exactly as above
-(`option ip6assign '64'`), advertised by odhcpd.
-
-**Two hard constraints:**
-
-- **The carrier must actually delegate.** 3GPP prefix delegation is a DHCPv6
-  IA_PD exchange with the network (P-GW); there is no QMI/MBIM path to a shorter
-  prefix. Where the network delegates nothing, you fall back to the shared `/64`
-  above — nothing breaks.
-- **The DHCPv6 client needs a global source address.** The stacked interface
-  **must** ride on `@wan` so it inherits the wwand-configured GUA: over the
-  cellular bearer a link-local source usually does not carry, and odhcp6c has no
-  option to force the source — the kernel selects it (RFC 6724) and prefers a
-  link-local when one exists. If your bearer drops link-local DHCPv6, IA_PD needs
-  an odhcp6c that pins the global source; verify with
-  `tcpdump -i <wan-l3dev> udp port 547` which source the SOLICIT uses.
+It needs a global source address (riding on `@wan` gives it the GUA; the kernel
+prefers a link-local, RFC 6724, and over a cellular bearer that often does not
+carry) — check with `tcpdump -i <wan-l3dev> udp port 547` which source the
+SOLICIT uses — and it only works where the modem passes the exchange through.
 
 **How prefix delegation works on mobile (background).** In 3GPP every IPv6 /
 IPv4v6 PDN connection is assigned its own `/64` by the network via SLAAC — the
@@ -1367,13 +1424,12 @@ single `/64` is exactly what wwand configures and (RFC 7278) shares. Delegating 
 *separate*, shorter prefix is an **optional DHCPv6-PD feature** (RFC 8415; 3GPP
 TS 29.061, overview in RFC 6459) that the operator must provision **per APN**: the
 router is the requesting router, the P-GW the delegating server (often backed by
-RADIUS, RFC 4818). Most consumer APNs do not enable it — a PD `SOLICIT` then goes
-unanswered and you are left with the shared `/64`; the standard-compliant
-link-local source is fine there, the network simply offers no PD. Verified on this
-project's test SIMs — a consumer web/dial-up APN and a hybrid-stack APN both
-return no delegation on either a link-local or a global
-source. Business / M2M APNs with explicit PD provisioning are where a delegated
-prefix actually appears.
+RADIUS, RFC 4818). Most consumer APNs do not enable it, and you are left with the shared `/64`:
+on this project's test SIMs a consumer web/dial-up APN and a hybrid-stack APN
+return no delegation. Business / M2M APNs with explicit PD provisioning are
+where a delegated prefix is expected; whether the modem then fetches it on its
+own, or only when asked, is not settled by anything here yet (STATUS.md,
+"Profile flags").
 
 ## Performance & tuning
 

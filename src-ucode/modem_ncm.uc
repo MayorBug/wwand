@@ -62,6 +62,8 @@ export const build_pdp_setup = ncm_vendors.build_pdp_setup;
 export const unsendable_conn = ncm_vendors.unsendable_conn;
 export const parse_cgdcont = ncm_vendors.parse_cgdcont;
 export const pdp_setup_matches = ncm_vendors.pdp_setup_matches;
+export const sync_pd = ncm_vendors.sync_pd;
+export const read_pd_prefix = ncm_vendors.read_pd_prefix;
 
 // --- CGCONTRDP parsing (shared with context_ncm.uc) --------------------------
 //
@@ -1283,7 +1285,7 @@ export function create(opts)
 		// down and re-enumerates it, so `self.at` can be null by the time the
 		// call lands. Reading `.send` off it throws inside a uloop callback,
 		// which does not fail the call: it takes the daemon with it. Field-seen
-		// at modem_ncm.uc:1137, and only with `sim_slot` configured — that is
+		// at modem_ncm.uc:1139, and only with `sim_slot` configured — that is
 		// what makes step_simslot walk the second pass at all
 		// (ddimension/wwand#32).
 		if (!self.at)
@@ -1602,20 +1604,45 @@ export function create(opts)
 		// APN from the modem's previous life flapped a card, 2026-10-04)
 		let apn = cfg.apn;
 		let configured = !(apn != null && substr(apn, 0, 1) == '#');
+		// The engine this attach started on. A stop between two hops (a SIM
+		// slot switch closes it, ddimension/wwand#34) leaves self.at null or a
+		// NEW engine; going on would read `.send` off null inside a uloop
+		// callback — the daemon dies — or drive an obsolete init on the new one.
+		let attach_at = self.at;
+		let gone = () => (self.at == null || self.at != attach_at);
 
-		self.at.send('AT+CGDCONT?', (rerr, rres) => {
+		attach_at.send('AT+CGDCONT?', (rerr, rres) => {
+			if (gone())
+				return;
+
 			// changed = an APN/PDP type that context 1 does not already carry
 			// (pdp_setup_matches compares pdp-type + APN; a read error => assume
 			// changed and re-attach, the safe side)
 			let changed = configured &&
 				!ncm_vendors.pdp_setup_matches(1, cfg, rres?.lines);
 
-			self.at.run_sequence(cmds, () => {
-				if (!changed)
-					return step_register();
+			attach_at.run_sequence(cmds, () => {
+				if (gone())
+					return;
 
-				log('notice', 'attach context changed, cycling radio to re-attach');
-				cfun_cycle(step_register);
+				// the PD flag rides the same re-attach: context 1's bearer comes
+				// up at attach, before any dial (QMI parity: ensure_attach_profile)
+				let want_pd = configured
+					? context_common.pd_want(cfg, cfg.pdp_type ?? 'ipv4v6') : null;
+				let send = (c, cb) => gone()
+					? cb({ error: 'modem_gone' })
+					: attach_at.send(c, (e, r) => cb(e, r?.lines));
+
+				ncm_vendors.sync_pd(self.vendor, send, 1, want_pd, log, (pd_changed) => {
+					if (gone())
+						return;
+
+					if (!changed && !pd_changed)
+						return step_register();
+
+					log('notice', 'attach context changed, cycling radio to re-attach');
+					cfun_cycle(step_register);
+				});
 			});
 		}, { timeout: 8000 });
 	};

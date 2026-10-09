@@ -56,6 +56,21 @@ function bool_opt(v, dflt)
 	return !(v == '0' || v == 'false' || v == 'off' || v == 'no');
 }
 
+function addr_alloc_opt(v, warnings)
+{
+	if (v == null || v == '')
+		return null;
+
+	let w = lc(sprintf('%s', v));
+
+	if (w == 'nas' || w == 'dhcp')
+		return w;
+
+	push(warnings, sprintf("invalid address_allocation '%s' (nas|dhcp), ignoring", v));
+
+	return null;
+}
+
 // the connection option bundle every context flavor shares (apn/auth/creds/mtu/
 // cadence); flavor-specific fields stay at the call sites.
 function conn_fields(s, warnings)
@@ -67,6 +82,15 @@ function conn_fields(s, warnings)
 		password: s.password,
 		mtu: (s.mtu != null) ? num_opt(s.mtu, null, 'mtu', warnings) : null,
 		use_pushed_prefix: bool_opt(s.use_pushed_prefix, false),
+		// IPv6 prefix delegation on the bearer, a flag in the modem's profile
+		// (QMI; NCM where the vendor has an AT command for it). TRI-STATE: unset leaves the profile as it is, because the
+		// write is to modem NV and nobody who never asked should get one.
+		ipv6_pd: (s.ipv6_pd != null && s.ipv6_pd != '') ? bool_opt(s.ipv6_pd, null) : null,
+		// the same tri-state, for 464XLAT in the modem (profile "CLAT Enabled")
+		clat: (s.clat != null && s.clat != '') ? bool_opt(s.clat, null) : null,
+		// profile "Address Allocation Preference": 'nas' | 'dhcp', unset =
+		// leave it; anything else is warned about and ignored, never guessed
+		address_allocation: addr_alloc_opt(s.address_allocation, warnings),
 		settings_poll: num_opt(s.settings_poll, 300, 'settings_poll', warnings),
 		// on a reconnect that changes the IP, do a netifd link down->up instead of
 		// an in-place renew, so dependent tunnels/xfrm re-follow the new local
@@ -253,6 +277,7 @@ export function context_defaults(over)
 		username: null, password: null, profile: null,
 		mtu: null, use_pushed_mtu: true,
 		use_pushed_prefix: false,
+		ipv6_pd: null, clat: null, address_allocation: null,
 		settings_poll: 300,
 		auto: true,   // netifd 'auto 0' => daemon won't proactively bring it up
 		...(over ?? {}),

@@ -479,7 +479,7 @@ export function create(opts)
 	// KEYED BY INTERFACE, NOT CARRIED ON THE ENTRY. The marker is evidence
 	// about an interface, and the context entry lives SHORTER than the
 	// interface. A config reload that cannot resolve an interface's modem
-	// produces no entry for it at all (config.uc:906-909 warns "references
+	// produces no entry for it at all (config.uc:931-934 warns "references
 	// unknown modem" and skips it), so a marker on the entry would have nothing
 	// to be carried over from. Re-adding the modem would then build a fresh
 	// entry with no marker, the status poll would see netifd's cleared
@@ -1419,7 +1419,7 @@ export function create(opts)
 	//     session that only down() will tear down.
 	//   - ACTIVATING is not "no session yet" either: MBIM sets `activated`
 	//     before it queries the IP configuration (context_mbim.uc:359-360), NCM
-	//     before it reads its own (context_ncm.uc:702), and QMI can have
+	//     before it reads its own (context_ncm.uc:742), and QMI can have
 	//     activated families while settings are still being fetched.
 	//
 	// Each backend's down() already knows exactly what it holds. Asking it is
@@ -1429,7 +1429,7 @@ export function create(opts)
 	//
 	// AND THE RECONNECT IS STARTED HERE, not inferred from the `down` event.
 	// context_ncm.down() returns WITHOUT emitting it when the activation has
-	// not set `activated` yet (context_ncm.uc:823-826) — so a mid-dial NCM
+	// not set `activated` yet (context_ncm.uc:879-882) — so a mid-dial NCM
 	// context would have gone IDLE with `wanted` still true and nothing
 	// scheduled, wedged by the very handler meant to restart it. enter_
 	// reconnecting returns on an armed hold timer, and every emitting backend
@@ -2536,7 +2536,7 @@ export function create(opts)
 		// entry.modem.stop() has just closed. One orphan per removal, and its
 		// late events can arm a spurious reconnect-hold on the rebuilt entry.
 		// `lost` is built for exactly this — it stops the monitor and destroys
-		// the family clients without attempting QMI cleanup (context.uc:1101).
+		// the family clients without attempting QMI cleanup (context.uc:1196).
 		for (let cname, centry in self.contexts) {
 			if (centry.cfg.modem == name && centry.ctx)
 				centry.ctx.modem_event('lost');

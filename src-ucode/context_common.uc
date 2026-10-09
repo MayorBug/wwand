@@ -79,6 +79,19 @@ export function effective_pdp(ctx)
 	return pdp;
 };
 
+// The prefix-delegation flag an AT-driven connection asks for: 1/0, or null
+// when `ipv6_pd` is unset or the connection carries no IPv6 (nothing to
+// delegate). The QMI side has the same rule in its PROFILE_FLAGS table
+// (context.uc); this is the copy for the AT paths, which have no table because
+// only this one flag reaches them (ncm_vendors.uc `pd` recipes).
+export function pd_want(cfg, pdp)
+{
+	if (cfg?.ipv6_pd == null || pdp == 'ipv4')
+		return null;
+
+	return cfg.ipv6_pd ? 1 : 0;
+};
+
 // the complete context state machine: IDLE -> PREPARING (QMI) | ACTIVATING
 // (MBIM/NCM dial directly) -> CONNECTED -> IDLE; every activation stage may
 // fall back to IDLE on failure/teardown. Used by ctx_scaffolding's warn-only

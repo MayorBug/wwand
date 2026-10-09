@@ -1312,6 +1312,29 @@ unanswered dial stays as the safety net.
   SET_NETDEV_DEV(qmap_net, &real_dev->dev) with real_dev the parent
   net_device (mhi_netdev_quectel.c:1608,1619).
 
+## Profile flags: IPv6 prefix delegation, CLAT, address allocation (2026-10-09)
+
+Three interface options, all tri-state (unset = the modem profile is left as it
+is): `ipv6_pd`, `clat`, `address_allocation` (`nas`|`dhcp`). QMI has all three;
+NCM has `address_allocation` (CGDCONT field 7, every vendor) and `ipv6_pd`
+(Quectel `AT+QIP6CFG`, flag and prefix read); MBIM has no field for any of them
+(libmbim 1.32). They are
+stored WDS profile settings (TLV 0xDF / 0xDE / 0x2D, libqmi 1.38), written
+read-before-write on the dialled profile and on the attach profile through one
+table, `context.uc PROFILE_FLAGS`.
+
+The delegated prefix itself is read back with Qualcomm's vendor WDS message
+0x00AC (not in libqmi; layout from the RG650E firmware) on every IPv6 settings
+fetch, and handed to netifd as the LAN prefix with a sourced default route. A
+host DHCPv6 client on the rmnet link gets no answer on these modems — the
+bearer's DHCPv6 is the modem's.
+
+HW: the flag round-trips on the RG650E (QMI 0xDF == `AT+QIP6CFG="PD_enable"`,
+both directions); 0x00AC answers "nothing delegated" (INTERNAL) on the RG650E
+(nonbonding.hybrid, /64) and on the RM520N-GL (v6.global-m2m.net, a PD APN in
+beta). **A prefix actually delegated end to end has not been seen yet** — open
+whether that APN delegates, or the modem asks only in router mode.
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

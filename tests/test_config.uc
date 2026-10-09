@@ -26,7 +26,8 @@ let r = padopt({
 		       pdp_type: 'ipv4v6', mux_id: '0' },
 		wan2: { '.type': 'interface', proto: 'wwand', modem: 'm0', apn: '#2',
 		        pdp_type: 'ipv4', mux_id: '2', auto: '0',
-		        hard_reconnect_on_ip_change: '1' },
+		        hard_reconnect_on_ip_change: '1', ipv6_pd: '0',
+		        clat: '1', address_allocation: 'DHCP' },
 	},
 });
 
@@ -50,6 +51,13 @@ eq(r.contexts.wan.interface, 'wan', 'native: interface attached');
 eq(r.contexts.wan2.mux_id, 2, 'native: mux id');
 eq(r.contexts.wan2.hard_reconnect_on_ip_change, true, 'native: hard_reconnect_on_ip_change parsed (bool)');
 eq(r.contexts.wan.hard_reconnect_on_ip_change, false, 'native: hard_reconnect defaults off');
+// tri-state: '0' is an instruction (clear the profile flag), unset is none
+eq(r.contexts.wan2.ipv6_pd, false, 'native: ipv6_pd 0 parsed as false');
+eq(r.contexts.wan.ipv6_pd, null, 'native: ipv6_pd unset stays null (profile left alone)');
+eq(r.contexts.wan2.clat, true, 'native: clat 1 parsed as true');
+eq(r.contexts.wan.clat, null, 'native: clat unset stays null');
+eq(r.contexts.wan2.address_allocation, 'dhcp', 'native: address_allocation parsed, case-insensitive');
+eq(r.contexts.wan.address_allocation, null, 'native: address_allocation unset stays null');
 eq(r.contexts.wan2.apn, '#2', 'native: profile passthrough apn');
 eq(r.contexts.wan.auto, true, 'native: interface auto defaults true');
 eq(r.contexts.wan2.auto, false, 'native: auto 0 -> not proactively brought up');

@@ -318,6 +318,12 @@ eq(cc.effective_pdp({ config: {} }), 'ipv4v6',
 	'pdp: ...and dual stack when nobody said');
 eq(cc.effective_pdp({}), 'ipv4v6', 'pdp: no config at all is still a default');
 
+// the PD flag an AT path asks for: tri-state, and nothing on an IPv4 connection
+eq(cc.pd_want({ ipv6_pd: true }, 'ipv4v6'), 1, 'pd_want: on');
+eq(cc.pd_want({ ipv6_pd: false }, 'ipv6'), 0, 'pd_want: off is an instruction too');
+eq(cc.pd_want({}, 'ipv4v6'), null, 'pd_want: unset leaves the profile alone');
+eq(cc.pd_want({ ipv6_pd: true }, 'ipv4'), null, 'pd_want: no IPv6, nothing to delegate');
+
 eq(cc.effective_pdp({ config: { pdp_type: 'ipv4v6' },
 	modem: { active_sim: { pdp_type: 'ipv4' } } }), 'ipv4',
 	'pdp: THE CARD WINS — that is the whole point of the per-SIM override');

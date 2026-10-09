@@ -86,6 +86,8 @@ function make_handlers(over, started)
 
 		MODIFY_PROFILE: {},
 		GET_PROFILE_SETTINGS: { pdp_type: 3, apn: 'web' },
+		// what a PDN without a delegated prefix answers (RG650E, 2026-10-09)
+		GET_DELEGATED_PREFIX: { __error: 3 },
 		SET_IP_FAMILY: {},
 		// asked before every dial (context.uc start_activation): nothing
 		// running, so the scenario dials as it always has
@@ -468,6 +470,183 @@ scenario('dual', { config: { apn: 'web', pdp_type: 'ipv4v6' } }, (ctx, mock, eve
 
 		let up = filter(events, (e) => e.event == 'up');
 		eq(length(up), 1, 'dual: one up event');
+		next();
+	});
+});
+
+// --- IPv6 prefix delegation: the profile flag (TLV 0xDF) -------------------
+
+// asked for and not held: ONE write carrying only the flag, the pdp type
+// already matches
+scenario('pd-on', { config: { apn: 'web', pdp_type: 'ipv4v6', ipv6_pd: true } }, (ctx, mock, events, next) => {
+	ctx.up((err) => {
+		eq(err, null, 'pd-on: connects');
+		// the mock profile never reports the flag, so the attach write and the
+		// dial-time check both carry it — every write is the flag alone
+		let w = filter(mock.calls_for('MODIFY_PROFILE'), (c) => c.args.prefix_delegation != null);
+		ok(length(w) >= 1, 'pd-on: the flag is written');
+		eq(uniq(map(w, (c) => c.args.prefix_delegation)), [ 1 ], 'pd-on: flag set');
+		// the attach-profile write (it always restates the pdp type) carries it:
+		// that bearer comes up at attach, before any dial-time write could act
+		ok(length(filter(w, (c) => c.args.pdp_type != null)) > 0, 'pd-on: attach profile write carries the flag');
+		ok(length(filter(w, (c) => c.args.pdp_type == null)) > 0, 'pd-on: dial-time write carries it alone');
+		eq(w[0].args.profile.index, 1, 'pd-on: on profile 1');
+		next();
+	});
+});
+
+// already held: no write at all (the idempotency rule covers the flag too)
+scenario('pd-same', {
+	config: { apn: 'web', pdp_type: 'ipv4v6', ipv6_pd: true },
+	handlers: { GET_PROFILE_SETTINGS: { pdp_type: 3, apn: 'web', prefix_delegation: 1 } },
+}, (ctx, mock, events, next) => {
+	ctx.up((err) => {
+		eq(err, null, 'pd-same: connects');
+		eq(length(mock.calls_for('MODIFY_PROFILE')), 0, 'pd-same: no NV write');
+		next();
+	});
+});
+
+// '0' is an instruction too: a profile holding the flag gets it cleared
+scenario('pd-off', {
+	config: { apn: 'web', pdp_type: 'ipv4v6', ipv6_pd: false },
+	handlers: { GET_PROFILE_SETTINGS: { pdp_type: 3, apn: 'web', prefix_delegation: 1 } },
+}, (ctx, mock, events, next) => {
+	ctx.up((err) => {
+		eq(err, null, 'pd-off: connects');
+		let w = filter(mock.calls_for('MODIFY_PROFILE'), (c) => c.args.prefix_delegation != null);
+		ok(length(w) >= 1, 'pd-off: the flag is written');
+		eq(uniq(map(w, (c) => c.args.prefix_delegation)), [ 0 ], 'pd-off: flag cleared');
+		next();
+	});
+});
+
+// an IPv4-only connection has no prefix to delegate: the flag is left alone
+scenario('pd-ipv4', {
+	config: { apn: 'web', pdp_type: 'ipv4', ipv6_pd: true },
+}, (ctx, mock, events, next) => {
+	ctx.up((err) => {
+		eq(err, null, 'pd-ipv4: connects');
+		let w = mock.calls_for('MODIFY_PROFILE');
+		ok(length(filter(w, (c) => c.args.pdp_type == 0)) > 0, 'pd-ipv4: pdp type ipv4 written');
+		eq(filter(w, (c) => c.args.prefix_delegation != null), [], 'pd-ipv4: no PD TLV');
+		next();
+	});
+});
+
+// a stack that refuses the message for the TLV: the pdp type still lands in a
+// write of its own and the dial goes on. (The attach profile is written from
+// the same config with pdp type only, so the PD write is picked out by flag.)
+scenario('pd-refused', {
+	config: { apn: 'web', pdp_type: 'ipv6', ipv6_pd: true },
+	handlers: {
+		MODIFY_PROFILE: (args) => (args.prefix_delegation != null) ? { __error: 48 } : {},
+	},
+}, (ctx, mock, events, next) => {
+	ctx.up((err) => {
+		eq(err, null, 'pd-refused: connects anyway');
+		let w = mock.calls_for('MODIFY_PROFILE');
+		let i = 0;
+		while (i < length(w) && w[i].args.prefix_delegation == null)
+			i++;
+		ok(i < length(w), 'pd-refused: a write carried the flag');
+		eq(w[i].args.pdp_type, 2, 'pd-refused: together with the pdp type');
+		eq([ w[i + 1]?.args.pdp_type, w[i + 1]?.args.prefix_delegation ], [ 2, null ],
+			'pd-refused: next write carries the pdp type alone');
+		next();
+	});
+});
+
+// --- CLAT and address allocation: the same profile-flag table ---------------
+
+// both written in ONE profile write, read first like the PD flag
+scenario('flags-clat-alloc', {
+	config: { apn: 'web', pdp_type: 'ipv4v6', clat: true, address_allocation: 'dhcp' },
+}, (ctx, mock, events, next) => {
+	ctx.up((err) => {
+		eq(err, null, 'flags: connects');
+		let w = filter(mock.calls_for('MODIFY_PROFILE'), (c) => c.args.pdp_type == null);
+		eq(length(w), 1, 'flags: one dial-time write');
+		eq([ w[0]?.args?.clat, w[0]?.args?.address_allocation ], [ 1, 1 ],
+			'flags: CLAT on and DHCP allocation in the same write');
+		next();
+	});
+});
+
+// CLAT needs an IPv6 bearer; the address-allocation preference does not
+scenario('flags-ipv4', {
+	config: { apn: 'web', pdp_type: 'ipv4', clat: true, address_allocation: 'nas' },
+}, (ctx, mock, events, next) => {
+	ctx.up((err) => {
+		eq(err, null, 'flags-ipv4: connects');
+		let w = mock.calls_for('MODIFY_PROFILE');
+		eq(filter(w, (c) => c.args.clat != null), [], 'flags-ipv4: no CLAT on an IPv4 connection');
+		ok(length(filter(w, (c) => c.args.address_allocation === 0)) > 0,
+			'flags-ipv4: NAS allocation still written');
+		next();
+	});
+});
+
+// already held: nothing written
+scenario('flags-same', {
+	config: { apn: 'web', pdp_type: 'ipv4v6', clat: false, address_allocation: 'nas' },
+	handlers: { GET_PROFILE_SETTINGS: { pdp_type: 3, apn: 'web', clat: 0, address_allocation: 0 } },
+}, (ctx, mock, events, next) => {
+	ctx.up((err) => {
+		eq(err, null, 'flags-same: connects');
+		eq(length(mock.calls_for('MODIFY_PROFILE')), 0, 'flags-same: no NV write');
+		next();
+	});
+});
+
+// --- the delegated prefix (vendor WDS 0x00AC) -----------------------------
+
+// delegated: read on the IPv6 family's client with the modem's own bearer
+// address (ipv4v6: the mock hands family 6 its settings on the SECOND start), and carried into the settings the shim hands netifd
+scenario('pd-delegated', {
+	config: { apn: 'web', pdp_type: 'ipv4v6', ipv6_pd: true },
+	handlers: {
+		GET_DELEGATED_PREFIX: { prefix: { addr: '2001:db8:100:0:0:0:0:0', plen: 56 } },
+	},
+}, (ctx, mock, events, next) => {
+	ctx.up((err, settings) => {
+		eq(err, null, 'pd-delegated: connects');
+		eq(settings?.ipv6?.delegated, '2001:db8:100:0:0:0:0:0/56', 'pd-delegated: prefix in the settings');
+		let q = mock.calls_for('GET_DELEGATED_PREFIX');
+		eq(length(q), 1, 'pd-delegated: asked once');
+		eq(q[0]?.args?.requestor, '2001:db8:0:0:0:0:0:2', 'pd-delegated: with the bearer address');
+		next();
+	});
+});
+
+// none delegated (INTERNAL): connected without one, and nothing is wrong
+scenario('pd-none', { config: { apn: 'web', pdp_type: 'ipv4v6', ipv6_pd: true } }, (ctx, mock, events, next) => {
+	ctx.up((err, settings) => {
+		eq(err, null, 'pd-none: connects');
+		eq(settings?.ipv6?.delegated, null, 'pd-none: no prefix reported');
+		eq(ctx.modem._pd_unsupported, null, 'pd-none: INTERNAL is not "unsupported"');
+		next();
+	});
+});
+
+// a modem without the message (INVALID_QMI_COMMAND): remembered, so the
+// settings poll does not ask again every five minutes
+scenario('pd-unsupported', {
+	config: { apn: 'web', pdp_type: 'ipv4v6', ipv6_pd: true },
+	handlers: { GET_DELEGATED_PREFIX: { __error: 71 } },
+}, (ctx, mock, events, next) => {
+	ctx.up((err, settings) => {
+		eq(err, null, 'pd-unsupported: connects');
+		eq(ctx.modem._pd_unsupported, true, 'pd-unsupported: remembered per modem');
+		next();
+	});
+});
+
+// not asked for: the vendor message is never sent
+scenario('pd-off-noread', { config: { apn: 'web', pdp_type: 'ipv4v6' } }, (ctx, mock, events, next) => {
+	ctx.up((err) => {
+		eq(err, null, 'pd-off-noread: connects');
+		eq(length(mock.calls_for('GET_DELEGATED_PREFIX')), 0, 'pd-off-noread: no 0x00AC without ipv6_pd');
 		next();
 	});
 });

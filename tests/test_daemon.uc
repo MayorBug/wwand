@@ -567,11 +567,13 @@ daemon.shutdown();
 
 ok(completed, 'full deferred-callback chain completed (no silent uloop unwind)');
 
-// --- generic modem_reset chain: GPIO priority, multi-modem gating, backend
-// fallback. Uses a bare daemon instance with a fake board + hand-built modem
-// entries (no transport needed — the chain never opens the device).
+// --- generic modem_reset chain: the modem's own reset first, the reset line
+// as the fallback (ddimension/openwrt-repo#4), multi-modem gating. Uses a bare
+// daemon instance with a fake board + hand-built modem entries (no transport
+// needed — the chain never opens the device); the fallback timer is captured.
 let pulses = [];
 let cycles = 0;
+let hw_timers = [];
 let rdeps = {
 	log: (level, msg) => null,
 	board: {
@@ -579,41 +581,85 @@ let rdeps = {
 		reset_pulse: (rg, off) => { push(pulses, rg); return true; },
 		power_cycle: (off) => { cycles++; return true; },
 	},
+	hw_timer: (ms, fn) => {
+		let t = { ms: ms, fn: fn, cancelled: false };
+		t.cancel = () => { t.cancelled = true; };
+		push(hw_timers, t);
+		return t;
+	},
 };
 let rd = daemon_mod.create({ timing: TIMING, deps: rdeps });
 let backend_resets = [];
-let mk_entry = (cfg, with_reset) => ({
+let mk_entry = (cfg, with_reset, fail) => ({
 	cfg: cfg,
 	modem: with_reset ?
 		{ stop: () => null,
-		  reset: (cb) => { push(backend_resets, 1); cb(null, { resetting: true }); } } :
+		  reset: (cb) => { push(backend_resets, 1); fail ? cb({ error: 'timeout' }) : cb(null, { resetting: true }); } } :
 		{ stop: () => null },
 });
 
-// single modem, no per-modem gpio -> board default GPIO wins over backend
+// single modem with a board line: the SOFT reset first, the line armed as
+// the fallback — not pulsed while the modem has a chance to reboot cleanly
 rd.modems = { m0: mk_entry({}, true) };
 rd.modem_reset('m0', (err, res) => {
 	eq(err, null, 'reset single: no error');
-	eq(res.action, 'gpio', 'reset single: board default GPIO used');
+	eq([ res.action, res.fallback_gpio, res.fallback_in ], [ 'backend', 'gpio900', 30 ],
+		'reset single: soft reset, board line armed for 30 s');
 });
-eq(pulses, [ 'gpio900' ], 'reset single: board reset line pulsed');
-eq(length(backend_resets), 0, 'reset single: backend reset not touched');
+eq(length(backend_resets), 1, 'reset single: the modem\'s own reset ran');
+eq(pulses, [], 'reset single: the line is not pulsed up front');
 
-// two modems, no per-modem gpio -> board default is ambiguous, backend reset
+// ...the modem did reboot (went ABSENT): the fallback stays quiet
+rd.modems.m0.modem._absent_count = 1;
+hw_timers[0].fn();
+eq(pulses, [], 'reset single: a modem that rebooted gets no pulse');
+
+// ...it acknowledged but never left the bus: now the line
+rd.modems = { m0: mk_entry({ reset_fallback: 5 }, true) };
+rd.modem_reset('m0', (err, res) => eq(res.fallback_in, 5, 'reset fallback: per-modem wait honoured'));
+eq(hw_timers[1].ms, 5000, 'reset fallback: armed with the configured wait');
+hw_timers[1].fn();
+eq(pulses, [ 'gpio900' ], 'reset fallback: no reboot, so the line is pulsed');
+
+// a daemon that stops disarms a pending fallback (stop_local leaves the modem
+// objects running), and a newer request replaces an older one's timer
+rd.modems = { m0: mk_entry({}, true) };
+rd.modem_reset('m0', () => null);
+rd.modem_reset('m0', () => null);
+eq(hw_timers[2].cancelled, true, 'reset fallback: a newer request replaces the older timer');
+rd.stop_local();
+eq(hw_timers[3].cancelled, true, 'reset fallback: cancelled when the daemon stops');
+
+// a REFUSED soft reset: the line at once
+rd.modems = { m0: mk_entry({}, true, true) };
+rd.modem_reset('m0', (err, res) => {
+	eq(err, null, 'reset refused: answered');
+	eq(res.action, 'gpio', 'reset refused: the line is used right away');
+});
+eq(pulses[1], 'gpio900', 'reset refused: board line pulsed');
+
+// a backend with no soft reset at all: the line, as before
+rd.modems = { m0: mk_entry({}, false) };
+rd.modem_reset('m0', (err, res) => eq(res.action, 'gpio', 'reset no-backend: the line'));
+eq(length(pulses), 3, 'reset no-backend: pulsed');
+
+// two modems, no per-modem gpio -> board default is ambiguous, backend only
+pulses = []; hw_timers = []; backend_resets = [];
 rd.modems = { m0: mk_entry({}, true), m1: mk_entry({}, true) };
 rd.modem_reset('m1', (err, res) => {
 	eq(err, null, 'reset multi: no error');
-	eq(res.action, 'backend', 'reset multi: falls back to backend reset');
+	eq([ res.action, res.fallback_gpio ], [ 'backend', null ], 'reset multi: backend reset, no line to fall back to');
 });
-eq(length(pulses), 1, 'reset multi: board GPIO not pulsed');
+eq(length(hw_timers), 0, 'reset multi: no fallback armed');
 eq(length(backend_resets), 1, 'reset multi: backend reset ran');
 
-// two modems, per-modem reset_gpio -> that line is pulsed
+// two modems, per-modem reset_gpio -> that line is the fallback
 rd.modems.m1.cfg = { reset_gpio: 'gpio7' };
 rd.modem_reset('m1', (err, res) => {
-	eq(res.gpio, 'gpio7', 'reset multi+gpio: per-modem line used');
+	eq(res.fallback_gpio, 'gpio7', 'reset multi+gpio: per-modem line is the fallback');
 });
-eq(pulses[1], 'gpio7', 'reset multi+gpio: per-modem line pulsed');
+hw_timers[0].fn();
+eq(pulses, [ 'gpio7' ], 'reset multi+gpio: per-modem line pulsed when no reboot came');
 
 // two modems, no gpio, backend without reset -> clean unsupported error
 rd.modems = { m0: mk_entry({}, false), m1: mk_entry({}, false) };

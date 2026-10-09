@@ -2,22 +2,24 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Fail on ucode constructs that parse, run, and silently do the wrong thing.
 
-One so far: ASSIGNING THE RESULT OF A PARENTHESIZED `??` THAT IS CALLED,
+One so far: CALLING A PARENTHESIZED `??`,
 
-    let c = (o.cursor_isolated ?? o.cursor)();
-    x = (a ?? b)(args);
+    let c = (o.cursor_isolated ?? o.cursor)();     # c is null
+    (o.timer ?? uloop.timer)(wait, fn);            # overwrites a neighbouring local
 
-yields null whenever the left operand is set — no error, the value is just
-gone. `return (a ?? b)()` and the bare statement `(a ?? b)();` are fine, and so
-is the assignment when the left operand is null, which is why a test that only
-exercises the fallback passes. Verified on the host ucode and on the target's
-ucode-2026.07.09~b885dd0f (NR7101, 2026-10-04). Write it as two statements:
+When the left operand is set and the right one is a member expression, the
+interpreter's stack ends up one slot off: assigned, the value is null; as a
+bare statement, a neighbouring local is overwritten. No error either way, and
+the fallback path works, so a test that only exercises it passes. Only the
+`return (a ?? b)()` form (and an arrow body, which is one) is safe. Verified on
+the host ucode and on ucode-2026.07.09~b885dd0f (RG650E, 2026-10-10; the table
+is in docs/gotchas.md). Write it as two statements:
 
     let mk = o.cursor_isolated ?? o.cursor;
     let c = mk();
 
-transport.uc already did, with a comment; deps.uc did not, and its device
-detour got a null cursor until this was found.
+Flagged here regardless of what the right operand is: whether it is a member
+expression is easy to misjudge, and two statements are never wrong.
 
 Usage: check-ucode-pitfalls.py [root]   (default: src-ucode)
 """
@@ -26,15 +28,101 @@ import os
 import re
 import sys
 
-# `=` that is an assignment (not ==, !=, <=, >=, =>), then `( … ?? … )(`
-PATTERN = re.compile(r'(?<![=!<>])=(?![=>])\s*\(([^()]*\?\?[^()]*)\)\s*\(')
+# directly after `return` or an arrow `=>`: the one safe form
+SAFE = re.compile(r'(?:\breturn|=>)\s*$')
 
 
-def strip_comment(line):
-    # good enough for this tree: `//` inside a string literal on the same line
-    # as such an assignment does not occur
-    i = line.find('//')
-    return line if i < 0 else line[:i]
+def mask_noncode(src):
+    """The source with comments and string literals blanked out, offsets and
+    newlines kept — so a `(` or `??` inside either cannot count."""
+    out = list(src)
+    i, state = 0, None
+
+    while i < len(src):
+        c = src[i]
+
+        if state in ("'", '"', '`'):
+            if c == '\\':
+                out[i] = ' '
+                if i + 1 < len(src) and src[i + 1] != '\n':
+                    out[i + 1] = ' '
+                i += 2
+                continue
+            if c == state:
+                state = None
+            if c != '\n':
+                out[i] = ' '
+        elif state == 'block':
+            if src.startswith('*/', i):
+                out[i:i + 2] = '  '
+                state = None
+                i += 2
+                continue
+            if c != '\n':
+                out[i] = ' '
+        elif src.startswith('//', i):
+            end = src.find('\n', i)
+            end = len(src) if end < 0 else end
+            out[i:end] = ' ' * (end - i)
+            i = end
+            continue
+        elif src.startswith('/*', i):
+            out[i:i + 2] = '  '
+            state = 'block'
+            i += 2
+            continue
+        elif c in ("'", '"', '`'):
+            state = c
+            out[i] = ' '
+
+        i += 1
+
+    return ''.join(out)
+
+
+def bad_calls(src):
+    """Line numbers of every called parenthesized `??` outside a return —
+    balanced over the whole file, so a call split over lines or one with
+    parentheses inside the `??` is found as well."""
+    code = mask_noncode(src)
+    stack = []
+
+    for i, ch in enumerate(code):
+        if ch == '(':
+            stack.append(i)
+        elif ch == ')' and stack:
+            start = stack.pop()
+            inner = code[start + 1:i]
+
+            # the `??` must be at THIS level, not inside a nested call
+            depth, top = 0, False
+            for k, x in enumerate(inner):
+                if x == '(':
+                    depth += 1
+                elif x == ')':
+                    depth -= 1
+                elif depth == 0 and inner.startswith('??', k):
+                    top = True
+                    break
+
+            if not top:
+                continue
+
+            # an argument list — `foo(a ?? b)(…)` — is not a parenthesized
+            # `??`: its `(` follows a name, a `)` or a `]`
+            k = start - 1
+            while k >= 0 and code[k].isspace():
+                k -= 1
+
+            if k >= 0 and (code[k].isalnum() or code[k] in '_$)]'):
+                continue
+
+            j = i + 1
+            while j < len(code) and code[j].isspace():
+                j += 1
+
+            if j < len(code) and code[j] == '(' and not SAFE.search(code[:start]):
+                yield src.count('\n', 0, start) + 1
 
 
 def main():
@@ -51,15 +139,18 @@ def main():
             files += 1
 
             with open(path, encoding='utf-8') as f:
-                for n, line in enumerate(f, 1):
-                    if PATTERN.search(strip_comment(line)):
-                        hits.append((path, n, line.strip()))
+                src = f.read()
+
+            lines = src.splitlines()
+
+            for n in bad_calls(src):
+                hits.append((path, n, lines[n - 1].strip()))
 
     for path, n, text in hits:
-        print(f'{path}:{n}: assigned call of a parenthesized `??` — null when the left side is set; split it into two statements')
+        print(f'{path}:{n}: call of a parenthesized `??` — misplaces the stack when the left side is set; split it into two statements')
         print(f'    {text}')
 
-    print(f'checked {files} .uc files under {root}: {len(hits)} assigned `(a ?? b)()` call(s)')
+    print(f'checked {files} .uc files under {root}: {len(hits)} called `(a ?? b)()` outside a return')
     return 1 if hits else 0
 
 

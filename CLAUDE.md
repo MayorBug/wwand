@@ -276,9 +276,11 @@ be decided by load order; `_wwand_apply_settings` builds the netifd update).
 - `Date.now()`/`new Date()`/`Math.random()` unavailable; `time()` is a builtin
   (works in the daemon; not in Workflow scripts).
 - `replace(s, /-/g, '')` for global replace (string arg replaces first only).
-- **`let x = (a ?? b)()` yields null when `a` is set** (no error). Split it:
-  `let mk = a ?? b; let x = mk();`. `return (a ?? b)()` works. Enforced by
-  `tools/check-ucode-pitfalls.py` in run_tests.sh; details in docs/gotchas.md.
+- **A called `(a ?? b.c)(…)` misplaces the stack when `a` is set** (no error):
+  assigned, the value is null; as a bare statement, a NEIGHBOURING local gets
+  overwritten. Split it: `let mk = a ?? b.c; mk(…);`. Only `return (a ?? b)()`
+  is safe. Enforced by `tools/check-ucode-pitfalls.py` in run_tests.sh;
+  details and the evidence in docs/gotchas.md.
 - **`require()` gives the loaded script its OWN copies of imported modules.** A
   plain script pulled in with `require()` does NOT share module instances with
   the importing side, so module-level mutable state (a registry, a cache) is

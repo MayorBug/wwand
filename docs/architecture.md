@@ -454,10 +454,11 @@ persist in tmpfs across daemon restarts and are intentionally cleared by
 reboot. A zero-rx watchdog (packet stats delta) triggers the same repower.
 
 Alongside the automatic ladder, the `modem_reset` ubus method
-(`hwops.uc`, installed into the daemon) offers an admin-driven reset with the
-same GPIO-first priority: it
-pulses the modem/board `reset_gpio` when one is configured, else falls back to
-the backend soft reset (QMI DMS offline→reset, NCM `CFUN=1,1`). Board-default
+(`hwops.uc`, installed into the daemon) offers an admin-driven reset, soft
+first: the backend reset (QMI DMS offline→reset, NCM `CFUN=1,1`) lets the
+modem shut down cleanly, and the modem/board `reset_gpio` is only the fallback
+— pulsed when the soft reset is refused, or when the modem has not dropped off
+the bus within `reset_fallback` (ddimension/openwrt-repo#4). Board-default
 GPIOs are gated by `board_gpio_ok` (a shared board power/reset rail is only
 touched on a single-modem box); a per-modem `reset_gpio` is the multi-modem path.
 

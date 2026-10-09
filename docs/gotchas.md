@@ -877,15 +877,29 @@ as no model.
 generic — no manufacturer and model ?`, `cgmi -, cgmm FM350-GL`, `cgmm Fibocom
 Wireless Inc.`); #32 for the same refusal after a slot switch.
 
-## `let x = (a ?? b)()` is null when `a` is set
+## A called `(a ?? b.c)(…)` misplaces the stack
 
-An assignment of a parenthesized `??` that is called — `let c =
-(o.cursor_isolated ?? o.cursor)();`, `x = (a ?? b)(args);` — yields **null**
-whenever the left operand is set: no error, the value is simply gone. With the
-left operand null it works, so a test that only exercises the fallback passes.
-`return (a ?? b)()` and the bare statement `(a ?? b)();` are fine. Verified on
-the host ucode and on ucode-2026.07.09~b885dd0f (NR7101, 2026-10-04); found
-when the netifd device detour in deps.uc got a null cursor. Write it as two
-statements (`let mk = a ?? b; let c = mk();`), as transport.uc already did.
-`tools/check-ucode-pitfalls.py` fails on the assignment form and runs in
+Calling a parenthesized `??` whose right operand is a member expression
+(`b.c`, a module or an object property), while the left operand is SET,
+leaves the interpreter's stack one slot off. No error; a neighbouring value
+is simply wrong:
+
+| form | result |
+|---|---|
+| `let r = (a ?? b.c)(w);` | `r` is **null**, the call's value lands in another local |
+| bare statement `(a ?? b.c)(w);` | the next local is **overwritten** (null, or NaN after arithmetic) |
+| `return (a ?? b.c)(w)` / arrow body | correct |
+| identifier on the right (`(a ?? print)`) or left operand null | correct |
+
+Identical on the host ucode and on ucode-2026.07.09~b885dd0f (RG650E/245,
+2026-10-10; the table is that run). Because the fallback path works, a test
+that only exercises the fallback passes. Found three times:
+- the netifd device detour in deps.uc got a null cursor (assignment form, 2026-10-04);
+- daemon probe_euicc's state object was null in its callback (bare form, 2026-10-01 —
+  worked around then without the cause);
+- hwops.modem_reset read its `wait` back as NaN (bare form, 2026-10-10).
+
+Write it as two statements (`let mk = a ?? b.c; mk(w);`), as transport.uc
+already did. `tools/check-ucode-pitfalls.py` fails on every called
+parenthesized `??` that is not a `return` / arrow body, and runs in
 `run_tests.sh`.

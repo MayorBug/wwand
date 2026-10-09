@@ -257,12 +257,13 @@ export function vanish_action(entry, now, timing)
 };
 
 // The callback for one eUICC read (daemon probe_euicc), built out here so it
-// closes over nothing but these four parameters. Built inline in create(), a
-// closure over the read's state object found it null when the callback ran
-// after another call had reused the stack, while other captured values
-// looked intact (host ucode, test_daemon, 2026-10-01). A small closure did
-// not reproduce it; create() is very large. Kept out here so the fix does
-// not depend on understanding that.
+// closes over nothing but these four parameters. Built inline, the closure
+// found the read's state object null when it ran (test_daemon, 2026-10-01).
+// The cause was the call that issued the read, `(deps.card_euicc_info ??
+// simmod.card_euicc_info)(…)`: a called parenthesized `??` with a member
+// expression on the right misplaces the interpreter's stack and overwrites a
+// neighbouring local (docs/gotchas.md, reproduced 2026-10-10). That call is
+// two statements now; the helper stays, as it costs nothing.
 function euicc_answer(fn, entry, m, st)
 {
 	return (info) => fn(entry, m, st, info);
@@ -479,7 +480,7 @@ export function create(opts)
 	// KEYED BY INTERFACE, NOT CARRIED ON THE ENTRY. The marker is evidence
 	// about an interface, and the context entry lives SHORTER than the
 	// interface. A config reload that cannot resolve an interface's modem
-	// produces no entry for it at all (config.uc:931-934 warns "references
+	// produces no entry for it at all (config.uc:934-937 warns "references
 	// unknown modem" and skips it), so a marker on the entry would have nothing
 	// to be carried over from. Re-adding the modem would then build a fresh
 	// entry with no marker, the status poll would see netifd's cleared
@@ -1394,7 +1395,11 @@ export function create(opts)
 		if (done)
 			push(st.waiters, done);
 
-		(deps.card_euicc_info ?? simmod.card_euicc_info)(m, euicc_answer(euicc_read, entry, m, st));
+		// two statements: a called `(a ?? b.c)(…)` misplaces the stack
+		// (docs/gotchas.md) — this very call once nulled `st` (see euicc_answer)
+		let read = deps.card_euicc_info ?? simmod.card_euicc_info;
+
+		read(m, euicc_answer(euicc_read, entry, m, st));
 	};
 
 	// THE SUBSCRIPTION CHANGED UNDER A RUNNING CONNECTION. An eSIM profile
@@ -1554,6 +1559,12 @@ export function create(opts)
 	};
 
 	let on_modem_event = (modem, event, data) => {
+		// How often this modem object has gone ABSENT: a modem that really
+		// reboots drops off the bus on the way (hwops.modem_reset asks this to
+		// tell a reset that happened from one that was only acknowledged).
+		if (event == 'state' && data?.state == 'ABSENT')
+			modem._absent_count = (modem._absent_count ?? 0) + 1;
+
 		// clear the one-shot manual-PIN-release flags so a later cycle never reuses them
 		if (event == 'registered' || event == 'sim_blocked') {
 			modem.pin_force = false;
@@ -4776,7 +4787,9 @@ export function create(opts)
 	// (same install pattern); the daemon keeps lifecycle, config and status.
 	simops.install(self, { log: log, check_modem: check_modem, load_esim: load_esim });
 	hwops.install(self, { log: log, check_modem: check_modem, board: deps.board,
-	                      board_gpio_ok: board_gpio_ok });
+	                      board_gpio_ok: board_gpio_ok,
+	                      reset_fallback_ms: self.timing?.reset_fallback_ms,
+	                      timer: deps.hw_timer });
 
 	// A plugin parking a modem's radio (a card lent to another modem) or
 	// handing it back. The DAEMON records the park, so the hand-back follows
@@ -5347,6 +5360,8 @@ export function create(opts)
 	// Destructive teardown for config reload/removal: bring every context down
 	// (STOP_NETWORK) and stop the modems, then drop all state.
 	self.shutdown = function() {
+		self.cancel_reset_fallbacks?.();
+
 		for (let name, entry in self.contexts) {
 			clear_reconnect(name);
 			cancel_confirm(entry);
@@ -5371,6 +5386,8 @@ export function create(opts)
 	// interfaces. With no-proto-task the WAN stays up across the restart and the
 	// fresh daemon adopts the live session on modem-ready. Just cancel our timers.
 	self.stop_local = function() {
+		self.cancel_reset_fallbacks?.();
+
 		// ...and no second look at an unrecorded down either: it ends in a
 		// kick, and the next daemon makes its own
 		for (let name, entry in self.contexts) {

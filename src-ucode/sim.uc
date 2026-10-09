@@ -1396,7 +1396,7 @@ export function install_refresh(modem, uim, opts)
 // the modem's internal LPA for the AT path (AT+QESIM="lpa_enable",0 + reset).
 
 // --- AT (CCHO/CGLA/CCHC) transport ---
-function at_apdu_open(modem, aid_hex, cb)
+function at_apdu_open(modem, aid_hex, cb, opts)
 {
 	modem.at.send(sprintf('AT+CCHO="%s"', uc(aid_hex)), (err, res) => {
 		if (err)
@@ -1412,7 +1412,7 @@ function at_apdu_open(modem, aid_hex, cb)
 		}
 
 		cb({ error: 'no_channel' }, null);
-	}, { timeout: 15000 });
+	}, { timeout: 15000, probe: opts?.probe });
 }
 
 function at_apdu_send(modem, channel, apdu_hex, cb)
@@ -1598,7 +1598,11 @@ function apdu_transport_gone(modem, be)
 
 // open a logical channel to `aid_hex` on physical slot `slot` (1-based);
 // cb(err, { channel, select_response })
-export function apdu_open(modem, slot, aid_hex, cb)
+// `opts.probe` (a string) marks a DISCOVERY open: its bare AT ERROR is the
+// answer "no such application here", logged at info under that note. Only the
+// eUICC probe passes it — an open for a real eSIM or raw-APDU operation keeps
+// warning when it fails.
+export function apdu_open(modem, slot, aid_hex, cb, opts)
 {
 	apdu_backend(modem, slot, (be) => {
 		let gone = apdu_transport_gone(modem, be);
@@ -1611,7 +1615,7 @@ export function apdu_open(modem, slot, aid_hex, cb)
 				cb(err, d ? { channel: d.channel, select_response: d.select_response } : null));
 
 		if (be == 'at')
-			return at_apdu_open(modem, aid_hex, cb);
+			return at_apdu_open(modem, aid_hex, cb, opts);
 
 		if (be != 'qmi')
 			return cb({ error: 'no_apdu_channel' }, null);
@@ -1863,7 +1867,10 @@ export function card_euicc_info(modem, cb)
 				: (sw == '9000' || substr(sw ?? '', 0, 2) == '61') ? 'ipad' : null;
 			fin(info);
 		});
-	});
+	// A plain SIM has no ISD-R and answers a bare ERROR: the probe's "no",
+	// reached three times on every start of a plain-SIM modem (daemon
+	// probe_euicc, EUICC_TRIES), not a fault (ddimension/wwand#51).
+	}, { probe: 'no eUICC answered on this card' });
 };
 
 // --- PLMN selector lists (settings editor) -----------------------------------

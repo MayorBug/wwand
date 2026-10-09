@@ -1235,6 +1235,31 @@ eq(urcs9, [ '^NDISSTAT: 1,,,,IPV4' ], 'urc-merge: the ^-sigil URC is dispatched'
 	ok(index(lv[0][1], 'declined by the modem') >= 0, 'probe: and says only what was seen');
 }
 
+// A probe can say what its bare ERROR means (the eUICC probe: "no ISD-R"),
+// and an error the caller handles itself (expect_errors) is info, not a
+// warning — AT+QGPS=1's 504 "session is ongoing" is success for gnss
+// (ddimension/wwand#51). A DIFFERENT code still warns, and every error line
+// now carries its code: "error: cme" alone said nothing.
+{
+	let lv = [];
+	let tre = fake_transport();
+	let ate = atcmd.create(tre, { log: (level, msg) => push(lv, [ level, msg ]) });
+
+	ate.send('AT+CCHO="A0000005591010FFFFFFFF8900000100"', () => null,
+		{ probe: 'no eUICC answered on this card' });
+	tre.reply('\r\nERROR\r\n');
+	ate.send('AT+QGPS=1', () => null, { expect_errors: /504/ });
+	tre.reply('\r\n+CME ERROR: 504\r\n');
+	ate.send('AT+QGPS=1', () => null, { expect_errors: /504/ });
+	tre.reply('\r\n+CME ERROR: 505\r\n');
+
+	eq(map(lv, (x) => x[0]), [ 'info', 'info', 'warn' ],
+		'expect: named probe and expected CME are info; an unexpected code warns');
+	ok(index(lv[0][1], 'no eUICC answered on this card') >= 0, 'expect: the probe names its own meaning');
+	ok(index(lv[1][1], 'error: cme 504') >= 0, 'expect: the error line carries the code');
+	ok(index(lv[2][1], 'error: cme 505') >= 0, 'expect: ...on the warning too');
+}
+
 // auth commands never log credentials
 let auth_logs = [];
 let tr4 = fake_transport();

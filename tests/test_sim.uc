@@ -1847,6 +1847,23 @@ let mk_modem = (lines) => ({
 	_apdu_be: 'at',
 });
 
+// The probe note reaches the AT engine ONLY from the eUICC discovery
+// (card_euicc_info): a plain SIM's bare ERROR there is an answer and logs at
+// info, while an open for a real eSIM operation keeps warning
+// (ddimension/wwand#51).
+{
+	let seen = [];
+	let probe_modem = {
+		at: { send: (cmd, cb, o) => { push(seen, o?.probe); cb({ error: 'ERROR' }, null); } },
+		_apdu_be: 'at',
+	};
+
+	sim.card_euicc_info(probe_modem, () => null);
+	sim.apdu_open(probe_modem, 1, sim.ISDR_AID, () => null);
+	eq(seen, [ 'no eUICC answered on this card', null ],
+		'apdu_open: the probe note comes from the discovery only, not from a plain open');
+}
+
 sim.apdu_open(mk_modem([ '1' ]), 1, sim.ISDR_AID, (err, ch) => {
 	eq(err, null, 'apdu_open: bare session id accepted');
 	eq(ch?.channel, 1, 'apdu_open: channel parsed from the bare form');

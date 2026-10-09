@@ -832,12 +832,27 @@ export function create(transport, opts)
 		// RG502Q-EA, AT+QNWLOCK="common/5g" on an EG25-G, which has no 5G
 		// (ddimension/wwand#47). But a busy modem answers a bare ERROR too, so
 		// the line says only what was seen, not that the command is absent.
-		// A timeout or a +CME ERROR to a probe still warns.
+		// A timeout or a +CME ERROR to a probe still warns. A probe may name
+		// what its bare ERROR means instead (a string): the setting wording is
+		// wrong for an eUICC probe, where it means "no ISD-R on this card".
+		//
+		// AND an error the CALLER HANDLES ITSELF (send option `expect_errors`,
+		// a regex over "<error> <code>"): a +CME ERROR the caller reads as
+		// success, like Quectel's 504 "session is ongoing" to AT+QGPS=1 — the
+		// receiver is already running. Logged as a warning, it contradicted
+		// the very next line ("receiver on — was already running") on every
+		// reload (ddimension/wwand#51).
 		let declined = (cur.probe && err?.error == 'ERROR');
+		let expected = (err && cur.expect_errors &&
+			match(sprintf('%s %s', err.error ?? '', err.code ?? ''), cur.expect_errors));
+		let note = declined
+			? sprintf(' (%s)', type(cur.probe) == 'string' ? cur.probe : 'optional setting, declined by the modem')
+			: expected ? ' (an answer the caller expects)' : '';
 
-		log(!err ? 'debug' : declined ? 'info' : 'warn', sprintf('%s -> %s%s', redact(cur.cmd),
-			err ? sprintf('error: %s', err.error ?? '?') : join(' | ', lines ?? []),
-			declined ? ' (optional setting, declined by the modem)' : ''));
+		log(!err ? 'debug' : (declined || expected) ? 'info' : 'warn', sprintf('%s -> %s%s', redact(cur.cmd),
+			err ? sprintf('error: %s%s', err.error ?? '?', err.code != null ? sprintf(' %s', err.code) : '')
+			    : join(' | ', lines ?? []),
+			note));
 
 		if (cur.cb)
 			cur.cb(err, { lines: lines });
@@ -1013,7 +1028,9 @@ export function create(transport, opts)
 			cmd: cmd,
 			cb: cb,
 			timeout: o?.timeout ?? DEFAULT_TIMEOUT,
-			probe: !!o?.probe,
+			// true, or a string naming what a bare ERROR means (see finish)
+			probe: (type(o?.probe) == 'string') ? o.probe : !!o?.probe,
+			expect_errors: o?.expect_errors,
 		});
 
 		next();

@@ -259,7 +259,7 @@ export function start_gnss(self, log, cb)
 			already ? ' — was already running' : '',
 			self.gps_tty ? sprintf(', NMEA on %s', self.gps_tty) : ''));
 		cb(null);
-	}, { timeout: 10000 });
+	}, { timeout: 10000, expect_errors: recipe.ok_errors });
 };
 
 export function dsd_from_serving(serving)

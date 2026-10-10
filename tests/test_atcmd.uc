@@ -1381,6 +1381,17 @@ let tlogs = [];
 let trt = fake_transport();
 let att = atcmd.create(trt, { log: (level, msg) => push(tlogs, msg) });
 
+let canceltr = fake_transport();
+let cancelat = atcmd.create(canceltr, { log: silent });
+let cancelled_cb = () => die('cancelled request must not run');
+cancelat.send('AT', () => null);
+cancelat.send('AT+QCFG="data_interface",1,0', cancelled_cb);
+cancelat.send('AT+CSQ', () => null);
+cancelat.cancel_queued(cancelled_cb);
+canceltr.reply('\r\nOK\r\n');
+eq(canceltr.written, ['AT\r', 'AT+CSQ\r'], 'cancel queued: remove unsent NV write and preserve another caller');
+cancelat.close();
+
 att.send('AT+CGAUTH=1,3,"user","secret123"', () => null, { timeout: 200 });
 uloop.timer(600, () => {
 	ok(!match(join(' ', tlogs), /secret123/), 'auth: timeout log redacted');

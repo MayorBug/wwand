@@ -1804,4 +1804,12 @@ ok(length(filter(psim.warnings, (w) => index(w, 'nonsense') >= 0)) > 0,
 eq(length(filter(psim.warnings, (w) => index(w, "unknown option 'pdp_type'") >= 0)), 0,
 	'sim pdp: no longer reported as an unknown option');
 
+let setup = config.parse({ network: { setup: { '.type': 'wwand_globals',
+	startup_pcie: '1', startup_power_driver: '/sys/bus/platform/drivers/pci-pwrctrl-slot',
+	startup_power_device: '80000000.pcie:pcie@0', startup_module: 'pcie_mhi',
+	startup_reset_gpio: 'modem-reset', startup_pci_vendor: '0x17cb', startup_pci_device: '0x0309',
+} } });
+eq(setup.globals.startup_pcie, null, 'setup: obsolete startup policy is ignored');
+eq(setup.globals.hardware_profile, null, 'setup: UCI cannot assign slot power policy');
+
 done('test_config');

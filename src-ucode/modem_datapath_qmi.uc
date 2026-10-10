@@ -85,6 +85,12 @@ export function setup(self, dp, o, next)
 		// datapath must be validated (or reported missing) the same whether
 		// or not a WDA service exists.
 		let fxi = dp.fx ?? netlink.default_fx((level, msg) => log(level, msg));
+		// The control node can appear before the data device at startup.
+		// Retry missing values here, after service initialization. Keep overrides.
+		if (dp.ep_id == null)
+			dp.ep_id = netlink.ep_iface_number(dp.netdev, dp.fx);
+		if (dp.ep_type == null)
+			dp.ep_type = netlink.ep_type_number(dp.netdev, dp.fx);
 		let backend = netlink.select_backend(fxi, dp.netdev, dp.mux ?? 'auto',
 			want_mux, dp.plugins, { model: self.info?.model, proto: 'qmi',
 			                        kernel_netdev: dp.netdev_kernel });

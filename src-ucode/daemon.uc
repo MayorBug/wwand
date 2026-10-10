@@ -14,6 +14,7 @@ import * as netsel_ops from 'wwand.netsel_ops';
 import * as simops from 'wwand.simops';
 import * as simmod from 'wwand.sim';
 import * as hwops from 'wwand.hwops';
+import * as board_transport from 'wwand.board_transport';
 import * as plugins from 'wwand.plugins';
 import * as siminventory from 'wwand.siminventory';
 import * as cfgmod from 'wwand.config';
@@ -2398,6 +2399,11 @@ export function create(opts)
 	};
 
 	let try_modeswitch = (name, entry, tty) => {
+		if (deps.board?.profile?.manual_data_mode) {
+			if (entry)
+				entry.control_note = 'select the modem data mode explicitly in Mobile Modems';
+			return;
+		}
 		log('warn', sprintf('modem %s: only a serial port present (ppp), no rich control interface', name));
 
 		if (modeswitch_tried[name]) {
@@ -2489,7 +2495,7 @@ export function create(opts)
 		if (!deps.board)
 			return null;
 
-		let rg = cfg?.reset_gpio ?? (board_gpio_ok() ? deps.board.profile?.reset_gpio : null);
+		let rg = cfg?.reset_gpio ?? (board_gpio_ok() && !deps.board.profile?.repower_uses_power ? deps.board.profile?.reset_gpio : null);
 
 		// AN OPTION THAT IS PRESENT BUT EMPTY IS NOT A LINE. uci keeps
 		// `option reset_gpio ''` as an empty string, which `??` passes straight
@@ -2986,6 +2992,14 @@ export function create(opts)
 
 		self.modems[name] = entry;
 
+		// Slot recovery owns the device until unload and power restore finish.
+		// Keep the usual waiting entry; hotplug/tick can rebuild it afterward.
+		if (deps.board?.profile?.power_driver && deps.board.power_busy?.()) {
+			entry.control_note = 'waiting for modem after board power cycle';
+			entry.waiting_since ??= time();
+			return;
+		}
+
 		// presence gate: NCM needs a datapath netdev, PPP needs a serial port,
 		// QMI/MBIM need a cdc-wdm control device.
 		let present = control && (
@@ -3174,7 +3188,12 @@ export function create(opts)
 			},
 			at: {
 				fx: deps.datapath_fx,
-				open_transport: deps.at_open_transport,
+				open_transport: (path, baud, log) => {
+					if (self.board_at_reserved(path))
+						return null;
+					let open = deps.at_open_transport ?? board_transport.open_transport;
+					return open(path, baud, log);
+				},
 			},
 			deps: {
 				transport_open: deps.transport_open,
@@ -3715,6 +3734,7 @@ export function create(opts)
 		if (!self._tick_started) {
 			self._tick_started = true;
 			deps.board?.init();
+			self.board_transport_start();
 
 			let led_state = (entry) => {
 				let m = entry?.modem, reg = m?.reg;
@@ -4678,6 +4698,8 @@ export function create(opts)
 			profile: deps.board.profile != null,
 			has_power: deps.board.has_power,
 			reset_gpio: deps.board.profile?.reset_gpio,
+			gpio_candidates: filter(deps.board.gpio_candidates?.() ?? [], (g) => g != null),
+			transport: self.board_transport_status(),
 		} : null;
 
 		return { modems: modems, contexts: contexts,
@@ -5388,6 +5410,8 @@ export function create(opts)
 	self.stop_local = function() {
 		self.cancel_reset_fallbacks?.();
 
+		self.board_transport_stop();
+		deps.board?.finish_power?.();
 		// ...and no second look at an unrecorded down either: it ends in a
 		// kick, and the next daemon makes its own
 		for (let name, entry in self.contexts) {
@@ -5403,5 +5427,28 @@ export function create(opts)
 		self._tick_timer = null;
 	};
 
+	board_transport.install(self, {
+		board: deps.board,
+		fx: deps.board_fx,
+		log: log,
+		open_at: deps.board_open_at ?? board_transport.open_at,
+		recheck: () => {
+			self.autosetup_scan();
+			self.hotplug('add', 'board-pcie-rescan');
+		},
+	});
+	deps.board?.set_action_guard?.(() => !self.board_transport_status().busy);
+	deps.board?.set_power_prepare?.(() => {
+		if (!board_gpio_ok() || self.board_transport_status().busy)
+			return false;
+		for (let name, entry in self.modems) {
+			if (entry.modem)
+				detach_modem(name, entry);
+			release_gps(name);
+			entry.control_note = 'waiting for modem after board power cycle';
+			entry.waiting_since = time();
+		}
+		return true;
+	});
 	return self;
 };

@@ -127,6 +127,18 @@ export function publish(conn, daemon, log)
 
 		// manual hardware repower/reset via the board profile (also the recovery
 		// path). modem optional; defaults to the first configured modem.
+		pcie_rescan: {
+			args: { ubus_rpc_session: '' },
+			call: (req) => ok_sync(daemon.pcie_rescan()),
+		},
+		modem_get_data_mode: {
+			args: { ubus_rpc_session: '' },
+			call: (req) => defer(req, (reply) => daemon.modem_data_mode(null, ok_reply(reply))),
+		},
+		modem_set_data_mode: {
+			args: { mode: '', ubus_rpc_session: '' },
+			call: (req) => defer(req, (reply) => daemon.modem_data_mode(req.args.mode, ok_reply(reply))),
+		},
 		modem_repower: {
 			args: { modem: '', ubus_rpc_session: '' },
 			call: (req) => ok_sync(daemon.repower_modem(req.args.modem)),

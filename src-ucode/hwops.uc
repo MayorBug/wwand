@@ -64,6 +64,9 @@ export function install(self, o)
 		if (!entry)
 			return;
 
+		if (self.board_transport_status?.().busy)
+			return cb({ error: 'board_transport_busy' });
+
 		let rg = entry.cfg?.reset_gpio ??
 			(board_gpio_ok() ? board?.profile?.reset_gpio : null);
 		let off = entry.cfg?.repower_time ? +entry.cfg.repower_time * 1000 : null;
@@ -214,7 +217,7 @@ export function install(self, o)
 
 		// board defaults only when they unambiguously target this modem (see
 		// board_gpio_ok): per-modem reset_gpio is the multi-modem path.
-		let rg = cfg?.reset_gpio ?? (board_gpio_ok() ? board.profile?.reset_gpio : null);
+		let rg = cfg?.reset_gpio ?? (board_gpio_ok() && !board.profile?.repower_uses_power ? board.profile?.reset_gpio : null);
 
 		if (rg)
 			return { action: 'reset_gpio', gpio: rg,
@@ -244,6 +247,9 @@ export function install(self, o)
 			return plan.ref != null
 				? { error: plan.error, ref: plan.ref }
 				: { error: plan.error };
+
+		if (self.board_transport_status?.().busy)
+			return { error: 'board_transport_busy' };
 
 		let rg = (plan.action == 'reset_gpio') ? plan.gpio : null;
 		let off = plan.off_ms;

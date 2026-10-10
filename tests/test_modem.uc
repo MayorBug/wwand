@@ -1129,6 +1129,41 @@ let dpfx = fakefx.create({ present: {
 	'/sys/module/rmnet': true,
 } });
 
+// A control node can precede the data-device link. Initialization retries it.
+	let latefx_detected = fakefx.create({ present: {
+		'/sys/class/net/wwan0/qmi/pass_through': true,
+		'/sys/class/net/wwan0/qmi/raw_ip': true,
+		'/sys/module/rmnet': true,
+	}, links: { '/sys/class/net/wwan0/device': '../../../0001:01:00.0' } });
+	scenario('endpoint-late', {
+		handlers: base_handlers({ SET_DATA_FORMAT: (args, meta) => ({
+			qos: 0, llp: 2, ul_protocol: args.ul_protocol, dl_protocol: args.dl_protocol,
+			dl_max_datagrams: 32, dl_max_size: args.dl_max_size,
+		}) }),
+		datapath: { netdev: 'wwan0', ep_id: null,
+			ep_type: null, mux: 'auto',
+			mux_links: [ { id: 1 } ], fx: latefx_detected },
+	}, 'registered', (modem, mock, events) => {
+		eq(modem.datapath.ep_id, 4, 'late endpoint: id resolved or preserved');
+		eq(modem.datapath.ep_type, 3, 'late endpoint: type resolved or preserved');
+	});
+	let latefx_override = fakefx.create({ present: {
+		'/sys/class/net/wwan0/qmi/pass_through': true,
+		'/sys/class/net/wwan0/qmi/raw_ip': true,
+		'/sys/module/rmnet': true,
+	}, links: { '/sys/class/net/wwan0/device': '../../../0001:01:00.0' } });
+	scenario('endpoint-override', {
+		handlers: base_handlers({ SET_DATA_FORMAT: (args, meta) => ({
+			qos: 0, llp: 2, ul_protocol: args.ul_protocol, dl_protocol: args.dl_protocol,
+			dl_max_datagrams: 32, dl_max_size: args.dl_max_size,
+		}) }),
+		datapath: { netdev: 'wwan0', ep_id: 7,
+			ep_type: 2, mux: 'auto',
+			mux_links: [ { id: 1 } ], fx: latefx_override },
+	}, 'registered', (modem, mock, events) => {
+		eq(modem.datapath.ep_id, 7, 'late endpoint: id resolved or preserved');
+		eq(modem.datapath.ep_type, 2, 'late endpoint: type resolved or preserved');
+	});
 scenario('datapath', {
 	handlers: base_handlers({
 		SET_DATA_FORMAT: (args, meta) => ({

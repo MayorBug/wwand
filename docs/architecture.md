@@ -15,8 +15,8 @@ per modem and load only when their package is installed.
 
 **Design principle — three separable concerns.** wwand deliberately keeps the
 **control protocol** (QMI / MBIM / AT), the **datapath** (QMAP/RmNet, MBIM,
-NCM/ECM/RNDIS, raw-ip) and the **physical transport** (USB today; PCIe/MHI on the
-roadmap) as distinct axes rather than one "modem protocol". QMI and MBIM are
+NCM/ECM/RNDIS, raw-ip) and the **physical transport** (USB or PCIe/MHI)
+as distinct axes rather than one "modem protocol". QMI and MBIM are
 co-equal first-class control backends (the market splits QMI/QMAP —
 Quectel/SIMCom/MeiG — vs MBIM — Sierra-Semtech/Telit/Fibocom/u-blox); QMAP is a
 *datapath capability*, not a synonym for QMI; and the control plane does not bake
@@ -35,7 +35,7 @@ One process. Zero per-context spawns. ~3 MB resident. The measured baseline:
 | ucode sources | 196 KB uncompressed | ≈ 40–50 KB on squashfs |
 | Native module | ~68 KB stripped | I/O + rmnet netlink helper |
 | Processes | **1 daemon, 0 per context** | no per-interface supervisor (no-proto-task) |
-| External spawns at runtime | 0 | only reboot in recovery (repower is a board GPIO) |
+| External spawns at runtime | 0 in this Chateau baseline | PCIe board profiles also invoke module commands |
 
 ## 2. Layering
 
@@ -62,7 +62,7 @@ One process. Zero per-context spawns. ~3 MB resident. The measured baseline:
                carrier_config.uc (MBN selection over PDC — token/indication),
                atcmd.uc + atcmd_parse.uc (+atport),
                discovery.uc (control-type detection), modeswitch/protocol_switch
- integration:  daemon.uc + netsel_ops.uc (registry/policy), config.uc
+ integration:  daemon.uc + netsel_ops.uc + board_transport.uc (registry/policy), config.uc
                (+migrate/compat), ubus.uc, main.uc
  shell:        wwand-proto.sh (thin netifd shim → wwand.sh, proto `wwand` only), init, hotplug,
                wwand-migrate + an example uci-defaults script (user-triggered config migration)
@@ -144,7 +144,8 @@ protocol-agnostic. `discovery.resolve_control` picks the backend per modem from
 the driver/device. Backends load lazily and ship as **separate packages**
 (`wwand-qmi` / `wwand-mbim` / `wwand-ncm`) on a backend-neutral `wwand` base; a
 missing backend package is reported (`control_note` in `status()`), not fatal.
-All configuration lives in `/etc/config/network` (see `docs/reference.md`).
+Modem and interface configuration lives in `/etc/config/network` (see `docs/reference.md`).
+Board hardware parameters can also come from the board package's JSON profile.
 
 Design principles, all validated in the field:
 
@@ -173,6 +174,23 @@ Design principles, all validated in the field:
 > codebase.
 
 ## 3. Selected mechanisms
+
+### Board discovery and explicit actions
+
+procd starts the daemon directly. A board profile supplies PCIe discovery and power parameters.
+`board_transport.uc` installs actions on the daemon through the same pattern as `hwops.uc` and `netsel_ops.uc`.
+The daemon keeps ownership of modem objects, contexts, autosetup, and hotplug handling.
+
+Board discovery does not wait for Wi-Fi PHYs or create a second modem lifecycle.
+After it loads the driver, it requests autosetup and hotplug handling through the existing daemon paths.
+WAITING_MODEM remains responsible for configured modems whose control interface is absent.
+
+Saved data-mode changes require an explicit API or UI action.
+The action reuses the modem's AT queue or reserves the board USB AT port for a temporary engine.
+Startup does not write the mode or reset the modem.
+Board guards prevent hardware reset and power actions during a data-mode transaction.
+During slot recovery, the daemon keeps a waiting entry until the board finishes, rather than reopening MHI before unload.
+See [Board transport integration](board-transport.md) for profile ownership, cancellation, recovery sequencing, and test limits.
 
 ### Modem lifecycle
 

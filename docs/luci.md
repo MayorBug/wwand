@@ -30,6 +30,18 @@ and **Save SIM** (a per-ICCID entry for the inserted card).
 
 ![Modems overview](images/luci-modems-list.png)
 
+The local redesign adds Board modem setup when the board profile supports PCIe discovery.
+This section also appears when no modem row exists.
+Rescan PCIe searches for a missing endpoint without resetting the modem.
+
+The Modem data mode picker reads the saved Quectel USB or PCIe mode.
+Selecting a mode does not save it. Apply data mode asks for confirmation before a persistent write.
+After a change, reboot the router to use the saved mode.
+Read again retries a failed read or resolves an uncertain write.
+Read-only users can read the mode but cannot save it or rescan.
+See [Board transport integration](board-transport.md) for the API contract and test limits.
+The existing screenshots do not include this new section.
+
 Below the SIM list, a **Migratable interfaces** section appears whenever the box
 still has stock `proto qmi`/`mbim`/`ncm`/`modemmanager` interfaces that wwand
 does not manage yet. Tick the ones to convert and press **Migrate selected**: each is rewritten

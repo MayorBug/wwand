@@ -1067,6 +1067,12 @@ export function create(transport, opts)
 		next();
 	};
 
+	// Cancel only unsent requests belonging to this callback. A command
+	// already on the wire cannot be undone, and other callers keep their queue.
+	self.cancel_queued = function(cb) {
+		self.queue = filter(self.queue, (request) => request.cb != cb);
+	};
+
 	// two-phase prompt command (AT+CMGS PDU mode): send `cmd`, wait for the '>'
 	// prompt, then write `payload` + Ctrl-Z. cb gets the final reply lines (e.g.
 	// "+CMGS: <ref>"). Longer default timeout — sending includes an OTA round trip.

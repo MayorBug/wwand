@@ -61,7 +61,11 @@ row. That is the whole maintenance rule.
 | Why did nothing happen although the count is past the threshold? | The arming gate in `recovery.uc on_attempt`: nothing physical until one request has completed in the selected protocol. `status` reports it as `recovery.armed`. |
 | ...and the one exception to that gate? | `recovery.uc unarmed_reset_line` — a pulse of the modem's own named RESET line, once per outage, nothing else. |
 | What would a repower do on THIS box for THIS modem? | `hwops.uc repower_plan` — the same precedence the action takes, so asking equals doing minus the doing. |
-| Which GPIOs and LEDs does this board have? | `board.uc` profile table, keyed by `/etc/board.json` model id. |
+| Which GPIOs and LEDs does this board have? | `board.uc` loads a version-1 file from `/usr/share/wwand/boards.d/<model.id>.json`, then falls back to its profile table. Built-in functions own LEDs. |
+| Who discovers a missing PCIe endpoint? | `board_transport.uc` owns bounded board scans and manual rescan. `daemon.uc` reuses autosetup, hotplug, and WAITING_MODEM after discovery. |
+| Who changes the saved USB/PCIe data mode? | `board_transport.uc` owns the explicit native AT action. `ubus.uc` exposes it. Startup does not write this mode. See `board-transport.md`. |
+| Which exported GPIOs need manual assignment? | `board.uc create` exposes read-only `gpio_candidates` through `daemon.uc status`. Names do not grant recovery permission. |
+| Who prepares the configured PCIe modem before the daemon starts? | `files/wwand-startup start_pcie_modem`, launched by the wwand procd instance. The `startup_pcie` configuration disables the USB composition recipe. |
 
 ## SIM, slots and eSIM
 

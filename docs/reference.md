@@ -1636,7 +1636,7 @@ every method to it.
 
 | Method | Arguments | Description |
 |---|---|---|
-| `status` / `modem_list` | — | modems (state, identity, registration, `registration_detail`, counters, `control_note`, `apdu_backend`, `at2_released` — the secondary AT port left to external tools, `gps_port` — the modem's NMEA tty when its port table names one (read by wwand-gps when `option gnss` is set; see `modem_gps`), `diag_port` — the modem's DM/DIAG node, likewise resolved and never opened (see "The diag port"), `locks` — cell/frequency-lock read-back, `rat` — the current fine access technology incl. IoT/RedCap/NTN (`NB-IoT`/`LTE-M`/`5G-SA`/…, identified over AT where QMI/MBIM can't name it), `caps` — best-effort `{ rats, iot_modes, ntn }` capability summary, `fcc_lock` — the FCC/RF-lock probe read-back, `esim` — `{ eid, profiles }` once the `esim_ready` bring-up refresh ran, `remote_sim` — `{ supported, via \| reason }`: whether the modem can run on a remote SIM, from the services it lists itself (QMI UIM Remote, service 0x32, natively or over the QMI-over-MBIM passthrough); `supported: null` while not known yet — listed is not switched on, see `wwandctl rsim MODEM switch`, `radio_held` — why a plugin holds the radio off (`<plugin>: <reason>`, null when nothing does; see "Radio hold" under Plugins), `radio_hold_error` — `cannot hold this modem (<why>)` when that hold cannot be honoured and the radio is in fact on, null otherwise) + contexts + `board` (detected profile, power/reset capability) |
+| `status` / `modem_list` | — | modems (state, identity, registration, `registration_detail`, counters, `control_note`, `apdu_backend`, `at2_released` — the secondary AT port left to external tools, `gps_port` — the modem's NMEA tty when its port table names one (read by wwand-gps when `option gnss` is set; see `modem_gps`), `diag_port` — the modem's DM/DIAG node, likewise resolved and never opened (see "The diag port"), `locks` — cell/frequency-lock read-back, `rat` — the current fine access technology incl. IoT/RedCap/NTN (`NB-IoT`/`LTE-M`/`5G-SA`/…, identified over AT where QMI/MBIM can't name it), `caps` — best-effort `{ rats, iot_modes, ntn }` capability summary, `fcc_lock` — the FCC/RF-lock probe read-back, `esim` — `{ eid, profiles }` once the `esim_ready` bring-up refresh ran, `remote_sim` — `{ supported, via \| reason }`: whether the modem can run on a remote SIM, from the services it lists itself (QMI UIM Remote, service 0x32, natively or over the QMI-over-MBIM passthrough); `supported: null` while not known yet — listed is not switched on, see `wwandctl rsim MODEM switch`, `radio_held` — why a plugin holds the radio off (`<plugin>: <reason>`, null when nothing does; see "Radio hold" under Plugins), `radio_hold_error` — `cannot hold this modem (<why>)` when that hold cannot be honoured and the radio is in fact on, null otherwise) + contexts + `board` (detected profile, power/reset capability, `transport` discovery state and action capabilities) |
 | `reload` | — | re-read UCI and apply the **diff** — only changed/added/removed modems and contexts are touched (idempotent; see *Idempotent reload*) |
 | `set_log_level` | `level` | change the log level at runtime |
 | `hotplug` | `action`, `device` | device add/remove (from the hotplug script) |
@@ -1669,7 +1669,10 @@ every method to it.
 | `modem_sms_read` | `modem`, `storage?`, `index` | read one stored SMS by index |
 | `modem_sms_delete` | `modem`, `storage?`, `index` **or** `indices` | delete stored SMS by index. `indices` (a list) deletes a set in one call, highest index first, and answers `{ ok, deleted, requested, failed[] }` — every index is attempted even after one fails. `index` (a single number) keeps answering `{ ok: true }`. There is deliberately **no "delete all"**: every backend offers one, and all of them delete what is in the store when the *modem* runs the request rather than what the operator was shown, so a message arriving between the listing and the click would go with it (write ACL) |
 | `modem_sms_send` | `modem`, `number`, `text` | send an SMS (SMS-SUBMIT, GSM7/UCS2, auto-segmented): QMI WMS RAW_SEND (native/passthrough) else AT+CMGS PDU mode (write ACL) |
-| `modem_repower` | `modem?` | hardware repower: pulse the modem `reset_gpio` (or, single-modem only, the board default), else power-cycle the modem USB power (also single-modem only — on a multi-modem box the board lines would hit the wrong hardware: error `multi_modem_needs_reset_gpio`). Same path as the recovery ladder; recovers a hung / vanished modem |
+| `pcie_rescan` | — | Board-profile discovery: scan a missing endpoint, then load its dependency and driver. Result includes `found` and `state`. Write access is required. |
+| `modem_get_data_mode` | — | Read the saved Quectel USB/PCIe mode through the board AT action. Read access is sufficient. |
+| `modem_set_data_mode` | `mode` | Save `"usb"` or `"pcie"` explicitly. A changed mode returns `restart_required: true`. The action does not reset the modem. Write access is required. |
+| `modem_repower` | `modem?` | Hardware recovery through the existing board policy: dedicated reset line, board reset, or board power cycle. A PCIe slot profile schedules transport closure, MHI unload, slot power-off, and restore. Shared board controls require one configured modem. |
 | `modem_set_protocol` | `modem`, `protocol` | switch the control protocol (`qmi` ⇄ `mbim`); the modem resets |
 | `modem_reattach` | `modem` | detach/re-attach at the registration level (QMI DMS low-power→online bounce natively, `AT+COPS=2`→`0` fallback; on NCM the COPS bounce also down→up's every CONNECTED context — the T700's data path does not survive the deregister/attach cycle) without a full modem reset (write ACL) |
 | `modem_datapath` | `modem` | datapath diagnostics: driver/protocol, mux channels, aggregation state, netdev counters |
@@ -2155,6 +2158,40 @@ protocol error; empty poll replies keep the last-known data; the per-type
 "not available" sentinels (`-32768`, `0xFFFFFFFF`) are normalised to null on
 signal and on every serving/neighbour cell at ingestion, so the UI shows "—"
 rather than e.g. `-3276.8 dBm`.
+
+## Board transport setup (local redesign)
+
+procd starts the daemon directly. The board profile supplies PCIe discovery and power parameters.
+The board package installs a version-1 JSON file under `/usr/share/wwand/boards.d/<model.id>.json`.
+A valid file overrides built-in data. Missing or invalid files use the built-in fallback.
+
+Discovery starts immediately and does not wait for Wi-Fi PHYs.
+The P5 profile requests five scans at five-second intervals.
+The daemon stays available between scans. Normal hotplug and WAITING_MODEM handle control readiness after discovery.
+Discovery does not reset the modem or write its saved data mode.
+
+Mobile Modems provides Rescan PCIe even when no modem row exists.
+The action scans only when the endpoint is absent. It loads the profile dependency before the driver.
+It does not remove devices or reset the modem.
+
+The Modem data mode picker reads the saved Quectel USB or PCIe mode through the native AT engine.
+Apply data mode requires confirmation before it saves a changed mode.
+The action reads the mode back and reports when a reboot is needed.
+It does not change the separate PCIe Endpoint mode.
+If the result is uncertain, use Read again before retrying.
+
+`status.board.transport` reports capabilities, discovery state, action status, and endpoint addresses.
+`driver_loaded` reports module loading, not protocol readiness or a working data connection.
+The old `startup_*` UCI parameters no longer control this integration.
+
+Slot recovery uses the existing recovery ladder or explicit Repower action.
+The daemon retires its modem after the recovery callback finishes.
+The board requires successful MHI unload before endpoint removal and power-off.
+Preparation or unload failure leaves power unchanged and produces a log message.
+A failed slot bind can leave the modem off.
+A missing control node does not establish PBL.
+
+See [Board transport integration](board-transport.md) for profile fields, API results, transport ownership, and test limits.
 
 ## Troubleshooting
 

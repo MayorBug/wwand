@@ -385,9 +385,14 @@ like and where a new field lands), see [luci.md](luci.md).
 
 ## 8. Adding a board profile
 
-Board-specific modem power/reset GPIOs and status LEDs live in one table in
-`src-ucode/board.uc`, keyed by the `/etc/board.json` model id. To support a new
-router, add an entry:
+The local redesign also accepts version-1 JSON profiles from the board package.
+The filename uses the board model identifier under `/usr/share/wwand/boards.d/`.
+A valid file overrides built-in data. Built-in LED functions remain in `board.uc`.
+See [Board transport integration](board-transport.md) for the fields and lifecycle contract.
+
+Built-in profiles keep modem power/reset GPIOs and LED functions in
+`src-ucode/board.uc`, keyed by the `/etc/board.json` model identifier.
+To add a built-in profile, add an entry:
 
 ```
 'vendor,my-router': {

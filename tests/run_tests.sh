@@ -8,7 +8,10 @@ set -e
 TESTDIR="$(cd "$(dirname "$0")" && pwd)"
 SRCDIR="$(dirname "$TESTDIR")/src-ucode"
 
-if [ -x "$HOME/.local/bin/ucode" ]; then
+if [ -n "$WWAND_TEST_UCODE" ]; then
+	UCODE="$WWAND_TEST_UCODE"
+	MODPATH="$WWAND_TEST_MODPATH"
+elif [ -x "$HOME/.local/bin/ucode" ]; then
 	UCODE="$HOME/.local/bin/ucode"
 	export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 	MODPATH="$HOME/.local/lib/ucode/*.so"
@@ -18,10 +21,10 @@ else
 fi
 
 # 'wwand...' imports resolve via the tests/wwand -> ../src-ucode symlink
-NATIVE="$TESTDIR/../io/build-host/*.so"
+NATIVE="${WWAND_TEST_NATIVE:-$TESTDIR/../io/build-host/*.so}"
 
 # spawn a private ubusd for the daemon integration test if available
-UBUSD=""
+UBUSD="${WWAND_TEST_UBUSD:-}"
 for cand in "$HOME/.local/sbin/ubusd" /sbin/ubusd /usr/sbin/ubusd; do
 	[ -x "$cand" ] && { UBUSD="$cand"; break; }
 done
@@ -81,6 +84,7 @@ done
 # existed and v1.6.4 shipped the defect it catches anyway. These are the cheap,
 # deterministic ones; they need nothing but python3.
 if command -v python3 >/dev/null 2>&1; then
+	python3 "$TESTDIR/test_board_transport_serial.py" || rc=1
 	for chk in check-map check-anchors check-export-terminators check-ucode-pitfalls standards; do
 		# --since HEAD: an uncommitted edit that MOVES an anchored line fails the
 		# run before the commit, when fixing it is one `--fix` away
